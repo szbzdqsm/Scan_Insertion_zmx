@@ -2,6 +2,8 @@
 
 This package runs inside `scan-agent-base:ubuntu24`. It calls the real `dftexp_scan` binary, saves each attempt, and refuses to fabricate a successful netlist or report. The current implementation has been replay-checked against all 11 Public cases using each case's `golden.dofile` as an offline test fixture. This verifies tool execution and artifact checks, but does not validate live LLM-generated Dofiles.
 
+The original contest guide is included as [赛题指南_广立微.docx](赛题指南_广立微.docx). See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for the requirements audit and remaining implementation gaps. Add documentation from updated handoff bundles individually; extracting an older starter over this folder overwrites the developed source.
+
 ## Build
 
 ```bash
@@ -35,3 +37,13 @@ docker run --rm \
 - The final saved artifacts passed the current independent DRC/artifact/scan-chain checks. Task 2 case 3 required two tool calls; its first run exposed DRC failures and the replayed second run passed.
 - The offline harness bypasses the live LLM API. Live model response quality, hidden cases, automatic pre-scan netlist repair, and LEC-backed edits remain unverified or unimplemented. Do not treat this as a platform-ready submission or upload it for evaluation.
 - Large-case tool runs took about 486 seconds (Task 1 case 5) and 298 seconds (Task 2 case 5); keep the configured case time budget in mind.
+
+The original Word review prompted fixes to evidence run references, change IDs, positive verification, full final-log copying, input paths, and post-generation tool budgets. Task 2 now keeps actual tool success separate from issue audit completion; an empty issue list produces an incomplete audit.
+
+The 12 audit regression checks use local test fixtures and do not call the LLM or ScanInsertion binary. Run them from the repository root:
+
+```bash
+python3 tests/test_audit_regressions.py
+```
+
+These checks passed, the Docker image rebuilt successfully, and the 11 previously saved real tool outputs still passed the output checker. No additional live model or full Public-case tool runs were performed for this audit update.

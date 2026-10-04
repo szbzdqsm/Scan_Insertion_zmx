@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import difflib
 import functools
 import json
@@ -35,7 +36,7 @@ def case_id_for(input_dir: Path) -> str:
     if configured:
         return configured
     for parent in (input_dir, *input_dir.parents):
-        if re.fullmatch(r"case\w+", parent.name, re.I):
+        if re.fullmatch(r"(?:(?:hidden|public)_)?case\w+", parent.name, re.I):
             return parent.name
     return "unknown" if input_dir.name.lower() == "input" else input_dir.name
 
@@ -181,7 +182,7 @@ def get_task_artifacts(input_dir: Path) -> tuple[str, str, list[Path], list[Path
 
 
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "") -> str:
-    lib_names = [p.name for p in libs]
+    lib_names = [str(p) for p in libs]
     lib_summary = []
     for p in libs:
         # Read only cell names; liberty files in public cases can be very large.
@@ -194,7 +195,8 @@ def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list
 {limits or 'Not supplied'}
 
 # Input files
-Netlists: {[p.name for p in netlists]}
+Input directory: {input_dir}
+Netlists: {[str(p) for p in netlists]}
 Liberty files: {lib_names}
 {chr(10).join(lib_summary)}
 
@@ -215,12 +217,19 @@ Liberty files: {lib_names}
 """
 
 
-def call_for_dofile(client: OpenAI, task: str, context: str, original: str | None) -> tuple[str, dict[str, Any]]:
+def call_for_dofile(client: OpenAI, task: str, context: str, original: str | None,
+                    input_dir: Path, run_dir: Path) -> tuple[str, dict[str, Any]]:
     mode = "Generate a Dofile from the task requirements." if task == "task1" else "Repair the supplied original Dofile while preserving valid intent."
     if task == "task2" and original:
         context += "\n# Original Dofile (repair starting point)\n" + original
-    system = """You are an expert operator of the ScanInsertion tool `dftexp_scan` for the contest.
-Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts and evidence from existing Dofiles. Never disable DRC to hide a violation. Never modify the input netlist unless explicitly required and a function-equivalence check is possible. Return exactly one JSON object with keys: dofile (complete Tcl script as a string), summary (brief), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix). Each evidence_excerpt must be an exact short excerpt copied from the supplied tool log or report; use an empty array when no issue is directly evidenced. Do not claim a requirement is met unless the script configures it. Input files are mounted at /input, writable outputs must be under the current run directory in /output/runs/Rn. Use absolute paths for input files. Save reports and deliverables under the current run directory. Add `exit` at the end. No markdown fences."""
+    netlist_rule = ("Task 1 strictly forbids modifying any Pre-scan input netlist."
+                    if task == "task1" else
+                    "This runtime supports Dofile repairs only; it has no netlist-edit/EQY workflow. "
+                    "Do not modify Pre-scan netlists. If netlist repair is necessary, leave the issue unresolved.")
+    system = f"""You are an expert operator of the ScanInsertion tool `dftexp_scan` for the contest.
+Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts and evidence from existing Dofiles. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
+Return exactly one JSON object with keys: dofile (complete Tcl script as a string), summary (brief), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Each evidence_excerpt must be an exact short excerpt copied from the supplied PREVIOUS run's tool log or report. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it.
+The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
     user = f"{mode}\n\n{context}\n\nReturn the JSON object now."
     result = json_from_response(ask(client, system, user))
     dofile = result.get("dofile")
@@ -469,6 +478,156 @@ def write_diff(out: Path, old: str, new: str, old_name: str, new_name: str) -> s
     return str(path.relative_to(out))
 
 
+def run_evidence_files(run_dir: Path) -> list[Path]:
+    """Enumerate real evidence without loading large logs into memory."""
+    reports = sorted(p for p in (run_dir / "reports").rglob("*")
+                     if p.is_file() and p.suffix.lower() in {".rpt", ".report", ".txt"})
+    log = run_dir / f"{run_dir.name}.log"
+    return reports + ([log] if log.is_file() else [])
+
+
+def locate_evidence(files: list[Path], output_dir: Path, excerpt: str,
+                    positive: bool = False) -> dict[str, str] | None:
+    """Locate an exact excerpt, retaining real line numbers even in long logs."""
+    if not excerpt:
+        return None
+    line_count = excerpt.count("\n") + 1
+    for path in files:
+        window: deque[str] = deque(maxlen=line_count)
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for last_line, line in enumerate(stream, 1):
+                window.append(line)
+                content = "".join(window)
+                if excerpt not in content:
+                    continue
+                # A Tcl echo/comment is not evidence that the tool performed an action.
+                if (re.search(r"CMD-0034|SOURCE TCL FILE", content, re.I)
+                        or any(part.lstrip().startswith("#") for part in window)):
+                    continue
+                if positive and re.search(r"\[(?:ERROR|FATAL|WARNING)\]", content, re.I):
+                    continue
+                after = content[content.index(excerpt) + len(excerpt):]
+                if positive and excerpt[-1].isdigit() and after[:1].isdigit():
+                    continue
+                before = content[:content.index(excerpt)]
+                first = last_line - len(window) + 1 + before.count("\n")
+                last = first + line_count - 1
+                return {"source": path.relative_to(output_dir).as_posix(),
+                        "locator": f"L{first}" if first == last else f"L{first}-L{last}",
+                        "excerpt": excerpt}
+    return None
+
+
+def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
+                       verification_plans: dict[str, dict[str, Any]], output_dir: Path,
+                       previous_run: str, current_run: str, change_id: str) -> None:
+    """Bind a proposed fix to the previous run that actually exposed the issue."""
+    if not previous_run or not change_id:
+        return
+    files = run_evidence_files(output_dir / "runs" / previous_run)
+    for item in meta.get("issue_resolutions", []):
+        if not isinstance(item, dict):
+            continue
+        cited = str(item.get("evidence_excerpt", item.get("excerpt", ""))).strip()
+        evidence = locate_evidence(files, output_dir, cited)
+        if not evidence:
+            continue
+        diagnosis = {"summary": str(item.get("diagnosis", "")),
+                     "located_object": str(item.get("located_object", "")),
+                     "root_cause": str(item.get("root_cause", "")),
+                     "violated_requirement": str(item.get("violated_requirement", ""))}
+        existing = next((issue for issue in issues
+                         if (issue["found"]["source"] == evidence["source"] and
+                             issue["found"]["excerpt"] == cited) or
+                         (diagnosis["located_object"] and diagnosis["root_cause"] and
+                          issue["diagnosis"]["located_object"] == diagnosis["located_object"] and
+                          issue["diagnosis"]["root_cause"] == diagnosis["root_cause"])), None)
+        if existing is None:
+            existing = {"issue_id": f"I{len(issues) + 1}",
+                        "phenomenon": str(item.get("phenomenon", "")),
+                        "found": {"run_ref": previous_run, **evidence, "verified": True},
+                        "diagnosis": diagnosis, "attempts": []}
+            issues.append(existing)
+        else:
+            existing["diagnosis"] = diagnosis
+        existing["attempts"].append({
+            "fix": {"action": str(item.get("fix", "")), "artifact_ref": [change_id]},
+            "verify": {"run_ref": current_run, "source": f"runs/{current_run}/{current_run}.log",
+                       "resolved": False, "locator": "", "excerpt": ""}})
+        plan = item.get("verification", {})
+        verification_plans[existing["issue_id"]] = plan if isinstance(plan, dict) else {}
+
+
+def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
+                           files: list[Path], output_dir: Path) -> dict[str, str] | None:
+    """Accept conservative, issue-specific positive evidence from a real rerun."""
+    found = issue["found"]["excerpt"]
+    diagnosis = issue["diagnosis"]
+    # A zero DRC summary proves a DRC condition only; it says nothing about configuration.
+    if re.search(r"\bDFTR[-_ ]?(?:\d+|TIE[01]|L[12])\b|Total violations:\s*[1-9]\d*", found, re.I):
+        drc_files = [p for p in files if "drc" in p.name.lower() or "violation" in p.name.lower()]
+        return locate_evidence(drc_files, output_dir, "Total violations: 0", positive=True)
+    expected = str(plan.get("expected_excerpt", "")).strip()
+    source = str(plan.get("source", "")).strip().replace("\\", "/")
+    if len(expected) < 8 or "\n" in expected or not source or expected == found:
+        return None
+    # Report paths may be nested; compare them relative to their run without accepting arbitrary paths.
+    candidates = [p for p in files if p.name == source or p.relative_to(output_dir).as_posix() == source or
+                  p.relative_to(output_dir).as_posix().endswith("/" + source)]
+    description = " ".join(str(value) for value in diagnosis.values())
+    required = diagnosis.get("violated_requirement", "")
+    if required and re.search(r"chain[_ -]?count|链数|扫描链数量|scan\s+chains?.{0,20}(?:count|number)", description, re.I):
+        wanted = re.search(r"(\d+)\s*条|(?:chain[_ -]?count|(?:number|total)\s+of\s+(?:scan\s+)?chains?)\s*[:=：]?\s*(\d+)", required, re.I)
+        actual = re.search(r"(?:number\s+of\s+chains|total\s+(?:scan\s+)?chains|scan\s+chains?)\s*[:=：]?\s*(\d+)", expected, re.I)
+        if wanted and actual and int(next(value for value in wanted.groups() if value)) == int(actual.group(1)):
+            candidates = [p for p in candidates if p.suffix.lower() in {".rpt", ".report", ".txt"}
+                          and "chain" in p.name.lower()]
+            return locate_evidence(candidates, output_dir, expected, positive=True)
+        return None
+    if re.search(r"ERROR|FATAL|unknown|invalid", found, re.I) and not required:
+        commands = re.findall(r"\b(?:set|load|write|rpt|examine|insert|add)_[A-Za-z0-9_]+\b", diagnosis["located_object"])
+        if any(command in expected for command in commands) and re.search(r"completed|successfully|passed", expected, re.I):
+            return locate_evidence(candidates, output_dir, expected, positive=True)
+    # Wrapper, signal, and other conditions need a dedicated semantic verifier.
+    return None
+
+
+def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[str, dict[str, Any]],
+                       output_dir: Path, current_run: str, tool_checks_passed: bool) -> None:
+    if not tool_checks_passed:
+        return
+    files = run_evidence_files(output_dir / "runs" / current_run)
+    for issue in issues:
+        attempts = issue.get("attempts", [])
+        if not attempts or issue["found"]["run_ref"] == current_run:
+            continue
+        verify = attempts[-1]["verify"]
+        if verify["run_ref"] != current_run or verify["resolved"]:
+            continue
+        evidence = positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir)
+        if evidence:
+            verify.update({"run_ref": current_run, **evidence, "resolved": True})
+
+
+def issue_audit_problems(task: str, issues: list[dict[str, Any]], changes: list[dict[str, Any]]) -> list[str]:
+    problems = []
+    if task == "task2" and not issues:
+        problems.append("Task 2 has no evidence-backed issue diagnosis; audit closure is incomplete")
+    change_ids = {change["change_id"] for change in changes}
+    for issue in issues:
+        diagnosis = issue.get("diagnosis", {})
+        if not all(str(diagnosis.get(key, "")).strip() for key in ("summary", "located_object", "root_cause")):
+            problems.append(f"{issue['issue_id']} lacks a concrete object or root-cause diagnosis")
+        attempts = issue.get("attempts", [])
+        if not attempts or not attempts[-1]["verify"].get("resolved"):
+            problems.append(f"{issue['issue_id']} lacks positive verification evidence from a later tool run")
+        for attempt in attempts:
+            if not attempt["fix"].get("action") or not attempt["fix"].get("artifact_ref") or any(
+                    ref not in change_ids for ref in attempt["fix"].get("artifact_ref", [])):
+                problems.append(f"{issue['issue_id']} has an incomplete fix or a non-closing change reference")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-input", "--input", required=True)
@@ -485,6 +644,7 @@ def main() -> int:
     run_records: list[dict[str, Any]] = []
     changes: list[dict[str, Any]] = []
     issue_records: list[dict[str, Any]] = []
+    verification_plans: dict[str, dict[str, Any]] = {}
     requirement_mapping: list[dict[str, Any]] = []
     final_dofile = ""
     task = "task1"
@@ -499,6 +659,7 @@ def main() -> int:
         task, task_spec, netlists, libs, original_path = get_task_artifacts(input_dir)
         limits = read_text(input_dir / "limitations.md", 8000)
         timeout_total = parse_limit_seconds(limits)
+        finalize_reserve = 30
         max_calls = parse_tool_limit(limits)
         # Contest tool-call ceiling always includes a strict local cap.
         max_calls = min(max_calls, int(os.environ.get("AGENT_MAX_TOOL_CALLS", str(max_calls))))
@@ -510,8 +671,8 @@ def main() -> int:
         generation_error = ""
         static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "")
         for index in range(1, max_calls + 1):
-            remaining = timeout_total - int(time.monotonic() - start)
-            if remaining < 15:
+            remaining = timeout_total - (time.monotonic() - start)
+            if remaining <= finalize_reserve + 1:
                 break
             rid = f"R{index}"
             run_dir = runs_root / rid
@@ -542,22 +703,36 @@ def main() -> int:
                 try:
                     if client is None:
                         client = get_client()
-                    request_client = client.with_options(timeout=max(1.0, min(45.0, remaining - 12.0)), max_retries=0)
-                    dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None)
+                    remaining = timeout_total - (time.monotonic() - start)
+                    if remaining <= finalize_reserve + 1:
+                        generation_error = f"Insufficient time for Dofile generation before {rid}; finalization reserve retained"
+                        break
+                    request_client = client.with_options(timeout=max(1.0, min(45.0, remaining - finalize_reserve - 1)), max_retries=0)
+                    dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
+                                                 input_dir, run_dir)
                 except Exception as e:
                     generation_error = f"LLM Dofile generation failed before R{index}: {type(e).__name__}: {e}"
                     if run_records:
                         break
                     raise
                 execution_path = None
+            # Generation and report-context reads consumed time; never reuse the pre-LLM budget.
+            remaining = timeout_total - (time.monotonic() - start)
+            if remaining <= finalize_reserve + 1:
+                generation_error = f"Insufficient time for tool call {rid}; finalization reserve retained"
+                break
+            previous_run = run_records[-1]["run_id"] if run_records else ""
+            change_id = ""
             if index > 1:
                 prior = run_records[-1]
                 diff_path = write_diff(output_dir, previous, dofile, prior["run_id"], rid)
-                changes.append({"change_id": f"F{len(changes)+1}", "type": "dofile",
+                change_id = f"F{len(changes)+1}"
+                changes.append({"change_id": change_id, "type": "dofile",
                                 "path": f"runs/{rid}/deliverables/{rid}.dofile", "diff_path": diff_path, "lec_ref": ""})
             final_dofile = dofile
             last_llm_meta = meta
-            per_run_timeout = max(1, min(900, remaining - 8))
+            remaining = timeout_total - (time.monotonic() - start)
+            per_run_timeout = max(1, min(900, int(remaining - finalize_reserve)))
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path)
             record = {k: v for k, v in result.items() if k != "log_path"}
             record["log_file"] = str((run_dir / f"{rid}.log").relative_to(output_dir)).replace("\\", "/")
@@ -567,59 +742,15 @@ def main() -> int:
             previous = dofile
             final_run_dir = run_dir
             ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"])
-            if not requirement_mapping:
+            if meta.get("requirement_mapping"):
+                requirement_mapping = []
                 for item in meta.get("requirement_mapping", []):
                     if isinstance(item, dict):
                         requirement_mapping.append({"requirement": str(item.get("requirement", "")),
                                                     "dft_config": str(item.get("dft_config", "")),
                                                     "config_ref": {"source": "final_results/deliverables/final.dofile", "locator": ""}})
-            evidence_text = last_log
-            evidence_source = run_records[-1]["log_file"]
-            evidence_files: list[tuple[str, str]] = [(evidence_source, last_log)]
-            for rp in (run_dir / "reports").rglob("*"):
-                if rp.is_file():
-                    report_content = read_text(rp, 40000)
-                    evidence_text += "\n" + report_content
-                    evidence_files.append((rp.relative_to(output_dir).as_posix(), report_content))
-            # Close a previously evidenced issue only when the exact cited diagnostic
-            # is absent from a later real run and the independent artifact checks pass.
-            for issue in issue_records:
-                found = issue.get("found", {})
-                if not found.get("verified") or not found.get("excerpt"):
-                    continue
-                attempts = issue.get("attempts", [])
-                verify = attempts[-1].get("verify", {}) if attempts else {}
-                if verify.get("resolved"):
-                    continue
-                cited = found["excerpt"]
-                if cited not in evidence_text and ok:
-                    verify.update({"run_ref": rid, "source": evidence_source, "resolved": True,
-                                   "locator": "cited diagnostic absent; artifact checks passed",
-                                   "excerpt": "The cited diagnostic is absent from this run's log and reports."})
-            for item in meta.get("issue_resolutions", []):
-                if not isinstance(item, dict):
-                    continue
-                cited = str(item.get("evidence_excerpt", item.get("excerpt", ""))).strip()
-                verified = bool(cited and cited in evidence_text)
-                if not verified:
-                    continue
-                evidence_source = next((source for source, content in evidence_files if cited in content), run_records[-1]["log_file"])
-                evidence_content = next((content for _, content in evidence_files if cited in content), last_log)
-                evidence_line = next((i for i, line in enumerate(evidence_content.splitlines(), 1) if cited in line), 0)
-                issue_records.append({
-                    "issue_id": str(item.get("issue_id", f"I{len(issue_records)+1}")),
-                    "phenomenon": str(item.get("phenomenon", "")),
-                    "found": {"run_ref": rid, "source": evidence_source,
-                              "locator": f"L{evidence_line}" if evidence_line else "",
-                              "excerpt": cited, "verified": True},
-                    "diagnosis": {"summary": str(item.get("diagnosis", "")),
-                                  "located_object": str(item.get("located_object", "")),
-                                  "root_cause": str(item.get("root_cause", "")),
-                                  "violated_requirement": str(item.get("violated_requirement", ""))},
-                    "attempts": [{"fix": {"action": str(item.get("fix", "")),
-                                           "artifact_ref": [f"runs/{rid}/deliverables/{rid}.dofile"]},
-                                  "verify": {"run_ref": rid, "source": f"runs/{rid}/{rid}.log",
-                                             "resolved": False, "locator": "", "excerpt": ""}}]})
+            record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id)
+            verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok)
             unresolved = any(issue.get("found", {}).get("verified") and
                              not (issue.get("attempts") and issue["attempts"][-1].get("verify", {}).get("resolved"))
                              for issue in issue_records)
@@ -630,10 +761,9 @@ def main() -> int:
         if not run_records:
             raise RuntimeError("No ScanInsertion tool call was made within the time budget")
         final_run_dir = runs_root / run_records[-1]["run_id"]
-        log = read_text(final_run_dir / f"{run_records[-1]['run_id']}.log", 100000)
         final_results = output_dir / "final_results"
         final_results.mkdir(exist_ok=True)
-        (final_results / "final.log").write_text(log, encoding="utf-8")
+        shutil.copy2(final_run_dir / f"{run_records[-1]['run_id']}.log", final_results / "final.log")
         deliverables = final_results / "deliverables"
         reports = final_results / "reports"
         deliverables.mkdir(exist_ok=True)
@@ -642,12 +772,10 @@ def main() -> int:
         # Copy actual tool-created products only.
         copy_tree_contents(final_run_dir / "reports", reports)
         copy_tree_contents(final_run_dir / "deliverables", deliverables)
-        passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile, run_records[-1]["exit_status"])
-        if passed and any(issue.get("found", {}).get("verified") and
-                          not (issue.get("attempts") and issue["attempts"][-1].get("verify", {}).get("resolved"))
-                          for issue in issue_records):
-            passed = False
-            final_problems.append("One or more evidence-backed issues lack a verified follow-up run")
+        tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile, run_records[-1]["exit_status"])
+        audit_problems = issue_audit_problems(task, issue_records, changes)
+        audit_complete = not audit_problems
+        passed = tool_checks_passed and audit_complete
         for mapping in requirement_mapping:
             config = mapping.get("dft_config", "")
             locator = ""
@@ -661,7 +789,10 @@ def main() -> int:
             "case_id": case_id_for(input_dir),
             "task": task,
             "final_run": run_records[-1]["run_id"],
-            "summary": f"Tool calls: {len(run_records)}; wall time: {time.monotonic() - start:.1f}s. Verified artifact checks: {'passed' if passed else 'incomplete'}. " + ("; ".join(final_problems) if final_problems else "") + (f"; {generation_error}" if generation_error else ""),
+            "summary": f"Tool calls: {len(run_records)}; wall time: {time.monotonic() - start:.1f}s. Verified artifact checks: {'passed' if tool_checks_passed else 'incomplete'}; issue audit: {'complete' if audit_complete else 'incomplete'}. " + ("; ".join(final_problems + audit_problems) if final_problems or audit_problems else "") + (f"; {generation_error}" if generation_error else ""),
+            "tool_checks_passed": tool_checks_passed,
+            "issue_audit_complete": audit_complete,
+            "audit_problems": audit_problems,
             "requirement_mapping": requirement_mapping,
             "issue_resolutions": issue_records,
             "tool_runs": [{"tool_call_id": r["run_id"], "log_file": r["log_file"],
@@ -672,7 +803,9 @@ def main() -> int:
         }
         (output_dir / "decision_log.json").write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"status": "completed" if passed else "incomplete", "task": task,
-                          "tool_calls": len(run_records), "problems": final_problems}, ensure_ascii=False))
+                          "tool_calls": len(run_records), "tool_checks_passed": tool_checks_passed,
+                          "issue_audit_complete": audit_complete,
+                          "problems": final_problems + audit_problems}, ensure_ascii=False))
         return 0 if passed else 2
     except Exception as e:
         error_message = f"{type(e).__name__}: {e}"
