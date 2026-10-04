@@ -217,6 +217,11 @@ class AuditRegression(unittest.TestCase):
             self.assertEqual(agent.case_id_for(Path("/work/input/hidden_case_1/input")), "hidden_case_1")
             self.assertEqual(agent.case_id_for(Path("/work/input/public_case_1/input")), "public_case_1")
 
+    def test_wrong_contest_model_is_rejected_before_client_creation(self):
+        with patch.dict(agent.os.environ, {"LLM_MODEL": "other-model", "LLM_API_KEY": "test"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "Contest requires DeepSeek V4 Pro"):
+                agent.get_client()
+
 
 if __name__ == "__main__":
     unittest.main()

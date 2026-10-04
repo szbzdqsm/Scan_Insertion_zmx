@@ -127,7 +127,15 @@ def parse_tool_limit(text: str) -> int:
     return max(1, int(os.environ.get("AGENT_MAX_TOOL_CALLS", "4")))
 
 
+def contest_model() -> str:
+    model = os.environ.get("LLM_MODEL", "deepseek-v4-pro").strip()
+    if model != "deepseek-v4-pro":
+        raise RuntimeError("Contest requires DeepSeek V4 Pro: LLM_MODEL must be deepseek-v4-pro")
+    return model
+
+
 def get_client() -> OpenAI:
+    contest_model()
     key = os.environ.get("LLM_API_KEY", "").strip()
     if not key:
         raise RuntimeError("LLM_API_KEY is required; inject it at runtime and never bake it into the image.")
@@ -136,7 +144,7 @@ def get_client() -> OpenAI:
 
 def ask(client: OpenAI, system: str, user: str, max_tokens: int = 7000) -> str:
     response = client.chat.completions.create(
-        model=os.environ.get("LLM_MODEL", "deepseek-v4-pro"),
+        model=contest_model(),
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         max_tokens=max_tokens,
         temperature=0.1,
@@ -171,7 +179,6 @@ def get_task_artifacts(input_dir: Path) -> tuple[str, str, list[Path], list[Path
     if not task_spec_path.exists():
         raise FileNotFoundError("Missing task_spec.md")
     task_spec = read_text(task_spec_path, 60000)
-    limits = read_text(input_dir / "limitations.md", 8000)
     netlists = discover_files(input_dir / "netlist", ".v")
     libs = discover_files(input_dir / "lib", ".lib")
     if not netlists or not libs:
@@ -666,7 +673,6 @@ def main() -> int:
         client: OpenAI | None = None
         original = read_text(original_path, 50000) if original_path else None
         previous = original or ""
-        last_llm_meta: dict[str, Any] = {}
         last_log = ""
         generation_error = ""
         static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "")
@@ -730,7 +736,6 @@ def main() -> int:
                 changes.append({"change_id": change_id, "type": "dofile",
                                 "path": f"runs/{rid}/deliverables/{rid}.dofile", "diff_path": diff_path, "lec_ref": ""})
             final_dofile = dofile
-            last_llm_meta = meta
             remaining = timeout_total - (time.monotonic() - start)
             per_run_timeout = max(1, min(900, int(remaining - finalize_reserve)))
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path)

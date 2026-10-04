@@ -1,5 +1,8 @@
 FROM scan-agent-base:ubuntu24
 
+RUN apt-get update && apt-get install -y --no-install-recommends make \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages \
       -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt \

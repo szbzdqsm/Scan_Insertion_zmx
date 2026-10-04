@@ -6,6 +6,8 @@ The original contest guide is included as [赛题指南_广立微.docx](赛题�
 
 The contest presentation is also included as [EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx](EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx). Its guidance and the difference concerning tool-call limits are recorded in the requirements audit.
 
+The repository root now includes VS Code and Dev Container configurations, development tasks, and [environment notes](../ENVIRONMENT.md). The Dockerfiles install GNU Make, which is missing from the official base image and is required for EQY's proof stage. Open the repository root for these development settings.
+
 ## Build
 
 ```bash

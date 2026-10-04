@@ -1,2 +1,2 @@
-openai>=1.30.0
-pypdf>=4.0.0
+openai==3.24.0
+pypdf==6.19.0

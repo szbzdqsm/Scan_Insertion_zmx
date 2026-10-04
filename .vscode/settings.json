@@ -1,0 +1,28 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python-envs.workspaceSearchPaths": ["./.venv"],
+  "python.testing.unittestEnabled": true,
+  "python.testing.pytestEnabled": false,
+  "python.testing.unittestArgs": ["-v", "-s", "tests", "-p", "test_*.py"],
+  "python.analysis.exclude": ["**/public_cases/**", "**/outputs/**", "**/reference_submission/**"],
+  "files.watcherExclude": {
+    "**/public_cases/**": true,
+    "**/outputs/**": true,
+    "**/.venv/**": true
+  },
+  "search.exclude": {
+    "**/public_cases/**": true,
+    "**/outputs/**": true,
+    "**/.venv/**": true
+  },
+  "files.associations": {"*.dofile": "tcl", "*.rpt": "plaintext", "*.lib": "plaintext"},
+  "verilog.linting.linter": "none",
+  "verilog.ctags.enabled": false,
+  "cmake.configureOnOpen": false,
+  "ruff.configuration": "${workspaceFolder}/ruff.toml",
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {"source.fixAll.ruff": "explicit"}
+  }
+}

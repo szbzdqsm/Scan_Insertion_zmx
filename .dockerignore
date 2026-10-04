@@ -1,0 +1,6 @@
+**
+!agent/
+!agent/requirements.txt
+!requirements-dev.txt
+!.devcontainer/
+!.devcontainer/Dockerfile

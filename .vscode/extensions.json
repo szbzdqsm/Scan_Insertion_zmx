@@ -1,0 +1,11 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.debugpy",
+    "charliermarsh.ruff",
+    "mshr-h.veriloghdl",
+    "ms-azuretools.vscode-containers",
+    "ms-vscode-remote.remote-containers"
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Scan: 环境检查",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "scripts/check_environment.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Scan: 审计回归检查",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "group": {"kind": "test", "isDefault": true},
+      "problemMatcher": []
+    },
+    {
+      "label": "Scan: Python 静态检查",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "-m", "ruff", "check", "agent", "scripts", "tests"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Scan: EQY 后端验证（Dev Container）",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "scripts/check_eqy.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Scan: 构建运行镜像（WSL）",
+      "type": "process",
+      "command": "docker",
+      "args": ["build", "-t", "scan-agent-dev:local", "-f", "agent/Dockerfile", "agent"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "group": {"kind": "build", "isDefault": true},
+      "problemMatcher": []
+    },
+    {
+      "label": "Scan: 运行一个 case（WSL）",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "scripts/run_case.py", "${input:scanCase}"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": "Scan: 构建运行镜像（WSL）",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {"id": "scanCase", "type": "promptString", "description": "Case 目录或 input 目录路径", "default": "public_cases/task_2/case1"}
+  ]
+}
