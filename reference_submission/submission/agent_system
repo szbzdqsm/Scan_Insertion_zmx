@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# Scan Insertion Agent 入口脚本
+# ============================================================================
+#
+# 功能：
+#   1. 解析命令行参数
+#   2. 验证输入输出目录
+#   3. 启动 Python Agent 主程序
+#
+# 参数：
+#   -input  <DIR>  输入目录（包含 task_spec.md, limitations.md 等）
+#   -output <DIR>  输出目录（用于保存 decision_log.json 等结果）
+#
+# 返回值：
+#   0 - 成功
+#   1 - Agent 执行失败
+#   2 - 参数错误
+#   3 - 目录不存在
+# ============================================================================
+
+INPUT_DIR=""
+OUTPUT_DIR=""
+
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -input|--input)
+      INPUT_DIR="${2:-}"
+      shift 2
+      ;;
+    -output|--output)
+      OUTPUT_DIR="${2:-}"
+      shift 2
+      ;;
+    *)
+      # 忽略未知参数（Codabench 可能传递额外参数）
+      shift
+      ;;
+  esac
+done
+
+# 验证必需参数
+if [[ -z "$INPUT_DIR" || -z "$OUTPUT_DIR" ]]; then
+  echo "错误: 缺少必需参数" >&2
+  echo "用法: $0 -input <输入目录> -output <输出目录>" >&2
+  exit 2
+fi
+
+# 验证目录存在
+if [[ ! -d "$INPUT_DIR" ]]; then
+  echo "错误: 输入目录不存在: $INPUT_DIR" >&2
+  exit 3
+fi
+
+# 创建输出目录
+mkdir -p "$OUTPUT_DIR" || {
+  echo "错误: 无法创建输出目录: $OUTPUT_DIR" >&2
+  exit 3
+}
+
+# 显示运行信息
+echo "========================================"
+echo "  Scan Insertion Agent"
+echo "========================================"
+echo "输入目录: $INPUT_DIR"
+echo "输出目录: $OUTPUT_DIR"
+echo ""
+
+# 启动 Python Agent
+cd /submission
+exec python3 scan_agent.py --input "$INPUT_DIR" --output "$OUTPUT_DIR"
