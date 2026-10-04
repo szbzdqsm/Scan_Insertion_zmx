@@ -4,6 +4,8 @@
 
 本目录已补入用户提供的原始正式赛题 Word 文档 `赛题指南_广立微.docx`，并于 2026-10-04 读取原文核对实现。技术要求核对与剩余缺口见 `CONTEST_REQUIREMENTS.md`。后续补充文档时请单独提取新增文件；整包解压会覆盖目录里的已开发源码。
 
+同时包含并已阅读 `EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx`（11 张幻灯片，标注页码 6–16），作为补充参考。PPT 输入目录截图划掉了工具调用次数限制，但 Word 仍保留限制；在正式规则澄清前，继续执行各 case 的 `limitations.md`，不要仅凭截图取消调用上限。
+
 ## 已验证的本机环境
 
 - 开发机：Windows + WSL Ubuntu；WSL Docker CLI 已连到 Docker Desktop。
@@ -107,3 +109,4 @@ code ~/scan-agent-dev/agent
 - `README.md`：本地构建/运行起点。
 - `赛题指南_广立微.docx`：用户提供的原始赛题 Word 文档。
 - `CONTEST_REQUIREMENTS.md`：按正式指南核对的实现状态与剩余工作。
+- `EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx`：用户提供的原始宣讲资料。

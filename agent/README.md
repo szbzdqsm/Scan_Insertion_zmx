@@ -4,6 +4,8 @@ This package runs inside `scan-agent-base:ubuntu24`. It calls the real `dftexp_s
 
 The original contest guide is included as [赛题指南_广立微.docx](赛题指南_广立微.docx). See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for the requirements audit and remaining implementation gaps. Add documentation from updated handoff bundles individually; extracting an older starter over this folder overwrites the developed source.
 
+The contest presentation is also included as [EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx](EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx). Its guidance and the difference concerning tool-call limits are recorded in the requirements audit.
+
 ## Build
 
 ```bash
