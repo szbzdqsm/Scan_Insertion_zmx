@@ -3,3 +3,4 @@
 !requirements.txt
 !agent_system
 !scan_agent.py
+!extract_tool_help.py

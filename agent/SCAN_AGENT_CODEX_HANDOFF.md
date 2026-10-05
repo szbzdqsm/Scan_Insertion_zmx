@@ -6,6 +6,10 @@
 
 同时包含并已阅读 `EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx`（11 张幻灯片，标注页码 6–16），作为补充参考。PPT 输入目录截图划掉了工具调用次数限制，但 Word 仍保留限制；在正式规则澄清前，继续执行各 case 的 `limitations.md`，不要仅凭截图取消调用上限。
 
+## 最新接手状态（2026-10-06）
+
+开发目录直接关联 GitHub，打开 VS Code 时使用仓库根目录 `~/scan-agent-dev`。本地 Key 已配置并验证指定模型成功，11 个真实模型 Public 基线已执行完成但均未通过当前检查，修正版正在重跑。详细状态、修复内容和验证命令见仓库根目录 `LIVE_VALIDATION.md`。下文未配置 Key 的描述为历史状态。自动网表修复与 EQY 闭环仍未实现，禁止据此宣称提交成品。
+
 ## 已验证的本机环境
 
 - 开发机：Windows + WSL Ubuntu；WSL Docker CLI 已连到 Docker Desktop。
@@ -23,8 +27,8 @@
 
 ```text
 ~/scan-agent-dev/
-├── public_cases/public_cases/task_1/case1/input/...
-├── public_cases/public_cases/task_2/case1/input/...
+├── public_cases/task_1/case1/input/...
+├── public_cases/task_2/case1/input/...
 ├── reference_submission/...
 └── reference/Scan_User_Manual.pdf
 ```

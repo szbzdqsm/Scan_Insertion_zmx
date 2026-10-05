@@ -1,5 +1,11 @@
 # Scan Insertion Agent starter
 
+## Latest status (2026-10-06)
+
+The local Bailian Key has passed a real `deepseek-v4-pro` request. A live-model baseline ran all 11 Public cases and passed none of the current Agent checks. Revised images are being retested and have passed several small cases. See [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for measured results and remaining work. The earlier Golden replay described below is historical tool validation, not an autonomous Agent pass.
+
+The runtime now uses build-time official command help, bounded structural context with actual Liberty pin names, command preflight, report redirection normalization, live tool logs, process-group timeouts, and indexed audit evidence. The root VS Code task menu includes minimal model and full Public validation. Automatic Pre-scan editing/EQY and complete semantic validation remain unfinished; do not upload this development version for evaluation.
+
 This package runs inside `scan-agent-base:ubuntu24`. It calls the real `dftexp_scan` binary, saves each attempt, and refuses to fabricate a successful netlist or report. The current implementation has been replay-checked against all 11 Public cases using each case's `golden.dofile` as an offline test fixture. This verifies tool execution and artifact checks, but does not validate live LLM-generated Dofiles.
 
 The original contest guide is included as [赛题指南_广立微.docx](赛题指南_广立微.docx). See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for the requirements audit and remaining implementation gaps. Add documentation from updated handoff bundles individually; extracting an older starter over this folder overwrites the developed source.

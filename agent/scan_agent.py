@@ -9,6 +9,7 @@ import functools
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,34 @@ def read_text(path: Path, limit: int = 30000) -> str:
         return f.read(limit)
 
 
+def diagnostic_excerpt(path: Path, limit: int = 18000) -> str:
+    """Keep early errors as well as the end of a large log for the next model request."""
+    if not path.is_file():
+        return ""
+    errors: list[str] = []
+    seen: set[str] = set()
+    error_size = 0
+    tail: deque[str] = deque()
+    tail_size = 0
+    drc_samples: dict[str, int] = {}
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            drc = re.search(r"\b(DFTR[-_]?(?:\d+|TIE[01]))\b", line, re.I)
+            if re.search(r"\[(?:ERROR|FATAL)\]|unknown (?:option|command)|invalid command", line, re.I) or drc:
+                sample_ok = not drc or drc_samples.get(drc.group(1), 0) < 3
+                if line not in seen and sample_ok and error_size + len(line) <= limit // 2:
+                    errors.append(line)
+                    seen.add(line)
+                    error_size += len(line)
+                    if drc:
+                        drc_samples[drc.group(1)] = drc_samples.get(drc.group(1), 0) + 1
+            tail.append(line)
+            tail_size += len(line)
+            while tail_size > limit // 2 and tail:
+                tail_size -= len(tail.popleft())
+    return ("# Earlier tool errors\n" + "".join(errors) + "\n# End of tool log\n" + "".join(tail))[:limit]
+
+
 def case_id_for(input_dir: Path) -> str:
     """Use the enclosing case directory, not the commonly named `input` folder."""
     configured = os.environ.get("CASE_ID", "").strip()
@@ -45,7 +74,7 @@ def discover_files(input_dir: Path, suffix: str) -> list[Path]:
     return sorted(p for p in input_dir.rglob(f"*{suffix}") if p.is_file())
 
 
-def netlist_summary(paths: list[Path]) -> str:
+def netlist_summary(paths: list[Path], query: str = "") -> str:
     """Bound context size; never load a multi-hundred-MB gate netlist into the LLM prompt."""
     out: list[str] = []
     for p in paths:
@@ -53,26 +82,64 @@ def netlist_summary(paths: list[Path]) -> str:
         modules: list[str] = []
         ports: list[str] = []
         cells: dict[str, int] = {}
+        module_names: set[str] = set()
+        hierarchy: dict[str, list[tuple[str, str]]] = {}
+        control_ports: dict[str, list[str]] = {}
+        current_module = ""
         try:
             with p.open("r", encoding="utf-8", errors="replace") as f:
                 for i, line in enumerate(f):
                     if i > 4_000_000:
                         break
-                    m = re.search(r"\bmodule\s+([\w$]+)\s*(?:\((.*?)\))?\s*;", line)
-                    if m and len(modules) < 80:
-                        modules.append(m.group(1))
-                        if m.group(2) and len(ports) < 160:
-                            ports.extend(re.findall(r"[\w$]+", m.group(2)))
+                    m = re.match(r"\s*module\s+([\w$]+)", line)
+                    if m:
+                        current_module = m.group(1)
+                        module_names.add(current_module)
+                        if len(modules) < 80:
+                            modules.append(current_module)
+                    if current_module and re.match(r"\s*(?:input|output|inout)\b", line):
+                        if re.search(r"clk|clock|rst|reset|test|scan|mode|mbist|jtag", line, re.I):
+                            entries = control_ports.setdefault(current_module, [])
+                            if len(entries) < 24:
+                                entries.append(line.strip()[:240])
+                        if len(ports) < 160:
+                            ports.extend(re.findall(r"[\w$]+", line))
                     c = re.match(r"\s*([\w$]+)\s+(?:\\[^\s]+|[\w$]+)\s*\(", line)
-                    if c and ("df" in c.group(1).lower() or "sdf" in c.group(1).lower() or "dl" in c.group(1).lower() or "latch" in c.group(1).lower() or "clk" in c.group(1).lower()):
-                        cells[c.group(1)] = cells.get(c.group(1), 0) + 1
+                    if c and any(term in c.group(1).lower() for term in ("df", "dl", "latch", "clk", "clock")):
+                        kind = c.group(1)
+                        if not kind.startswith("sky130_fd_sc_"):
+                            kind = re.sub(r"\d+$", "*", kind)
+                        cells[kind] = cells.get(kind, 0) + 1
+                    if c and current_module and not c.group(1).startswith("sky130_fd_sc_"):
+                        entries = hierarchy.setdefault(current_module, [])
+                        instance = re.match(r"\s*[\w$]+\s+(\\[^\s]+|[\w$]+)\s*\(", line)
+                        if instance and len(entries) < 64:
+                            entries.append((instance.group(1), c.group(1)))
+                    if re.match(r"\s*endmodule\b", line):
+                        current_module = ""
         except OSError as e:
             out.append(f"Could not scan file: {e}")
             continue
         out.append("Modules (first 80): " + ", ".join(modules))
         out.append("Top-level port identifiers (best-effort): " + ", ".join(dict.fromkeys(ports[:160])))
-        out.append("Sequential/clock cell type counts (best-effort): " + json.dumps(cells, ensure_ascii=False))
-    return "\n".join(out)
+        out.append("Sequential/clock cell type counts (numeric module variants grouped; first 100): " +
+                   json.dumps(dict(sorted(cells.items(), key=lambda item: -item[1])[:100]), ensure_ascii=False))
+        links = {name: [f"{instance}:{kind}" for instance, kind in entries if kind in module_names]
+                 for name, entries in hierarchy.items()}
+        child_modules = {kind for entries in hierarchy.values() for _, kind in entries}
+        roots = sorted(module_names - child_modules)
+        preferred = sorted(module_names.intersection(re.findall(r"[A-Za-z_][\w$]*", query)))
+        preferred_roots = [name for name in preferred if name in roots]
+        order = list(dict.fromkeys(preferred_roots + preferred + roots + list(links)))
+        shown_roots = list(dict.fromkeys(preferred_roots + roots))[:40]
+        out.append("Root modules (not instantiated by another module in this file): " + ", ".join(shown_roots))
+        if len(roots) > 40:
+            out.append(f"Root module candidates total: {len(roots)}; only 40 names shown.")
+        out.append("Hierarchy (module -> child-instance:module): " +
+                   json.dumps({name: links.get(name, []) for name in order[:40]}, ensure_ascii=False)[:8000])
+        out.append("Clock/reset/test port declarations by module: " +
+                   json.dumps({name: control_ports.get(name, []) for name in order[:12]}, ensure_ascii=False)[:5000])
+    return "\n".join(out)[:50000]
 
 
 @functools.lru_cache(maxsize=1)
@@ -96,8 +163,21 @@ def manual_context(query: str, max_chars: int = 12000) -> str:
     if not text:
         return "Manual PDF is unavailable or not text-searchable. Use case Dofiles as syntax evidence; do not invent unsupported commands."
     terms = set(re.findall(r"[A-Za-z][A-Za-z0-9_]+", query.lower()))
+    critical = []
+    for pattern, commands in (
+        (r"悬空|浮空|伪|pseudo", ["add_pseudo_pi", "rpt_pseudo_pi"]),
+        (r"分区|partition", ["add_scan_partition", "set_current_scan_partition"]),
+        (r"ICG|时钟门控|clock.gating", ["set_dft_clock_gating_cfg", "clock_gating_init_cycles"]),
+        (r"Wrapper|黑盒|CTL", ["load_ctl", "set_wrapper_cfg"]),
+        (r"替换|回替|replacement", ["set_scan_cell_mapping", "replace_unscan"]),
+        (r"闩锁|latch|内部时钟|关联关系", ["associated_internal_clocks"]),
+        (r"移位寄存器|segment", ["set_scan_segment", "rpt_scan_segment"]),
+    ):
+        if re.search(pattern, query, re.I):
+            critical.extend(commands)
     pages = re.split(r"(?=\[manual page \d+\])", text)
-    ranked = sorted(pages, key=lambda p: sum(p.lower().count(term) for term in terms), reverse=True)
+    ranked = sorted(pages, key=lambda p: sum(p.lower().count(term) for term in terms) +
+                    sum(p.lower().count(command) * 40 for command in critical), reverse=True)
     selected: list[str] = []
     size = 0
     for page in ranked:
@@ -108,6 +188,80 @@ def manual_context(query: str, max_chars: int = 12000) -> str:
         selected.append(page)
         size += len(page)
     return "\n\n".join(selected) or text[:max_chars]
+
+
+def command_syntax(query: str, max_chars: int = 30000) -> str:
+    path = Path(__file__).with_name("tool_help.json")
+    if not path.is_file():
+        return "No build-time command syntax cache; consult the manual excerpts."
+    syntax = json.loads(path.read_text())
+    names = ["load_lib", "load_netlist", "present_design", "set_scan_signal", "set_scan_cfg",
+             "set_scan_cell_mapping", "set_scan_element", "set_dft_clock_gating_cfg", "insert_dft_logic",
+             "examine_scan_drc", "examine_scan_chain", "set_scan_drc_cfg", "dump_netlist", "dump_ctl",
+             "dump_def", "rpt_scan_chain", "rpt_scan_chain_cell", "rpt_scan_element", "rpt_scan_cfg",
+             "rpt_scan_signal", "rpt_scan_drc_violation", "rpt_insertion_info", "get_cells",
+             "get_pins", "get_ports", "get_nets", "get_obj_insts", "get_attr", "foreach_in_collection", "sizeof_collection"]
+    if re.search(r"悬空|浮空|伪|pseudo", query, re.I):
+        names = ["add_pseudo_pi", "rpt_pseudo_pi"] + names
+    if re.search(r"partition|分区", query, re.I):
+        names = ["add_scan_partition", "set_current_scan_partition", "rpt_scan_partition"] + names
+    if re.search(r"wrapper|CTL|黑盒", query, re.I):
+        names = ["load_ctl", "set_wrapper_cfg", "rpt_wrapper_cfg", "rpt_wrapper_implementation"] + names
+    if re.search(r"移位寄存器|segment", query, re.I):
+        names = ["set_scan_segment", "rpt_scan_segment"] + names
+    if re.search(r"忽略|允许|无需处理", query):
+        names = ["set_scan_drc_rule_handling", "rpt_scan_drc_rule_handling"] + names
+    chunks = []
+    size = 0
+    for name in dict.fromkeys(names):
+        text = syntax.get(name, "")
+        if text and size + len(text) <= max_chars:
+            chunks.append(text)
+            size += len(text)
+    return "\n\n".join(chunks)
+
+
+def unsupported_options(dofile: str) -> list[str]:
+    """Check literal options on simple commands against the installed tool's help."""
+    path = Path(__file__).with_name("tool_help.json")
+    if not path.is_file():
+        return []
+    syntax = json.loads(path.read_text())
+    problems = []
+    for line in dofile.replace("\\\n", " ").splitlines():
+        match = re.match(r"\s*([a-z_]+)\s+(.*)", line)
+        if not match or match.group(1) not in syntax:
+            continue
+        command, args = match.groups()
+        # Skip groups/substitutions; only literal options directly on this command are checked.
+        args = re.sub(r'\[[^\]]*\]|"[^"\n]*"|\{[^}]*\}', "", args)
+        args = args.split(";", 1)[0].split(" #", 1)[0]
+        allowed = set(re.findall(r"(?<![\w-])-([a-z_]+)\b", syntax[command]))
+        for option in re.findall(r"(?:^|\s)-([a-z_]+)\b", args):
+            if not any(name.startswith(option) for name in allowed):
+                problems.append(f"{command}: unsupported -{option}; supported options: " +
+                                ", ".join("-" + name for name in sorted(allowed)))
+    return list(dict.fromkeys(problems))[:10]
+
+
+def normalize_report_redirection(dofile: str) -> str:
+    """Adapt unsupported report -file to the official shell's equivalent redirection."""
+    path = Path(__file__).with_name("tool_help.json")
+    if not path.is_file():
+        return dofile
+    syntax = json.loads(path.read_text())
+    lines = []
+    for line in dofile.splitlines():
+        match = re.match(r"(\s*)(rpt_[a-z_]+)(\s+.*)", line)
+        if match and match.group(2) in syntax:
+            indent, command, args = match.groups()
+            if not re.search(r"(?<![\w-])-file\b", syntax[command]):
+                target = re.search(r'(?<!\S)-file\s+("[^"\n]+"|\{[^}\n]+\}|[^\s;]+)', args)
+                if target and ">" not in args and ";" not in args:
+                    args = args[:target.start()] + args[target.end():]
+                    line = indent + command + args.rstrip() + " > " + target.group(1)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 def parse_limit_seconds(text: str) -> int:
@@ -142,13 +296,27 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=key, base_url=os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"), timeout=45.0, max_retries=0)
 
 
-def ask(client: OpenAI, system: str, user: str, max_tokens: int = 7000) -> str:
+def ask(client: OpenAI, system: str, user: str, max_tokens: int = 7000,
+        request_log: Path | None = None) -> str:
+    started = time.monotonic()
     response = client.chat.completions.create(
         model=contest_model(),
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         max_tokens=max_tokens,
         temperature=0.1,
+        response_format={"type": "json_object"},
+        extra_body={"enable_thinking": os.environ.get("LLM_ENABLE_THINKING", "false").lower() == "true"},
     )
+    if request_log is not None:
+        usage = getattr(response, "usage", None)
+        request_log.write_text(json.dumps({
+            "model": contest_model(), "response_model": getattr(response, "model", None),
+            "response_id": getattr(response, "id", None),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "finish_reason": getattr(response.choices[0], "finish_reason", None),
+            "usage": usage.model_dump() if usage is not None else None,
+            "content": response.choices[0].message.content,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
     content = response.choices[0].message.content
     if not content:
         raise RuntimeError("LLM returned an empty response")
@@ -188,13 +356,29 @@ def get_task_artifacts(input_dir: Path) -> tuple[str, str, list[Path], list[Path
     return task, task_spec, netlists, libs, original if original.is_file() else None
 
 
+def liberty_summary(path: Path) -> str:
+    """Read actual sequential/clock cell pins without sending timing tables to the model."""
+    names = []
+    pin_map: dict[str, list[str]] = {}
+    current = ""
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            cell = re.match(r'\s*cell\s*\(\s*"?([^"\s)]+)', line)
+            if cell:
+                current = cell.group(1)
+                names.append(current)
+                if re.search(r"df|sdf|latch|clk|dl", current, re.I) and len(pin_map) < 40:
+                    pin_map[current] = []
+            pin = re.match(r'\s*pin\s*\(\s*"?([^"\s)]+)', line)
+            if pin and current in pin_map and len(pin_map[current]) < 24:
+                pin_map[current].append(pin.group(1))
+    return (f"{path.name}: {len(names)} cells; sample={', '.join(names[:30])}\n"
+            "Actual sequential/clock cell pin names: " + json.dumps(pin_map))[:8000]
+
+
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "") -> str:
     lib_names = [str(p) for p in libs]
-    lib_summary = []
-    for p in libs:
-        # Read only cell names; liberty files in public cases can be very large.
-        names = re.findall(r"\bcell\s*\(\s*([^\)]+)\s*\)", read_text(p, 8_000_000))
-        lib_summary.append(f"{p.name}: {len(names)} cells; sample={', '.join(names[:50])}")
+    lib_summary = [liberty_summary(p) for p in libs]
     return f"""# Natural-language task specification
 {task_spec}
 
@@ -208,10 +392,13 @@ Liberty files: {lib_names}
 {chr(10).join(lib_summary)}
 
 # Best-effort structural netlist scan
-{netlist_summary(netlists)}
+{netlist_summary(netlists, task_spec)}
 
 # ScanInsertion manual excerpts (authoritative syntax reference)
 {manual_context(task_spec)}
+
+# Command syntax from this installed tool's built-in verbose help
+{command_syntax(task_spec)}
 
 # Current Dofile
 {dofile}
@@ -225,7 +412,7 @@ Liberty files: {lib_names}
 
 
 def call_for_dofile(client: OpenAI, task: str, context: str, original: str | None,
-                    input_dir: Path, run_dir: Path) -> tuple[str, dict[str, Any]]:
+                    input_dir: Path, run_dir: Path, deadline: float | None = None) -> tuple[str, dict[str, Any]]:
     mode = "Generate a Dofile from the task requirements." if task == "task1" else "Repair the supplied original Dofile while preserving valid intent."
     if task == "task2" and original:
         context += "\n# Original Dofile (repair starting point)\n" + original
@@ -234,15 +421,41 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     "This runtime supports Dofile repairs only; it has no netlist-edit/EQY workflow. "
                     "Do not modify Pre-scan netlists. If netlist repair is necessary, leave the issue unresolved.")
     system = f"""You are an expert operator of the ScanInsertion tool `dftexp_scan` for the contest.
-Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts and evidence from existing Dofiles. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
+Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts, this tool's built-in help and evidence from existing Dofiles. Built-in help determines valid command options; do not use options from another EDA product. Correct every earlier ERROR before retrying. Use the actual Liberty pin names, never guess SE/SI/CLK. Choose the requested top module from root-module evidence, rather than an internal module whose name appears first. For reset signals, -off_state is the INACTIVE level: active-low reset means -off_state 1; active-high reset means -off_state 0. get_cells/get_pins return tool collections; use foreach_in_collection to iterate them. Declare wrapper control signals with set_scan_signal before referring to them in set_wrapper_cfg. Complete examine_scan_drc/examine_scan_chain before insert_dft_logic; do not call examine_scan_chain after insertion. For a clock passed through a latch, use the documented associated_internal_clocks option and exclude that latch from scan elements as required. Group repeated diagnostics by concrete root cause, rather than one issue per cell. Keep each diagnosis and summary short. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
 Return exactly one JSON object with keys: dofile (complete Tcl script as a string), summary (brief), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Each evidence_excerpt must be an exact short excerpt copied from the supplied PREVIOUS run's tool log or report. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it.
 The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
     user = f"{mode}\n\n{context}\n\nReturn the JSON object now."
-    result = json_from_response(ask(client, system, user))
-    dofile = result.get("dofile")
-    if not isinstance(dofile, str) or not dofile.strip():
-        raise ValueError("LLM JSON is missing a non-empty dofile")
-    return strip_fence(dofile), result
+    problems = []
+    for attempt in range(2):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                raise TimeoutError("Dofile generation exhausted its remaining case budget")
+            client = client.with_options(timeout=min(float(os.environ.get("AGENT_LLM_TIMEOUT", "90")),
+                                                     remaining), max_retries=0)
+        log_name = "llm_response.json" if attempt == 0 else "llm_response_retry.json"
+        raw = ask(client, system, user, request_log=run_dir / log_name)
+        try:
+            result = json_from_response(raw)
+            # Normalize this spelling without changing the proposed Tcl or inventing a repair.
+            dofile = result.get("dofile", result.get("dfile"))
+            if not isinstance(dofile, str) or not dofile.strip():
+                raise ValueError("LLM JSON is missing a non-empty dofile")
+            adapted = normalize_report_redirection(dofile)
+            if adapted.strip() != dofile.strip():
+                (run_dir / "llm_normalization.json").write_text(json.dumps({
+                    "kind": "report_file_redirection", "original_dofile": dofile,
+                    "executed_dofile": adapted}, ensure_ascii=False, indent=2))
+                dofile = adapted
+            problems = unsupported_options(dofile)
+            if not problems:
+                return strip_fence(dofile), result
+        except ValueError as error:
+            problems = [str(error)]
+        (run_dir / "llm_validation.json").write_text(json.dumps({"problems": problems}, indent=2))
+        user += "\n# Your previous proposed JSON\n" + raw + "\n# Preflight errors (no tool call made)\n" + "\n".join(problems)
+        user += "\nReturn corrected JSON with key dofile and valid options from the supplied built-in help."
+    raise ValueError("LLM Dofile failed command preflight: " + "; ".join(problems))
 
 
 def _is_inside(path: Path, parent: Path) -> bool:
@@ -271,6 +484,8 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
         if rel.parts and rel.parts[0] == "input":
             continue
         if source.name.endswith(".dofile") or source.suffix.lower() == ".log":
+            continue
+        if source.name.startswith("llm_") and source.suffix == ".json":
             continue
 
         parts = list(rel.parts)
@@ -316,19 +531,21 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
     log_path = run_dir / f"{run_id}.log"
     cmd = [TOOL, "-f", str(execute_path)]
     started = time.monotonic()
-    try:
-        proc = subprocess.run(cmd, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, errors="replace", timeout=max(1, timeout), check=False)
-        log_path.write_text(proc.stdout, encoding="utf-8")
-        status = "completed" if proc.returncode == 0 else "error"
-        error = None
-        code = proc.returncode
-    except subprocess.TimeoutExpired as e:
-        output = e.stdout or ""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", "replace")
-        log_path.write_text(str(output) + "\n[agent] tool timeout\n", encoding="utf-8")
-        status, error, code = "aborted", "timeout", None
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(cmd, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+        try:
+            code = proc.wait(timeout=max(1, timeout))
+            status = "completed" if code == 0 else "error"
+            error = None
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            log.write("\n[agent] tool timeout\n")
+            status, error, code = "aborted", "timeout", None
     elapsed = time.monotonic() - started
     # Collect only actual tool outputs. Preserve subdirectories and never fabricate reports.
     output_files = collect_tool_outputs(run_dir, run_id)
@@ -339,7 +556,8 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
 
 def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: str) -> tuple[bool, list[str]]:
     problems: list[str] = []
-    log = read_text(run_dir / f"{run_dir.name}.log", 100000)
+    log_path = run_dir / f"{run_dir.name}.log"
+    log = read_text(log_path, 100000)
     if status != "completed":
         problems.append("ScanInsertion tool did not exit successfully")
     diagnostic_files = [p for p in (run_dir / "reports").rglob("*") if p.is_file()]
@@ -347,7 +565,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     diagnostic_files = list(dict.fromkeys(diagnostic_files))
     diagnostics = "\n".join(read_text(p, 100000) for p in diagnostic_files)
     diagnostic_text = log + "\n" + diagnostics
-    if re.search(r"\[(?:ERROR|FATAL)\]", diagnostic_text, re.I):
+    if re.search(r"\[(?:ERROR|FATAL)\]", diagnostic_text + diagnostic_excerpt(log_path), re.I):
         problems.append("Tool log or DRC report contains an ERROR/FATAL diagnostic")
     allowed_codes: set[str] = set()
     for line in task_spec.splitlines():
@@ -359,9 +577,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
         found_codes = {re.sub(r"[-_ ]", "", c).upper()
                        for c in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", diagnostic_text, re.I)}
         blocking_codes = found_codes - allowed_codes
-        strict_zero = bool(re.search(r"DRC.{0,50}(?:无[^\n]{0,12}违例|必须清零|zero\s+violations|no\s+violations)|(?:无违例|必须清零).{0,40}DRC|(?:其余|其他).{0,12}(?:违例|violation).{0,20}(?:清零|zero)", task_spec, re.I))
-        warning_only = bool(re.search(r"\[WARNING\].*DFTDRC", diagnostic_text, re.I)) and not re.search(r"\[(?:ERROR|FATAL)\].*DFTDRC", diagnostic_text, re.I)
-        if not found_codes or blocking_codes and (strict_zero or not warning_only):
+        if not found_codes or blocking_codes:
             problems.append("DRC report has nonzero violations" +
                             (f" (unallowed codes: {', '.join(sorted(blocking_codes))})" if blocking_codes else " whose codes could not be verified"))
     actual_files = [p for p in run_dir.rglob("*") if p.is_file() and p.suffix.lower() not in {".dofile", ".log"} and not _is_inside(p, run_dir / "input")]
@@ -415,6 +631,15 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
                     problems.append(f"Scan-chain count mismatch: requested {desired_count}, tool report shows {actual_count}")
             elif actual_count is None:
                 problems.append(f"Could not verify requested scan-chain count {desired_count} from reports")
+        chain_cap = re.search(r"(?:扫描)?链数(?:量)?\s*(?:不得超过|不超过|最多|上限为)\s*(\d+)", task_spec)
+        if chain_cap:
+            chain_files = [p for p in report_files if "chain" in p.name.lower() and "cell" not in p.name.lower()]
+            chain_rows = sum(len(re.findall(r"(?m)^\s*(?:I\s+)?\d+\s+\d+\s+\S+\s+\S+", read_text(p, 100000)))
+                             for p in chain_files)
+            if not chain_rows:
+                problems.append("Could not verify the scan-chain channel budget from chain report rows")
+            elif chain_rows > int(chain_cap.group(1)):
+                problems.append(f"Scan-chain count {chain_rows} exceeds channel budget {chain_cap.group(1)}")
         max_length = re.search(r"(?:最大链长|最大长度|最大链长度|链最大长度)[^\d]{0,40}(\d+)|maximum\s+(?:chain\s+)?length\s*(?:is|of|:|=)?\s*(\d+)|max_length\s*(?:is|:|=)\s*(\d+)", task_spec, re.I)
         max_length_value = int(next(group for group in max_length.groups() if group)) if max_length else None
         # Public specs also express per-partition limits in Markdown tables.
@@ -490,7 +715,44 @@ def run_evidence_files(run_dir: Path) -> list[Path]:
     reports = sorted(p for p in (run_dir / "reports").rglob("*")
                      if p.is_file() and p.suffix.lower() in {".rpt", ".report", ".txt"})
     log = run_dir / f"{run_dir.name}.log"
-    return reports + ([log] if log.is_file() else [])
+    return sorted(reports, key=lambda p: p.stat().st_size) + ([log] if log.is_file() else [])
+
+
+@functools.lru_cache(maxsize=64)
+def evidence_windows(path_string: str, mtime_ns: int, size: int) -> list[list[tuple[int, str]]]:
+    """Index bounded evidence windows once; preserve original source line numbers."""
+    head: list[tuple[int, str]] = []
+    tail: deque[tuple[int, str]] = deque()
+    head_size = tail_size = 0
+    nearby: dict[int, str] = {}
+    nearby_size = 0
+    before: deque[tuple[int, str]] = deque(maxlen=3)
+    after = 0
+    counts: dict[str, int] = {}
+    with Path(path_string).open(encoding="utf-8", errors="replace") as stream:
+        for number, line in enumerate(stream, 1):
+            category = re.search(r"\bDFTR[-_]?(?:\d+|TIE[01])\b|\[(?:ERROR|FATAL)\]", line, re.I)
+            if category and counts.get(category.group(0), 0) < 3 and nearby_size < 131072:
+                for n, text in before:
+                    if n not in nearby:
+                        nearby[n] = text[:2000]
+                        nearby_size += len(nearby[n])
+                after = 4
+                counts[category.group(0)] = counts.get(category.group(0), 0) + 1
+            if after > 0 and nearby_size < 131072:
+                if number not in nearby:
+                    nearby[number] = line[:2000]
+                    nearby_size += len(nearby[number])
+                after -= 1
+            before.append((number, line))
+            if head_size + len(line) <= 262144 and len(head) < 3000:
+                head.append((number, line))
+                head_size += len(line)
+            tail.append((number, line))
+            tail_size += len(line)
+            while tail and (tail_size > 262144 or len(tail) > 3000):
+                tail_size -= len(tail.popleft()[1])
+    return [head, sorted(nearby.items()), list(tail)]
 
 
 def locate_evidence(files: list[Path], output_dir: Path, excerpt: str,
@@ -499,10 +761,17 @@ def locate_evidence(files: list[Path], output_dir: Path, excerpt: str,
     if not excerpt:
         return None
     line_count = excerpt.count("\n") + 1
+    if re.search(r"\[(?:ERROR|FATAL|WARNING|INFO)\]", excerpt, re.I):
+        files = sorted(files, key=lambda p: (p.suffix != ".log", p.stat().st_size))
     for path in files:
-        window: deque[str] = deque(maxlen=line_count)
-        with path.open("r", encoding="utf-8", errors="replace") as stream:
-            for last_line, line in enumerate(stream, 1):
+        stat = path.stat()
+        for block in evidence_windows(str(path), stat.st_mtime_ns, stat.st_size):
+            window: deque[str] = deque(maxlen=line_count)
+            previous_number = 0
+            for last_line, line in block:
+                if last_line != previous_number + 1:
+                    window.clear()
+                previous_number = last_line
                 window.append(line)
                 content = "".join(window)
                 if excerpt not in content:
@@ -570,6 +839,41 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
     """Accept conservative, issue-specific positive evidence from a real rerun."""
     found = issue["found"]["excerpt"]
     diagnosis = issue["diagnosis"]
+    if re.search(r"Cannot execute command 'examine_scan_chain' after executing 'insert_dft_logic'", found):
+        # The tool's own final chain examination supplies positive counts, not just silence.
+        for path in files:
+            if path.suffix != ".log":
+                continue
+            for window in evidence_windows(str(path), path.stat().st_mtime_ns, path.stat().st_size):
+                text = "".join(line for _, line in window)
+                match = re.search(r"Total scan chains checked:\s*(\d+)\nSuccess:\s*(\d+)\nFail:\s*0\b", text)
+                if match and int(match.group(1)) > 0 and match.group(1) == match.group(2):
+                    return locate_evidence([path], output_dir, match.group(0), positive=True)
+    design_match = re.search(r"\bpresent_design\s+([\w$]+)", diagnosis.get("located_object", ""))
+    if design_match and re.search(r"Nothing (?:implicitly )?matched|design.*not found", found, re.I):
+        # A real configuration/chain report identifies the design now present in the tool.
+        reports = [p for p in files if p.suffix.lower() in {".rpt", ".report", ".txt"}]
+        for path in reports:
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    if re.fullmatch(r"\s*Design:\s*" + re.escape(design_match.group(1)) + r"\s*", line):
+                        return locate_evidence([path], output_dir, line.strip(), positive=True)
+    if re.search(r"unknown (?:option|argument)", found, re.I) and "rpt_scan_drc_violation" in found:
+        # The reporting command emits a typed DRC summary rather than a completion message.
+        # Bind it to that command's actual output block, never to an earlier examine_scan_drc.
+        for path in files:
+            if path.suffix != ".log":
+                continue
+            in_report = False
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                for number, line in enumerate(stream, 1):
+                    if "CMD-0034" in line:
+                        in_report = bool(re.search(r"@\d+:\s*rpt_scan_drc_violation(?:\s|$)", line))
+                    elif in_report and re.search(r"\[(?:ERROR|FATAL)\]", line):
+                        in_report = False
+                    elif in_report and re.fullmatch(r"Total violations:\s*0\s*", line):
+                        return {"source": path.relative_to(output_dir).as_posix(),
+                                "locator": f"L{number}", "excerpt": line.strip()}
     # A zero DRC summary proves a DRC condition only; it says nothing about configuration.
     if re.search(r"\bDFTR[-_ ]?(?:\d+|TIE[01]|L[12])\b|Total violations:\s*[1-9]\d*", found, re.I):
         drc_files = [p for p in files if "drc" in p.name.lower() or "violation" in p.name.lower()]
@@ -584,8 +888,8 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
     description = " ".join(str(value) for value in diagnosis.values())
     required = diagnosis.get("violated_requirement", "")
     if required and re.search(r"chain[_ -]?count|链数|扫描链数量|scan\s+chains?.{0,20}(?:count|number)", description, re.I):
-        wanted = re.search(r"(\d+)\s*条|(?:chain[_ -]?count|(?:number|total)\s+of\s+(?:scan\s+)?chains?)\s*[:=：]?\s*(\d+)", required, re.I)
-        actual = re.search(r"(?:number\s+of\s+chains|total\s+(?:scan\s+)?chains|scan\s+chains?)\s*[:=：]?\s*(\d+)", expected, re.I)
+        wanted = re.search(r"(\d+)\s*(?:条|(?:scan\s+)?chains?)|(?:chain[_ -]?count|(?:number|total)\s+(?:of\s+)?(?:scan\s+)?chains?)\s*[:=：]?\s*(\d+)", required, re.I)
+        actual = re.search(r"(?:number\s+of\s+chains|total\s+(?:of\s+)?(?:scan\s+)?chains(?:\s+checked)?|scan\s+chains?)\s*[:=：]?\s*(\d+)", expected, re.I)
         if wanted and actual and int(next(value for value in wanted.groups() if value)) == int(actual.group(1)):
             candidates = [p for p in candidates if p.suffix.lower() in {".rpt", ".report", ".txt"}
                           and "chain" in p.name.lower()]
@@ -609,7 +913,7 @@ def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[st
         if not attempts or issue["found"]["run_ref"] == current_run:
             continue
         verify = attempts[-1]["verify"]
-        if verify["run_ref"] != current_run or verify["resolved"]:
+        if verify["resolved"]:
             continue
         evidence = positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir)
         if evidence:
@@ -675,6 +979,7 @@ def main() -> int:
         previous = original or ""
         last_log = ""
         generation_error = ""
+        validation_problems: list[str] = []
         static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "")
         for index in range(1, max_calls + 1):
             remaining = timeout_total - (time.monotonic() - start)
@@ -683,6 +988,13 @@ def main() -> int:
             rid = f"R{index}"
             run_dir = runs_root / rid
             run_dir.mkdir(parents=True, exist_ok=False)
+            script_root = run_dir / "input"
+            if task == "task2":
+                script_root.mkdir()
+                for dirname in ("netlist", "lib", "ctl"):
+                    source = input_dir / dirname
+                    if source.exists():
+                        (script_root / dirname).symlink_to(source, target_is_directory=True)
             previous_reports = ""
             if run_records:
                 previous_dir = runs_root / run_records[-1]["run_id"]
@@ -694,16 +1006,12 @@ def main() -> int:
             context = (static_context + f"\n# Current Dofile\n{previous}\n\n"
                        f"# Most recent tool log / diagnostics\n{last_log[-18000:] if last_log else '(no run yet)'}\n\n"
                        f"# Most recent tool reports\n{previous_reports[-18000:] if previous_reports else '(no reports captured yet)'}\n")
+            if validation_problems:
+                context += "\n# Independent output-validator findings from previous round\n" + "\n".join(validation_problems)
             if task == "task2" and index == 1 and original is not None:
                 # R1 is a faithful diagnostic run of the supplied Dofile. Preserve the original as evidence.
                 dofile, meta = original, {"summary": "Run the supplied original Dofile to gather diagnostic evidence.", "requirement_mapping": [], "issue_resolutions": []}
-                script_root = run_dir / "input"
-                script_root.mkdir(parents=True, exist_ok=True)
                 (script_root / "original.dofile").write_text(original, encoding="utf-8")
-                for dirname in ("netlist", "lib", "ctl"):
-                    source = input_dir / dirname
-                    if source.exists():
-                        (script_root / dirname).symlink_to(source, target_is_directory=True)
                 execution_path = script_root / "original.dofile"
             else:
                 try:
@@ -713,15 +1021,20 @@ def main() -> int:
                     if remaining <= finalize_reserve + 1:
                         generation_error = f"Insufficient time for Dofile generation before {rid}; finalization reserve retained"
                         break
-                    request_client = client.with_options(timeout=max(1.0, min(45.0, remaining - finalize_reserve - 1)), max_retries=0)
+                    request_client = client.with_options(
+                        timeout=max(1.0, min(float(os.environ.get("AGENT_LLM_TIMEOUT", "90")),
+                                             remaining - finalize_reserve - 1)), max_retries=0)
                     dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
-                                                 input_dir, run_dir)
+                                                 input_dir, run_dir, start + timeout_total - finalize_reserve - 1)
                 except Exception as e:
                     generation_error = f"LLM Dofile generation failed before R{index}: {type(e).__name__}: {e}"
                     if run_records:
                         break
                     raise
                 execution_path = None
+                if task == "task2":
+                    execution_path = script_root / f"{rid}.dofile"
+                    execution_path.write_text(dofile, encoding="utf-8")
             # Generation and report-context reads consumed time; never reuse the pre-LLM budget.
             remaining = timeout_total - (time.monotonic() - start)
             if remaining <= finalize_reserve + 1:
@@ -743,10 +1056,11 @@ def main() -> int:
             record["log_file"] = str((run_dir / f"{rid}.log").relative_to(output_dir)).replace("\\", "/")
             record["exit_status"] = result["status"]
             run_records.append(record)
-            last_log = read_text(run_dir / f"{rid}.log", 50000)
+            last_log = diagnostic_excerpt(run_dir / f"{rid}.log")
             previous = dofile
             final_run_dir = run_dir
             ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"])
+            validation_problems = problems
             if meta.get("requirement_mapping"):
                 requirement_mapping = []
                 for item in meta.get("requirement_mapping", []):
@@ -759,7 +1073,7 @@ def main() -> int:
             unresolved = any(issue.get("found", {}).get("verified") and
                              not (issue.get("attempts") and issue["attempts"][-1].get("verify", {}).get("resolved"))
                              for issue in issue_records)
-            if ok and not unresolved:
+            if ok and not unresolved and not issue_audit_problems(task, issue_records, changes):
                 break
             if index < max_calls:
                 continue

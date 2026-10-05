@@ -44,6 +44,24 @@
       "problemMatcher": []
     },
     {
+      "label": "Scan: 最小模型调用验证（WSL）",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "scripts/check_model.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Scan: 完整 Public 验证（WSL，调用模型）",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "scripts/run_public_cases.py", "--jobs", "1"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": ["Scan: 最小模型调用验证（WSL）", "Scan: 构建运行镜像（WSL）"],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
       "label": "Scan: 运行一个 case（WSL）",
       "type": "process",
       "command": "bash",

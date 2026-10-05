@@ -110,11 +110,127 @@ class AuditRegression(unittest.TestCase):
         agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
         self.assertEqual(issues[0]["attempts"][0]["verify"]["locator"], "L2")
 
+    def test_report_command_fix_requires_its_actual_output_block(self):
+        item = dict(self.item,
+                    evidence_excerpt="[ERROR] Unknown option '-file' for command 'rpt_scan_drc_violation'.",
+                    located_object="rpt_scan_drc_violation", root_cause="unsupported -file option",
+                    violated_requirement="produce a DRC report")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        log = self.out / "runs/R2/R2.log"
+        log.write_text("Total violations: 0\n[INFO] [CMD-0034] @2: # rpt_scan_drc_violation\n1\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        log.write_text("[INFO] [CMD-0034] @3: rpt_scan_drc_violation\nDRC Report\nTotal violations: 0\n1\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+        self.assertEqual(issues[0]["attempts"][0]["verify"]["locator"], "L3")
+
+    def test_command_preflight_ignores_nested_query_options(self):
+        path = self.root / "tool_help.json"
+        path.write_text(json.dumps({"set_scan_cfg": "[-max_length length] [-internal_clocks none]",
+                                    "set_scan_element": "set_scan_element false instance_list"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options("set_scan_cfg -scan_data_in_prefix si"))
+            self.assertEqual(agent.unsupported_options("set_scan_cfg -internal_clock none"), [])
+            self.assertEqual(agent.unsupported_options(
+                "set_scan_element false [get_cells -hierarchical {u_core/*}]"), [])
+
+    def test_report_file_adapter_preserves_supported_file_options(self):
+        path = self.root / "tool_help.json"
+        path.write_text(json.dumps({"rpt_scan_drc_violation": "[-verbose]",
+                                    "rpt_scan_chain": "[-file filename]"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            text = agent.normalize_report_redirection(
+                'rpt_scan_drc_violation -verbose -file "report with spaces.rpt"\n'
+                'rpt_scan_chain -file "chain.rpt"\n')
+        self.assertIn('rpt_scan_drc_violation -verbose > "report with spaces.rpt"', text)
+        self.assertIn('rpt_scan_chain -file "chain.rpt"', text)
+
+    def test_chain_order_fix_requires_positive_success_counts(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Cannot execute command 'examine_scan_chain' "
+                    "after executing 'insert_dft_logic' command.", located_object="examine_scan_chain",
+                    violated_requirement="build scan chains", fix="move examination before insertion")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        log = self.out / "runs/R2/R2.log"
+        log.write_text("Total scan chains checked: 4\nSuccess: 3\nFail: 1\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        log.write_text("Total scan chains checked: 4\nSuccess: 4\nFail: 0\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_liberty_context_includes_actual_scan_pins(self):
+        path = self.root / "cells.lib"
+        path.write_text('cell ("sky130_fd_sc_hd__sdfxtp_1") {\n'
+                        'pin ("SCD") { }\npin ("SCE") { }\npin ("CLK") { }\n}\n')
+        summary = agent.liberty_summary(path)
+        self.assertIn('"SCD", "SCE", "CLK"', summary)
+
+    def test_later_successful_round_can_verify_an_earlier_fix(self):
+        issues, plans = self.record()
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", False)
+        run = self.out / "runs/R3"
+        (run / "reports").mkdir(parents=True)
+        (run / "reports/drc.rpt").write_text("DRC Report\nTotal violations: 0\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R3", True)
+        self.assertEqual(issues[0]["attempts"][0]["verify"]["run_ref"], "R3")
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_missing_design_fix_requires_actual_report_for_correct_design(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Nothing matched for 'design'.",
+                    located_object="present_design cpu", root_cause="missing netlist load")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        report = self.out / "runs/R2/reports/scan_cfg.rpt"
+        report.write_text("Design: unrelated_cpu\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        report.write_text("Design: cpu\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
     def test_multiline_and_late_log_evidence_preserve_real_lines(self):
         path = self.out / "runs/R1/R1.log"
         path.write_text(("prefix\n" * 18000) + "first diagnostic\nsecond diagnostic\n")
         evidence = agent.locate_evidence([path], self.out, "first diagnostic\nsecond diagnostic")
         self.assertEqual(evidence["locator"], "L18001-L18002")
+
+    def test_model_context_retains_early_errors_in_long_log(self):
+        path = self.root / "large.log"
+        error = "[ERROR] Unknown option '-active_state' for command 'set_scan_signal'.\n"
+        path.write_text(error + ("ordinary progress\n" * 20000) + "[INFO] tool finished\n")
+        context = agent.diagnostic_excerpt(path)
+        self.assertIn(error.strip(), context)
+        self.assertIn("tool finished", context)
+        self.assertLessEqual(len(context), 18000)
+
+    def test_multiline_modules_and_actual_parent_instance_names_are_summarized(self):
+        path = self.root / "hierarchy.v"
+        path.write_text("module child (\nclk\n);\ninput clk;\nendmodule\n"
+                        "module top (\nclk\n);\ninput clk;\nchild u_cpu (.clk(clk));\nendmodule\n")
+        summary = agent.netlist_summary([path], "Top 模块 top")
+        self.assertIn("u_cpu:child", summary)
+        self.assertIn("Root modules (not instantiated by another module in this file): top", summary)
+
+    def test_many_module_names_cannot_overflow_model_context(self):
+        path = self.root / "many_modules.v"
+        path.write_text("".join(f"module SNPS_CLOCK_GATE_HIGH_{i}();\nendmodule\n" for i in range(12000)) +
+                        "module actual_top();\nendmodule\n")
+        summary = agent.netlist_summary([path], "Top 模块 actual_top")
+        self.assertLessEqual(len(summary), 50000)
+        self.assertIn("actual_top", summary)
+        self.assertIn("only 40 names shown", summary)
+
+    def test_late_error_is_not_hidden_by_output_prefix_limit(self):
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/post_scan.v").write_text("module top(); endmodule\n")
+        (run / "R2.log").write_text("progress\n" * 20000 + "[ERROR] late command failure\n")
+        ok, problems = agent.check_output(run, "Generate Verilog.", "task1", "exit\n", "completed")
+        self.assertFalse(ok)
+        self.assertIn("Tool log or DRC report contains an ERROR/FATAL diagnostic", problems)
 
     def run_main(self, task2=False, diagnosed=False, generation_seconds=17):
         input_dir = self.root / "work/input/hidden_case_1/input"
