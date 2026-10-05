@@ -20,21 +20,21 @@ sys.path.insert(0, str(ROOT / "agent"))
 from scan_agent import parse_limit_seconds  # noqa: E402
 
 
-def run_case(case: Path, batch: Path, image: str, env_file: Path) -> dict:
+def run_case(case: Path, batch: Path, image: str, env_file: Path, thinking: str | None = None) -> dict:
     large = sum(path.stat().st_size for path in (case / "input/netlist").rglob("*.v")) > 64 * 1024 * 1024
     # Measured large designs use several GiB each on this WSL host; serialize them.
     if not large:
-        return execute_case(case, batch, image, env_file)
+        return execute_case(case, batch, image, env_file, thinking)
     with LARGE_CASE_LOCK, (batch.parent / ".public-large.lock").open("a") as lock:
         # flock also coordinates separate batches launched from other terminals.
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            return execute_case(case, batch, image, env_file)
+            return execute_case(case, batch, image, env_file, thinking)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def execute_case(case: Path, batch: Path, image: str, env_file: Path) -> dict:
+def execute_case(case: Path, batch: Path, image: str, env_file: Path, thinking: str | None = None) -> dict:
     tag = f"{case.parent.name}_{case.name}"
     source = case / "input"
     output = batch / tag
@@ -60,6 +60,8 @@ def execute_case(case: Path, batch: Path, image: str, env_file: Path) -> dict:
                "-e", f"CASE_ID={tag}", *mounts,
                "--mount", f"type=bind,source={output},target=/output",
                image, "-input", "/input", "-output", "/output"]
+    if thinking is not None:
+        command[2:2] = ["-e", "LLM_ENABLE_THINKING=" + ("true" if thinking == "on" else "false")]
     started = time.monotonic()
     print(f"START {tag} (case limit {limit}s)", flush=True)
     timed_out = False
@@ -101,6 +103,7 @@ def main() -> int:
     parser.add_argument("--image", default="scan-agent-dev:local")
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=1)
     parser.add_argument("--select", nargs="+", help="Optional task_1/case1 style subset")
+    parser.add_argument("--thinking", choices=("on", "off"), help="Optional model reasoning-mode experiment")
     args = parser.parse_args()
     env_file = ROOT / "agent/.env"
     if not env_file.is_file():
@@ -118,10 +121,11 @@ def main() -> int:
                               check=True, capture_output=True, text=True).stdout.strip()
     summary = {"image": args.image, "image_id": image_id, "model": "deepseek-v4-pro",
                "mode": "live_model", "answers_exposed": False,
+               "thinking": args.thinking or "runtime_default",
                "case_count": len(cases), "cases": []}
     print(f"Batch directory: {batch}", flush=True)
     with ThreadPoolExecutor(max_workers=args.jobs) as workers:
-        futures = {workers.submit(run_case, case, batch, image_id, env_file): case for case in cases}
+        futures = {workers.submit(run_case, case, batch, image_id, env_file, args.thinking): case for case in cases}
         for future in as_completed(futures):
             try:
                 summary["cases"].append(future.result())

@@ -155,6 +155,15 @@ class AuditRegression(unittest.TestCase):
             self.assertEqual(agent.unsupported_options('get_cells -hier -filter "is_sequential == true"'), [])
             self.assertEqual(agent.unsupported_options('get_pins -filter "is_clock_pin == true"'), [])
 
+    def test_multiple_input_files_are_one_tcl_list_argument(self):
+        text = agent.normalize_load_file_lists('load_netlist -top top "/input/a.v" "/input/path with spaces/b.v"\n'
+                                               'load_lib /input/a.lib /input/b.lib\n')
+        self.assertIn('load_netlist -top top [list "/input/a.v" "/input/path with spaces/b.v"]', text)
+        self.assertIn('load_lib [list /input/a.lib /input/b.lib]', text)
+        self.assertEqual(agent.normalize_load_file_lists(text), text)
+        self.assertEqual(agent.normalize_load_file_lists('load_netlist {/a.v /b.v} -top top\n'),
+                         'load_netlist {/a.v /b.v} -top top\n')
+
     def test_chain_order_fix_requires_positive_success_counts(self):
         item = dict(self.item, evidence_excerpt="[ERROR] Cannot execute command 'examine_scan_chain' "
                     "after executing 'insert_dft_logic' command.", located_object="examine_scan_chain",
@@ -219,6 +228,59 @@ class AuditRegression(unittest.TestCase):
         self.assertLess(text.index("rpt_scan_cfg >"), text.index("exit"))
         self.assertIn("insert_dft_logic", text)
 
+    def test_incremental_round_replaces_owned_audit_block(self):
+        (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_cfg": "rpt_scan_cfg"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            first = agent.append_audit_reports("insert_dft_logic\nexit\n", self.out / "runs/R1")
+            second = agent.append_audit_reports(first, self.out / "runs/R2")
+            repeated = agent.append_audit_reports(second, self.out / "runs/R2")
+        self.assertEqual(second, repeated)
+        self.assertEqual(second.count("rpt_scan_cfg >"), 1)
+        self.assertNotIn(str(self.out / "runs/R1"), second)
+        self.assertIn(str(self.out / "runs/R2"), second)
+
+    def test_round_rebases_script_and_mapping_without_mutating_evidence(self):
+        before, after = self.out / "runs/R1", self.out / "runs/R2"
+        script = f'dump_netlist "{before}/deliverables/post.v"\nexit\n'
+        mapping = [{"requirement": "Produce netlist", "dft_config": script.splitlines()[0], "dofile_ref": "L1"}]
+        rebased, copied = agent.rebase_round(script, mapping, before, after)
+        self.assertNotIn(str(before), rebased)
+        self.assertIn(str(after), copied[0]["dft_config"])
+        self.assertEqual(agent.config_reference(rebased, copied[0]["dft_config"]), "L1")
+        self.assertNotIn("dofile_ref", copied[0])
+        self.assertIn(str(before), mapping[0]["dft_config"])
+        self.assertEqual(mapping[0]["dofile_ref"], "L1")
+
+    def generate_patch(self, responses, base="set_scan_cfg -chain_count 4\nexit\n", mapping=None):
+        run = self.out / "runs/R2"
+        (self.root / "task_spec.md").write_text("Configure a scan chain count.")
+        if mapping is None:
+            mapping = [{"requirement": "Four scan chains", "dft_config": "set_scan_cfg -chain_count 4"}]
+        with patch.object(agent, "ask", side_effect=[json.dumps(item) for item in responses]), \
+             patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            return agent.call_for_dofile(object(), "task1", "local fixture", None,
+                                         self.root, run, base_dofile=base, previous_mapping=mapping)
+
+    def test_localized_dofile_repair_inherits_valid_mapping(self):
+        dofile, meta = self.generate_patch([{"dofile_edits": [{"old": "exit\n", "new": "rpt_scan_cfg\nexit\n"}]}])
+        self.assertEqual(dofile, "set_scan_cfg -chain_count 4\nrpt_scan_cfg\nexit\n")
+        self.assertEqual(meta["requirement_mapping"][0]["dft_config"], "set_scan_cfg -chain_count 4")
+
+    def test_changed_configuration_requires_updated_mapping(self):
+        edit = {"dofile_edits": [{"old": "-chain_count 4", "new": "-chain_count 8"}]}
+        fixed = dict(edit, requirement_mapping=[{"requirement": "Eight scan chains", "dft_config": "set_scan_cfg -chain_count 8"}])
+        dofile, meta = self.generate_patch([edit, fixed])
+        self.assertIn("-chain_count 8", dofile)
+        self.assertEqual(meta["requirement_mapping"][0]["dft_config"], "set_scan_cfg -chain_count 8")
+        validation = json.loads((self.out / "runs/R2/llm_validation.json").read_text())
+        self.assertIn("has no actual Tcl match", validation["problems"][0])
+
+    def test_ambiguous_including_overlapping_dofile_edit_is_rejected(self):
+        for base, old in [("exit\nexit\n", "exit"), ("aaa\nexit\n", "aa")]:
+            edit = {"dofile_edits": [{"old": old, "new": "new"}]}
+            with self.assertRaisesRegex(ValueError, "unique"):
+                self.generate_patch([edit, edit], base=base)
+
     def test_later_successful_round_can_verify_an_earlier_fix(self):
         issues, plans = self.record()
         agent.verify_issue_fixes(issues, plans, self.out, "R2", False)
@@ -270,6 +332,8 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(agent.config_reference(dofile, "set_scan_signal -type clock -port clk; set_scan_cfg -chain_count 4"), "L2-L4")
         self.assertEqual(agent.config_reference(dofile, "set_scan_element false [SFFs in PLL]"), "")
         self.assertEqual(agent.config_reference(dofile, "set_scan_cfg -chain_count 40"), "")
+        self.assertEqual(agent.config_reference(dofile, "set_scan_cfg -max_length 100 -chain_count 4"), "L3-L4")
+        self.assertEqual(agent.config_reference(dofile, "set_scan_cfg -max_length 100 (in all partitions)"), "")
 
     def test_many_module_names_cannot_overflow_model_context(self):
         path = self.root / "many_modules.v"
@@ -288,6 +352,35 @@ class AuditRegression(unittest.TestCase):
         ok, problems = agent.check_output(run, "Generate Verilog.", "task1", "exit\n", "completed")
         self.assertFalse(ok)
         self.assertIn("Tool log or DRC report contains an ERROR/FATAL diagnostic", problems)
+
+    def test_generated_error_terminates_tool_process_group(self):
+        run = self.out / "runs/R2"
+        pid_file = self.root / "child.pid"
+        wrapper = self.root / "tool_fixture.py"
+        wrapper.write_text(f"#!{sys.executable}\nimport subprocess,sys,time\n"
+                           "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
+                           f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                           "print('[ERROR] local fixture diagnostic', flush=True)\ntime.sleep(20)\n")
+        wrapper.chmod(0o700)
+        with patch.object(agent, "TOOL", str(wrapper)):
+            result = agent.tool_run("exit\n", run, "R2", 4, abort_on_error=True)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], "early_tool_error")
+        self.assertLess(result["elapsed_seconds"], 3)
+        state = Path("/proc") / pid_file.read_text() / "stat"
+        self.assertTrue(not state.exists() or state.read_text().split()[2] == "Z")
+        self.assertIn("remaining commands were not executed", (run / "R2.log").read_text())
+
+    def test_original_script_is_not_stopped_at_an_error(self):
+        wrapper = self.root / "tool_fixture.py"
+        wrapper.write_text(f"#!{sys.executable}\nimport time\n"
+                           "print('[ERROR] original fixture diagnostic', flush=True)\ntime.sleep(0.2)\n"
+                           "print('original reached its end', flush=True)\n")
+        wrapper.chmod(0o700)
+        with patch.object(agent, "TOOL", str(wrapper)):
+            result = agent.tool_run("exit\n", self.out / "runs/R1", "R1", 4, abort_on_error=False)
+        self.assertEqual(result["returncode"], 0)
+        self.assertIn("original reached its end", (self.out / "runs/R1/R1.log").read_text())
 
     def run_main(self, task2=False, diagnosed=False, generation_seconds=17):
         input_dir = self.root / "work/input/hidden_case_1/input"
@@ -320,7 +413,7 @@ class AuditRegression(unittest.TestCase):
                         return types.SimpleNamespace(choices=[types.SimpleNamespace(
                             message=types.SimpleNamespace(content=json.dumps(response)))])
 
-        def tool(dofile, run_dir, run_id, timeout, execution_path):
+        def tool(dofile, run_dir, run_id, timeout, execution_path, abort_on_error=True):
             captures["calls"].append(timeout)
             delivery = run_dir / "deliverables"
             reports = run_dir / "reports"

@@ -44,7 +44,7 @@ docker build -t scan-agent-dev:local -f agent/Dockerfile agent
 
 ## 真实模型验证
 
-本地百炼 Key 已验证可调用 `deepseek-v4-pro`。真实模型的完整 Public 基线已跑完，未全部通过；后续修正版仍在重跑。实际结果与未完成能力见 [LIVE_VALIDATION.md](LIVE_VALIDATION.md)，不能把早期 Golden 回放结果当作 Agent 自主通过。
+本地百炼 Key 已验证可调用 `deepseek-v4-pro`。真实模型的完整 Public 基线已跑完；最新已完成的小用例批次通过当前检查 4/9，失败问题仍在修复。实际结果与未完成能力见 [LIVE_VALIDATION.md](LIVE_VALIDATION.md)，不能把早期 Golden 回放结果当作 Agent 自主通过。
 
 ```bash
 .venv/bin/python scripts/check_model.py

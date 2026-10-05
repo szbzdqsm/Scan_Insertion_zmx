@@ -30,7 +30,7 @@ def patch_unique(source: Path, destination: Path, old: str, new: str) -> None:
         raise RepairRejected("Each edit needs a distinct, nonempty old span and at most 16384 characters")
     if max(old.count("\n"), new.count("\n")) > 32:
         raise RepairRejected("Edits are limited to 32 lines each")
-    if re.search(r"(?m)^\s*(?:module|endmodule|input|output|inout|parameter)\b", old + "\n" + new):
+    if re.search(r"\b(?:module|endmodule|input|output|inout|parameter)\b", old + "\n" + new):
         raise RepairRejected("Automatic edits cannot change module interfaces or parameters")
     needle, replacement = old.encode(), new.encode()
     # Count first, so a rejected edit never leaves a partially accepted version.
@@ -81,6 +81,23 @@ def proof_top(spec: str, original_dofile: str, netlists: list[Path]) -> str:
         if name in names:
             return name
     raise RepairRejected("Cannot determine a proof top from task specification and the supplied original Dofile")
+
+
+def containing_module(path: Path, excerpt: str) -> str:
+    module = ""
+    buffer = ""
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            declaration = re.match(r"\s*module\s+([A-Za-z_][\w$]*)", line)
+            if declaration:
+                module = declaration.group(1)
+            buffer += line
+            if excerpt in buffer:
+                if not module:
+                    raise RepairRejected("Every changed span must belong to a concrete module")
+                return module
+            buffer = buffer[-max(1, len(excerpt)-1):]
+    raise RepairRejected("Cannot locate the changed module for proof coverage")
 
 
 def eqy_configuration(originals: list[Path], candidates: list[Path], libs: list[Path], top: str) -> str:
@@ -147,6 +164,7 @@ def prepare_repair(task: str, spec: str, original_dofile: str, input_dir: Path,
     candidate_root.mkdir(parents=True, exist_ok=False)
     candidate_map = dict(active)
     changed: set[Path] = set()
+    affected_modules: set[str] = set()
     for index, edit in enumerate(edits):
         path = Path(str(edit.get("file", "")))
         source = (path if path.is_absolute() else input_dir / path).resolve()
@@ -155,6 +173,7 @@ def prepare_repair(task: str, spec: str, original_dofile: str, input_dir: Path,
         if not str(edit.get("reason", "")).strip():
             raise RepairRejected("Every edit must explain why Dofile settings alone are insufficient")
         relative = source.relative_to(input_dir / "netlist")
+        affected_modules.add(containing_module(candidate_map[source], str(edit.get("old", ""))))
         intermediate = candidate_root / ".patches" / f"{index}.v"
         patch_unique(candidate_map[source], intermediate, str(edit.get("old", "")), str(edit.get("new", "")))
         target = candidate_root / relative
@@ -170,10 +189,21 @@ def prepare_repair(task: str, spec: str, original_dofile: str, input_dir: Path,
             target.symlink_to(active[source])
             candidate_map[source] = target
     top = proof_top(spec, original_dofile, originals)
-    proof = run_proof(originals, [candidate_map[path] for path in originals], libs, top,
-                      output_dir / "lec" / run_id, deadline)
-    if not proof["passed"]:
-        raise RepairRejected(f"EQY did not prove candidate equivalent to original: {proof['result']}; candidate not adopted")
+    proof_root = output_dir / "lec" / run_id
+    aggregate = proof_root / "aggregate.log"
+    proof_logs = []
+    for index, module in enumerate([top] + sorted(affected_modules - {top})):
+        directory = proof_root if index == 0 else proof_root / f"affected_{index}"
+        proof = run_proof(originals, [candidate_map[path] for path in originals], libs, module, directory, deadline)
+        actual_log = directory / "eqy.log"
+        if actual_log.is_file():
+            proof_logs.append(actual_log.relative_to(output_dir).as_posix())
+            with aggregate.open("a") as output, actual_log.open() as source_log:
+                output.write(f"\n[agent] Actual EQY log for module {module}: {actual_log}\n")
+                while chunk := source_log.read(65536):
+                    output.write(chunk)
+        if not proof["passed"] or not actual_log.is_file():
+            raise RepairRejected(f"EQY did not prove module {module} equivalent to original: {proof['result']}; candidate not adopted")
     changes = []
     diff_root = output_dir / "diffs"
     diff_root.mkdir(exist_ok=True)
@@ -187,5 +217,5 @@ def prepare_repair(task: str, spec: str, original_dofile: str, input_dir: Path,
             raise RepairRejected("Could not retain a real nonempty original-to-candidate netlist diff")
         changes.append({"type": "netlist", "path": candidate_map[source].relative_to(output_dir).as_posix(),
                         "diff_path": diff.relative_to(output_dir).as_posix(),
-                        "lec_ref": (output_dir / "lec" / run_id / "eqy.log").relative_to(output_dir).as_posix()})
+                        "lec_ref": aggregate.relative_to(output_dir).as_posix(), "lec_refs": proof_logs})
     return candidate_map, changes

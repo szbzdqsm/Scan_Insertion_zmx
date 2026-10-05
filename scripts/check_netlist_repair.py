@@ -40,6 +40,19 @@ def main() -> int:
                          "reason": "deliberately non-equivalent negative fixture"}], out, "R3", time.monotonic() + 120)
     except RepairRejected:
         different_rejected = True
+    extra = input_dir / "netlist/extra.v"
+    helper_span = "assign y = a & b; // helper logic"
+    extra.write_text("module top(input a,b, output y);\nassign y = a & b;\nendmodule\n"
+                     f"module helper(input a,b, output y);\n{helper_span}\nendmodule\n")
+    unused_edit_rejected = False
+    try:
+        prepare_repair("task2", "Top 模块: `top`", "present_design top\n", input_dir,
+                       [extra], {extra: extra}, libraries,
+                       [{"file": "netlist/extra.v", "old": helper_span,
+                         "new": "assign y = a | b; // helper logic",
+                         "reason": "ensure modified unused module is independently proved"}], out, "R5", time.monotonic() + 120)
+    except RepairRejected:
+        unused_edit_rejected = True
     unsupported_rejected = None
     if args.lib:
         unknown = input_dir / "netlist/unsupported.v"
@@ -55,10 +68,11 @@ def main() -> int:
             unsupported_rejected = True
     passed = (equal[source] != source and bool(changes) and different_rejected
               and source.read_bytes() == original and active[source] == source
-              and unsupported_rejected is not False)
+              and unsupported_rejected is not False and unused_edit_rejected)
     summary = {"passed": passed, "equivalent_candidate_admitted": equal[source] != source,
                "different_candidate_rejected": different_rejected,
                "unsupported_used_cell_rejected": unsupported_rejected,
+               "unused_edited_module_rejected": unused_edit_rejected,
                "original_unchanged": source.read_bytes() == original,
                "library": str(args.lib) if args.lib else None, "changes": changes,
                "output_directory": str(out)}
