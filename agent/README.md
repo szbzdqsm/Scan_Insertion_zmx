@@ -4,7 +4,7 @@
 
 The local Bailian Key has passed a real `deepseek-v4-pro` request. A live-model baseline ran all 11 Public cases and passed none of the current Agent checks. Revised images are being retested and have passed several small cases. See [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for measured results and remaining work. The earlier Golden replay described below is historical tool validation, not an autonomous Agent pass.
 
-The runtime now uses build-time official command help, bounded structural context with actual Liberty pin names, command preflight, report redirection normalization, live tool logs, process-group timeouts, and indexed audit evidence. The root VS Code task menu includes minimal model and full Public validation. Automatic Pre-scan editing/EQY and complete semantic validation remain unfinished; do not upload this development version for evaluation.
+The runtime now uses build-time official command help, bounded structural context with actual Liberty pin names, command preflight, report redirection normalization, live tool logs, process-group timeouts, and indexed audit evidence. Task 1 mappings must refer to literal executed Tcl. A bounded private Pre-scan editing/EQY workflow is implemented and has passed small real proofs, including sky130 cells; see [NETLIST_REPAIR.md](NETLIST_REPAIR.md) for its restrictions. Some ICGs still lack usable functional models, and complete Public and semantic validation remain unfinished. Do not upload this development version for evaluation.
 
 This package runs inside `scan-agent-base:ubuntu24`. It calls the real `dftexp_scan` binary, saves each attempt, and refuses to fabricate a successful netlist or report. The current implementation has been replay-checked against all 11 Public cases using each case's `golden.dofile` as an offline test fixture. This verifies tool execution and artifact checks, but does not validate live LLM-generated Dofiles.
 
@@ -39,7 +39,7 @@ docker run --rm \
 - Task 1 starts from a generated Dofile; task 2 starts from `original.dofile`.
 - The agent uses actual tool exit status and output files. It does not synthesize deliverables.
 - Tool calls are bounded by the case time limit and `AGENT_MAX_TOOL_CALLS` (default 4).
-- A pre-scan netlist is never edited automatically in this starter. If the tool reports a netlist DRC that cannot be resolved through Dofile settings, the run is reported as incomplete for human review. Add an approved LEC-backed netlist repair policy before enabling such edits.
+- Task 2 may propose localized edits when the case allows them and Dofile settings are insufficient. The runtime edits a private copy and requires actual EQY PASS before use. Task 1 and explicit no-edit cases always refuse edits. Proof failures remain incomplete; input netlists are never overwritten.
 
 ## Validation status (2026-10-04)
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
+from netlist_repair import RepairRejected, edits_allowed, prepare_repair
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -168,7 +169,7 @@ def manual_context(query: str, max_chars: int = 12000) -> str:
         (r"悬空|浮空|伪|pseudo", ["add_pseudo_pi", "rpt_pseudo_pi"]),
         (r"分区|partition", ["add_scan_partition", "set_current_scan_partition"]),
         (r"ICG|时钟门控|clock.gating", ["set_dft_clock_gating_cfg", "clock_gating_init_cycles"]),
-        (r"Wrapper|黑盒|CTL", ["load_ctl", "set_wrapper_cfg"]),
+        (r"Wrapper|黑盒|CTL", ["load_ctl", "set_wrapper_cfg", "add_dedicated_wrapper_cell_type"]),
         (r"替换|回替|replacement", ["set_scan_cell_mapping", "replace_unscan"]),
         (r"闩锁|latch|内部时钟|关联关系", ["associated_internal_clocks"]),
         (r"移位寄存器|segment", ["set_scan_segment", "rpt_scan_segment"]),
@@ -195,18 +196,20 @@ def command_syntax(query: str, max_chars: int = 30000) -> str:
     if not path.is_file():
         return "No build-time command syntax cache; consult the manual excerpts."
     syntax = json.loads(path.read_text())
-    names = ["load_lib", "load_netlist", "present_design", "set_scan_signal", "set_scan_cfg",
+    names = ["__cell_properties", "load_lib", "load_netlist", "present_design", "set_scan_signal", "set_scan_cfg",
              "set_scan_cell_mapping", "set_scan_element", "set_dft_clock_gating_cfg", "insert_dft_logic",
              "examine_scan_drc", "examine_scan_chain", "set_scan_drc_cfg", "dump_netlist", "dump_ctl",
              "dump_def", "rpt_scan_chain", "rpt_scan_chain_cell", "rpt_scan_element", "rpt_scan_cfg",
              "rpt_scan_signal", "rpt_scan_drc_violation", "rpt_insertion_info", "get_cells",
-             "get_pins", "get_ports", "get_nets", "get_obj_insts", "get_attr", "foreach_in_collection", "sizeof_collection"]
+             "get_pins", "get_ports", "get_nets", "get_obj_insts", "get_attribute", "get_property",
+             "list_properties", "rpt_property", "foreach_in_collection", "sizeof_collection"]
     if re.search(r"悬空|浮空|伪|pseudo", query, re.I):
         names = ["add_pseudo_pi", "rpt_pseudo_pi"] + names
     if re.search(r"partition|分区", query, re.I):
         names = ["add_scan_partition", "set_current_scan_partition", "rpt_scan_partition"] + names
     if re.search(r"wrapper|CTL|黑盒", query, re.I):
-        names = ["load_ctl", "set_wrapper_cfg", "rpt_wrapper_cfg", "rpt_wrapper_implementation"] + names
+        names = ["load_ctl", "set_wrapper_cfg", "add_dedicated_wrapper_cell_type", "rpt_dedicated_wrapper_cell_type",
+                 "rpt_wrapper_cfg", "rpt_wrapper_implementation"] + names
     if re.search(r"移位寄存器|segment", query, re.I):
         names = ["set_scan_segment", "rpt_scan_segment"] + names
     if re.search(r"忽略|允许|无需处理", query):
@@ -228,6 +231,17 @@ def unsupported_options(dofile: str) -> list[str]:
         return []
     syntax = json.loads(path.read_text())
     problems = []
+    properties = set(re.findall(r"(?m)^\s*(\w+)\s+cell\s+", syntax.get("__cell_properties", "")))
+    if properties:
+        for match in re.finditer(r'-filter\s+(?:"([^"\n]+)"|\{([^}\n]+)\})', dofile):
+            prefix = dofile[:match.start()].rsplit("\n", 1)[-1]
+            queries = re.findall(r"\b(get_cells|get_obj_insts|get_pins|get_obj_pins|get_ports|get_nets)\b", prefix)
+            if not queries or queries[-1] not in {"get_cells", "get_obj_insts"}:
+                continue
+            expression = match.group(1) or match.group(2)
+            for name in re.findall(r"\b([A-Za-z_]\w*)\s*(?:==|!=|=~|!~|<=|>=|<|>)", expression):
+                if name not in properties:
+                    problems.append(f"Cell filter uses undefined property {name}; use the actual cell property table")
     for line in dofile.replace("\\\n", " ").splitlines():
         match = re.match(r"\s*([a-z_]+)\s+(.*)", line)
         if not match or match.group(1) not in syntax:
@@ -367,13 +381,98 @@ def liberty_summary(path: Path) -> str:
             if cell:
                 current = cell.group(1)
                 names.append(current)
-                if re.search(r"df|sdf|latch|clk|dl", current, re.I) and len(pin_map) < 40:
+                if re.search(r"df|sdf|latch|clk|dl", current, re.I) and len(pin_map) < 128:
                     pin_map[current] = []
             pin = re.match(r'\s*pin\s*\(\s*"?([^"\s)]+)', line)
             if pin and current in pin_map and len(pin_map[current]) < 24:
                 pin_map[current].append(pin.group(1))
+    pins = dict(sorted(pin_map.items(), key=lambda item: ("sdf" not in item[0], item[0]))[:80])
     return (f"{path.name}: {len(names)} cells; sample={', '.join(names[:30])}\n"
-            "Actual sequential/clock cell pin names: " + json.dumps(pin_map))[:8000]
+            "Actual sequential/clock cell pin names (scan cells first): " + json.dumps(pins))[:8000]
+
+
+def netlist_diagnostic_context(active: dict[Path, Path], diagnostic: str, limit: int = 6000) -> str:
+    """Provide literal localized source evidence around diagnosed instances for a repair proposal."""
+    tokens = re.findall(r"'([^'\n]{3,120})'", diagnostic)
+    needles = list(dict.fromkeys(token.split("/")[-1] for token in tokens
+                                if re.fullmatch(r"[\w$\[\]\\/.-]+", token)))[:24]
+    if not needles:
+        return ""
+    result = []
+    size = 0
+    for original, current in active.items():
+        before: deque[tuple[int, str]] = deque(maxlen=2)
+        remaining = 0
+        seen: set[str] = set()
+        with current.open(encoding="utf-8", errors="replace") as stream:
+            for number, line in enumerate(stream, 1):
+                match = next((needle for needle in needles if needle not in seen and needle in line), None)
+                if match:
+                    seen.add(match)
+                    header = f"\n# Netlist literal excerpt: original file {original}, current version {current}, L{max(1, number-2)}\n"
+                    result.append(header)
+                    result.extend(text for _, text in before)
+                    size += len(header) + sum(len(text) for _, text in before)
+                    remaining = 10
+                if remaining:
+                    result.append(line)
+                    size += len(line)
+                    remaining -= 1
+                before.append((number, line))
+                if size >= limit:
+                    return "".join(result)[:limit]
+    return "".join(result)[:limit]
+
+
+def append_audit_reports(dofile: str, run_dir: Path) -> str:
+    """Request real configuration evidence; never change the supplied Task 2 R1 script."""
+    cache = Path(__file__).with_name("tool_help.json")
+    if not cache.is_file():
+        return dofile
+    known = json.loads(cache.read_text())
+    commands = [name for name in ("rpt_scan_signal", "rpt_scan_cfg", "rpt_scan_drc_rule_handling")
+                if name in known]
+    extra = "\n# Agent audit reports from actual tool state\n" + "\n".join(
+        f'{name} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name in commands) + "\n"
+    if not commands:
+        return dofile
+    exits = list(re.finditer(r"(?m)^\s*exit\s*$", dofile))
+    if exits:
+        position = exits[-1].start()
+        return dofile[:position] + extra + dofile[position:]
+    return dofile.rstrip() + extra + "exit\n"
+
+
+def config_reference(dofile: str, configuration: str) -> str:
+    """Resolve literal configuration statements, including continued and grouped commands."""
+    records = []
+    current = ""
+    first = 0
+    for number, line in enumerate(dofile.splitlines(), 1):
+        if not current and (not line.strip() or line.lstrip().startswith("#")):
+            continue
+        if not current:
+            first = number
+        current += " " + line.rstrip().removesuffix("\\")
+        if line.rstrip().endswith("\\"):
+            continue
+        records.append((first, number, re.sub(r"\s+", " ", current).strip()))
+        current = ""
+    parts = re.split(r";\s*(?=[A-Za-z_]+\b)|\n", configuration.replace("\\\n", " "))
+    locations = []
+    for part in parts:
+        normalized = re.sub(r"\s+", " ", part).strip()
+        if not normalized:
+            continue
+        matches = [(start, end) for start, end, text in records
+                   if re.search(re.escape(normalized) + r"(?=$|[\s;])", text)]
+        if not matches:
+            return ""
+        locations.append(matches[0])
+    if not locations:
+        return ""
+    first, last = min(start for start, _ in locations), max(end for _, end in locations)
+    return f"L{first}" if first == last else f"L{first}-L{last}"
 
 
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "") -> str:
@@ -416,14 +515,21 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
     mode = "Generate a Dofile from the task requirements." if task == "task1" else "Repair the supplied original Dofile while preserving valid intent."
     if task == "task2" and original:
         context += "\n# Original Dofile (repair starting point)\n" + original
-    netlist_rule = ("Task 1 strictly forbids modifying any Pre-scan input netlist."
-                    if task == "task1" else
-                    "This runtime supports Dofile repairs only; it has no netlist-edit/EQY workflow. "
-                    "Do not modify Pre-scan netlists. If netlist repair is necessary, leave the issue unresolved.")
+    spec = read_text(input_dir / "task_spec.md", 60000)
+    netlist_rule = (("Task 1 strictly forbids modifying Pre-scan input netlists. Return no netlist_edits."
+                     if task == "task1" else "This case strictly forbids modifying Pre-scan input netlists. Return no netlist_edits.")
+                    if not edits_allowed(task, spec) else
+                    "Prefer Dofile repairs. Only if an evidence-backed structural problem cannot be fixed by Dofile settings, "
+                    "you may additionally return netlist_edits: an array of at most four objects with file (original input .v path), "
+                    "old (unique literal span from the actual input), new (replacement), reason (why settings are insufficient), "
+                    "and evidence_excerpt (a real preceding tool diagnostic). Each edit is limited to 32 lines and cannot change "
+                    "module interfaces. Input files remain read-only. The runtime patches a private copy and admits it only after "
+                    "a fixed EQY proof against the original netlist returns PASS; failed or unproven candidates are not adopted. "
+                    "Do not provide proof scripts or assumptions, and do not claim EQY ran before it actually runs.")
     system = f"""You are an expert operator of the ScanInsertion tool `dftexp_scan` for the contest.
 Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts, this tool's built-in help and evidence from existing Dofiles. Built-in help determines valid command options; do not use options from another EDA product. Correct every earlier ERROR before retrying. Use the actual Liberty pin names, never guess SE/SI/CLK. Choose the requested top module from root-module evidence, rather than an internal module whose name appears first. For reset signals, -off_state is the INACTIVE level: active-low reset means -off_state 1; active-high reset means -off_state 0. get_cells/get_pins return tool collections; use foreach_in_collection to iterate them. Declare wrapper control signals with set_scan_signal before referring to them in set_wrapper_cfg. Complete examine_scan_drc/examine_scan_chain before insert_dft_logic; do not call examine_scan_chain after insertion. For a clock passed through a latch, use the documented associated_internal_clocks option and exclude that latch from scan elements as required. Group repeated diagnostics by concrete root cause, rather than one issue per cell. Keep each diagnosis and summary short. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
-Return exactly one JSON object with keys: dofile (complete Tcl script as a string), summary (brief), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Each evidence_excerpt must be an exact short excerpt copied from the supplied PREVIOUS run's tool log or report. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it.
-The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
+Return exactly one JSON object with keys: dofile (complete Tcl script as a string), summary (brief), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Task 1 requires a nonempty mapping of key requirements; dft_config must contain literal Tcl statements copied from your returned Dofile, never descriptions or invented placeholders for collections. Each evidence_excerpt must be an exact short excerpt copied from the supplied PREVIOUS run's tool log or report. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it.
+The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Load multiple netlists together in one load_netlist file-list command with explicit -top when needed; separate load_netlist calls can change the scan engine's analyzed top. Use property names from the supplied actual cell property table, and get_property/get_attribute (not the nonexistent get_attr). For a user-defined dedicated wrapper, -interface is a list of semantic_role actual_module_port polarity triples; semantic roles are shift_clk, capture_en, shift_en, cti, cto, cfi, cfo. Read the provided module port declarations. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
     user = f"{mode}\n\n{context}\n\nReturn the JSON object now."
     problems = []
     for attempt in range(2):
@@ -448,8 +554,15 @@ The actual read-only input directory is {input_dir}. The current run directory a
                     "executed_dofile": adapted}, ensure_ascii=False, indent=2))
                 dofile = adapted
             problems = unsupported_options(dofile)
+            if task == "task1":
+                mappings = result.get("requirement_mapping")
+                if not isinstance(mappings, list) or not mappings:
+                    problems.append("Task 1 requires a nonempty requirement_mapping with literal Dofile configurations")
+                elif any(not isinstance(item, dict) or not str(item.get("requirement", "")).strip() or
+                         not config_reference(dofile, str(item.get("dft_config", ""))) for item in mappings):
+                    problems.append("Every Task 1 dft_config must resolve to actual Tcl statements in the returned Dofile; remove descriptive placeholders")
             if not problems:
-                return strip_fence(dofile), result
+                return append_audit_reports(strip_fence(dofile), run_dir), result
         except ValueError as error:
             problems = [str(error)]
         (run_dir / "llm_validation.json").write_text(json.dumps({"problems": problems}, indent=2))
@@ -573,7 +686,8 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
             allowed_codes.update(re.sub(r"[-_ ]", "", code).upper()
                                  for code in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", line, re.I))
     violation_total = re.search(r"Total violations:\s*(\d+)", diagnostic_text, re.I)
-    if violation_total and int(violation_total.group(1)) > 0:
+    drc_required = bool(re.search(r"\bDRC\b|违例", task_spec, re.I))
+    if drc_required and violation_total and int(violation_total.group(1)) > 0:
         found_codes = {re.sub(r"[-_ ]", "", c).upper()
                        for c in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", diagnostic_text, re.I)}
         blocking_codes = found_codes - allowed_codes
@@ -796,7 +910,8 @@ def locate_evidence(files: list[Path], output_dir: Path, excerpt: str,
 
 def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                        verification_plans: dict[str, dict[str, Any]], output_dir: Path,
-                       previous_run: str, current_run: str, change_id: str) -> None:
+                       previous_run: str, current_run: str, change_id: str,
+                       additional_change_ids: list[str] | None = None) -> None:
     """Bind a proposed fix to the previous run that actually exposed the issue."""
     if not previous_run or not change_id:
         return
@@ -827,11 +942,85 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         else:
             existing["diagnosis"] = diagnosis
         existing["attempts"].append({
-            "fix": {"action": str(item.get("fix", "")), "artifact_ref": [change_id]},
+            "fix": {"action": str(item.get("fix", "")), "artifact_ref": [change_id] + (additional_change_ids or [])},
             "verify": {"run_ref": current_run, "source": f"runs/{current_run}/{current_run}.log",
                        "resolved": False, "locator": "", "excerpt": ""}})
         plan = item.get("verification", {})
         verification_plans[existing["issue_id"]] = plan if isinstance(plan, dict) else {}
+
+
+def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir: Path,
+                           dofile: str) -> dict[str, str] | None:
+    """Bind the executed literal configuration to typed rows from the real tool."""
+    diagnosis = issue["diagnosis"]
+    fix = issue.get("attempts", [{}])[-1].get("fix", {}).get("action", "")
+    subject = diagnosis.get("located_object", "") + " " + fix
+    logical_lines = dofile.replace("\\\n", " ").splitlines()
+    if "set_scan_drc_rule_handling" in subject:
+        for command in logical_lines:
+            match = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|DFTR[\w-]+)\s+(Error|Warning|Info|Ignore)\b", command)
+            if not match or "-inst" in command:
+                continue
+            rules = set(re.findall(r"DFTR[-\w]+", match.group(1)))
+            if not rules or not all(rule.removeprefix("DFTR-") in subject or rule in subject for rule in rules):
+                continue
+            for path in files:
+                if "rule_handling" not in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
+                    continue
+                lines = read_text(path, 50000).splitlines()
+                matches = []
+                for number, line in enumerate(lines, 1):
+                    row = re.fullmatch(r"\s*(DFTR[-\w]+)\s+(?:Error|Warning|Info|Ignore)\s+(Error|Warning|Info|Ignore)\s+all\s*", line)
+                    if row and row.group(1) in rules and row.group(2) == match.group(2):
+                        matches.append((number, row.group(1)))
+                if {rule for _, rule in matches} == rules:
+                    first, last = min(n for n, _ in matches), max(n for n, _ in matches)
+                    return {"source": path.relative_to(output_dir).as_posix(),
+                            "locator": f"L{first}" if first == last else f"L{first}-L{last}",
+                            "excerpt": "\n".join(lines[first-1:last])}
+    if "set_scan_signal" in subject:
+        for command in logical_lines:
+            if not re.match(r"\s*set_scan_signal\b", command):
+                continue
+            options = dict(re.findall(r"-([a-z_]+)\s+([\w$]+)", command))
+            port, kind = options.get("port", ""), options.get("type", "")
+            if not port or not kind or not re.search(r"(?<![\w$])" + re.escape(port) + r"(?![\w$])", subject):
+                continue
+            for path in files:
+                if "signal" not in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
+                    continue
+                columns = []
+                with path.open(encoding="utf-8", errors="replace") as stream:
+                    for number, line in enumerate(stream, 1):
+                        if re.search(r"\bPort\s+PortProperty\s+SignalType\s+OffState\b", line):
+                            columns = [(match.group(0), match.start()) for match in re.finditer(r"\S+", line)]
+                        elif columns and line.strip() and not line.lstrip().startswith("-"):
+                            row = {key: line[start:columns[index + 1][1] if index + 1 < len(columns) else None].strip()
+                                   for index, (key, start) in enumerate(columns)}
+                            if row.get("Port") != port or row.get("SignalType", "").split("(")[0] != kind:
+                                continue
+                            if any(key in options and row.get(column) != options[key]
+                                   for key, column in (("off_state", "OffState"), ("usage", "Usage"))):
+                                continue
+                            return {"source": path.relative_to(output_dir).as_posix(),
+                                    "locator": f"L{number}", "excerpt": line.strip()}
+    if "set_scan_cfg" in subject and re.search(r"\[ERROR\]|unknown (?:option|argument)", issue["found"]["excerpt"], re.I):
+        mentioned = set(re.findall(r"-([a-z_]+)", diagnosis.get("located_object", "") + " " + fix))
+        for command in logical_lines:
+            if not re.match(r"\s*set_scan_cfg\b", command):
+                continue
+            for parameter, value in re.findall(r"-([a-z_]+)\s+([\w]+)", command):
+                if not any(parameter.startswith(option) for option in mentioned):
+                    continue
+                for path in files:
+                    if "cfg" not in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
+                        continue
+                    with path.open(encoding="utf-8", errors="replace") as stream:
+                        for number, line in enumerate(stream, 1):
+                            if re.fullmatch(r"\s*" + re.escape(parameter) + r"\s+" + re.escape(value) + r"\s*", line, re.I):
+                                return {"source": path.relative_to(output_dir).as_posix(),
+                                        "locator": f"L{number}", "excerpt": line.strip()}
+    return None
 
 
 def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
@@ -908,6 +1097,7 @@ def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[st
     if not tool_checks_passed:
         return
     files = run_evidence_files(output_dir / "runs" / current_run)
+    dofile = read_text(output_dir / "runs" / current_run / "deliverables" / f"{current_run}.dofile", 100000)
     for issue in issues:
         attempts = issue.get("attempts", [])
         if not attempts or issue["found"]["run_ref"] == current_run:
@@ -916,6 +1106,8 @@ def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[st
         if verify["resolved"]:
             continue
         evidence = positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir)
+        if not evidence:
+            evidence = configuration_evidence(issue, files, output_dir, dofile)
         if evidence:
             verify.update({"run_ref": current_run, **evidence, "resolved": True})
 
@@ -956,6 +1148,7 @@ def main() -> int:
     changes: list[dict[str, Any]] = []
     issue_records: list[dict[str, Any]] = []
     verification_plans: dict[str, dict[str, Any]] = {}
+    repair_attempts: list[dict[str, Any]] = []
     requirement_mapping: list[dict[str, Any]] = []
     final_dofile = ""
     task = "task1"
@@ -968,6 +1161,8 @@ def main() -> int:
         if not os.environ.get("SCANINSERTION_LICENSE_SERVER"):
             raise RuntimeError("SCANINSERTION_LICENSE_SERVER is required")
         task, task_spec, netlists, libs, original_path = get_task_artifacts(input_dir)
+        active_netlists = {path: path for path in netlists}
+        active_netlist_root = input_dir / "netlist"
         limits = read_text(input_dir / "limitations.md", 8000)
         timeout_total = parse_limit_seconds(limits)
         finalize_reserve = 30
@@ -1006,6 +1201,11 @@ def main() -> int:
             context = (static_context + f"\n# Current Dofile\n{previous}\n\n"
                        f"# Most recent tool log / diagnostics\n{last_log[-18000:] if last_log else '(no run yet)'}\n\n"
                        f"# Most recent tool reports\n{previous_reports[-18000:] if previous_reports else '(no reports captured yet)'}\n")
+            netlist_changes: list[dict[str, Any]] = []
+            if task == "task2" and run_records and edits_allowed(task, task_spec):
+                context += "\n# Localized actual netlist source around prior diagnostics\n" + netlist_diagnostic_context(active_netlists, last_log)
+            if active_netlist_root != input_dir / "netlist":
+                context += f"\n# EQY-proven current netlist directory\n{active_netlist_root}\n"
             if validation_problems:
                 context += "\n# Independent output-validator findings from previous round\n" + "\n".join(validation_problems)
             if task == "task2" and index == 1 and original is not None:
@@ -1026,6 +1226,33 @@ def main() -> int:
                                              remaining - finalize_reserve - 1)), max_retries=0)
                     dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
                                                  input_dir, run_dir, start + timeout_total - finalize_reserve - 1)
+                    if meta.get("netlist_edits"):
+                        edits = meta["netlist_edits"]
+                        if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
+                            raise RepairRejected("netlist_edits must be an array of localized edit objects")
+                        prior_files = run_evidence_files(runs_root / run_records[-1]["run_id"]) if run_records else []
+                        if any(not locate_evidence(prior_files, output_dir, str(edit.get("evidence_excerpt", "")))
+                               for edit in edits):
+                            raise RepairRejected("Netlist edit is missing exact preceding tool diagnostic evidence")
+                        active_netlists, netlist_changes = prepare_repair(
+                            task, task_spec, original or "", input_dir, netlists, active_netlists, libs,
+                            edits, output_dir, rid, start + timeout_total - finalize_reserve - 1)
+                        active_netlist_root = output_dir / "netlist_versions" / rid
+                        repair_attempts.append({"run_ref": rid, "admitted": True, "adopted": False,
+                                                "lec_ref": f"lec/{rid}/eqy.log"})
+                    if active_netlist_root != input_dir / "netlist":
+                        dofile = dofile.replace(str(input_dir / "netlist"), str(active_netlist_root))
+                        if task == "task2":
+                            (script_root / "netlist").unlink()
+                            (script_root / "netlist").symlink_to(active_netlist_root, target_is_directory=True)
+                except RepairRejected as e:
+                    generation_error = f"Netlist repair rejected before {rid}: {e}"
+                    repair_attempts.append({"run_ref": rid, "adopted": False, "reason": str(e),
+                                            "lec_ref": f"lec/{rid}/eqy.log" if (output_dir / "lec" / rid / "eqy.log").exists() else ""})
+                    (run_dir / "repair_rejection.json").write_text(json.dumps(repair_attempts[-1], ensure_ascii=False, indent=2))
+                    if run_records:
+                        break
+                    raise
                 except Exception as e:
                     generation_error = f"LLM Dofile generation failed before R{index}: {type(e).__name__}: {e}"
                     if run_records:
@@ -1048,6 +1275,11 @@ def main() -> int:
                 change_id = f"F{len(changes)+1}"
                 changes.append({"change_id": change_id, "type": "dofile",
                                 "path": f"runs/{rid}/deliverables/{rid}.dofile", "diff_path": diff_path, "lec_ref": ""})
+            netlist_change_ids = []
+            for change in netlist_changes:
+                change["change_id"] = f"F{len(changes)+1}"
+                netlist_change_ids.append(change["change_id"])
+                changes.append(change)
             final_dofile = dofile
             remaining = timeout_total - (time.monotonic() - start)
             per_run_timeout = max(1, min(900, int(remaining - finalize_reserve)))
@@ -1056,6 +1288,9 @@ def main() -> int:
             record["log_file"] = str((run_dir / f"{rid}.log").relative_to(output_dir)).replace("\\", "/")
             record["exit_status"] = result["status"]
             run_records.append(record)
+            for attempt in repair_attempts:
+                if attempt.get("run_ref") == rid and attempt.get("admitted"):
+                    attempt["adopted"] = True
             last_log = diagnostic_excerpt(run_dir / f"{rid}.log")
             previous = dofile
             final_run_dir = run_dir
@@ -1068,7 +1303,8 @@ def main() -> int:
                         requirement_mapping.append({"requirement": str(item.get("requirement", "")),
                                                     "dft_config": str(item.get("dft_config", "")),
                                                     "config_ref": {"source": "final_results/deliverables/final.dofile", "locator": ""}})
-            record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id)
+            record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id,
+                               netlist_change_ids)
             verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok)
             unresolved = any(issue.get("found", {}).get("verified") and
                              not (issue.get("attempts") and issue["attempts"][-1].get("verify", {}).get("resolved"))
@@ -1097,13 +1333,7 @@ def main() -> int:
         passed = tool_checks_passed and audit_complete
         for mapping in requirement_mapping:
             config = mapping.get("dft_config", "")
-            locator = ""
-            if config:
-                for line_no, line in enumerate(final_dofile.splitlines(), 1):
-                    if config.strip() and config.strip() in line:
-                        locator = f"L{line_no}"
-                        break
-            mapping.setdefault("config_ref", {})["locator"] = locator
+            mapping.setdefault("config_ref", {})["locator"] = config_reference(final_dofile, config)
         decision = {
             "case_id": case_id_for(input_dir),
             "task": task,
@@ -1119,6 +1349,7 @@ def main() -> int:
                            "elapsed_seconds": r.get("elapsed_seconds"), "artifacts": r.get("artifacts", [])}
                           for r in run_records],
             "file_changes": changes,
+            "netlist_repair_attempts": repair_attempts,
         }
         (output_dir / "decision_log.json").write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"status": "completed" if passed else "incomplete", "task": task,

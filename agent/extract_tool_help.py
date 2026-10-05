@@ -15,8 +15,10 @@ COMMANDS = (
     "set_wrapper_cfg examine_scan_drc examine_scan_chain insert_dft_logic "
     "dump_netlist dump_ctl dump_def rpt_scan_chain rpt_scan_chain_cell rpt_scan_element "
     "rpt_scan_cfg rpt_scan_signal rpt_scan_drc_violation rpt_scan_partition "
-    "rpt_wrapper_cfg rpt_wrapper_implementation rpt_insertion_info set_scan_segment rpt_scan_segment "
-    "add_pseudo_pi rpt_pseudo_pi get_cells get_pins get_ports get_nets get_obj_insts get_attr "
+    "rpt_wrapper_cfg rpt_wrapper_implementation add_dedicated_wrapper_cell_type rpt_dedicated_wrapper_cell_type "
+    "rpt_insertion_info set_scan_segment rpt_scan_segment "
+    "add_pseudo_pi rpt_pseudo_pi get_cells get_pins get_ports get_nets get_obj_insts "
+    "get_attribute get_property list_properties rpt_property "
     "sizeof_collection foreach_in_collection"
 ).split()
 
@@ -28,7 +30,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="scan-help-") as temp:
         script = Path(temp) / "help.dofile"
         script.write_text("\n".join(f'puts "=== SYNTAX {name} ==="\ncatch {{help -verbose {name}}}'
-                                    for name in COMMANDS) + "\nexit\n")
+                                    for name in COMMANDS) +
+                          '\nputs "=== SYNTAX __cell_properties ==="\nlist_properties -sys -obj_type cell -no_split\nexit\n')
         result = subprocess.run(["/opt/dftexp_scan/bin/dftexp_scan", "-f", str(script)],
                                 capture_output=True, text=True, errors="replace", timeout=30, check=True)
     blocks = re.split(r"(?m)^=== SYNTAX ([A-Za-z_]+) ===\s*$", result.stdout)

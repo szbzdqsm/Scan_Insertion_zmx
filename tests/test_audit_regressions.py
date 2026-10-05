@@ -11,6 +11,7 @@ from unittest.mock import patch
 openai_stub = types.ModuleType("openai")
 openai_stub.OpenAI = object
 agent_path = Path(__file__).resolve().parents[1] / "agent" / "scan_agent.py"
+sys.path.insert(0, str(agent_path.parent))
 spec = importlib.util.spec_from_file_location("scan_agent", agent_path)
 agent = importlib.util.module_from_spec(spec)
 with patch.dict(sys.modules, {"openai": openai_stub}):
@@ -147,6 +148,13 @@ class AuditRegression(unittest.TestCase):
         self.assertIn('rpt_scan_drc_violation -verbose > "report with spaces.rpt"', text)
         self.assertIn('rpt_scan_chain -file "chain.rpt"', text)
 
+    def test_cell_filter_preflight_uses_real_properties_and_skips_pin_queries(self):
+        (self.root / "tool_help.json").write_text(json.dumps({"__cell_properties": "ref_name cell string A,R\nis_sequential cell boolean A,R"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options('get_cells -hier -filter "is_scan_cell == true"'))
+            self.assertEqual(agent.unsupported_options('get_cells -hier -filter "is_sequential == true"'), [])
+            self.assertEqual(agent.unsupported_options('get_pins -filter "is_clock_pin == true"'), [])
+
     def test_chain_order_fix_requires_positive_success_counts(self):
         item = dict(self.item, evidence_excerpt="[ERROR] Cannot execute command 'examine_scan_chain' "
                     "after executing 'insert_dft_logic' command.", located_object="examine_scan_chain",
@@ -167,6 +175,49 @@ class AuditRegression(unittest.TestCase):
                         'pin ("SCD") { }\npin ("SCE") { }\npin ("CLK") { }\n}\n')
         summary = agent.liberty_summary(path)
         self.assertIn('"SCD", "SCE", "CLK"', summary)
+
+    def test_scan_signal_fix_requires_matching_typed_tool_row(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Port 'wb_clk' does not exist.",
+                    located_object="set_scan_signal -type clock -port wb_clk",
+                    fix="Use set_scan_signal -type clock -port wb_clk_i -off_state 0")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text("set_scan_signal -type clock -port wb_clk_i -off_state 0\n")
+        report = run / "reports/rpt_scan_signal.audit.rpt"
+        header = f"{'Port':16}{'PortProperty':18}{'SignalType':22}{'OffState':12}\n"
+        report.write_text(header + f"{'wb_clk_i':16}{'pre_existing':18}{'reset':22}{'0':12}\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        report.write_text(header + f"{'wb_clk_i':16}{'pre_existing':18}{'clock':22}{'0':12}\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+        self.assertEqual(issues[0]["attempts"][0]["verify"]["locator"], "L2")
+
+    def test_config_option_fix_requires_actual_report_value(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] set_scan_cfg execution failed",
+                    located_object="set_scan_cfg -mix_edges wrong", fix="set_scan_cfg -mix_edges true")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text("set_scan_cfg -mix_edges true\n")
+        report = run / "reports/rpt_scan_cfg.audit.rpt"
+        report.write_text("mix_edges False\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        report.write_text("mix_edges True\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_audit_report_commands_are_inserted_before_exit(self):
+        path = self.root / "tool_help.json"
+        path.write_text(json.dumps({"rpt_scan_cfg": "rpt_scan_cfg"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            text = agent.append_audit_reports("insert_dft_logic\nexit\n", self.out / "runs/R2")
+        self.assertLess(text.index("rpt_scan_cfg >"), text.index("exit"))
+        self.assertIn("insert_dft_logic", text)
 
     def test_later_successful_round_can_verify_an_earlier_fix(self):
         issues, plans = self.record()
@@ -214,6 +265,12 @@ class AuditRegression(unittest.TestCase):
         self.assertIn("u_cpu:child", summary)
         self.assertIn("Root modules (not instantiated by another module in this file): top", summary)
 
+    def test_requirement_reference_resolves_multiple_and_continued_commands(self):
+        dofile = "# comment\nset_scan_signal -type clock -port clk\nset_scan_cfg \\\n    -chain_count 4 -max_length 100\nexit\n"
+        self.assertEqual(agent.config_reference(dofile, "set_scan_signal -type clock -port clk; set_scan_cfg -chain_count 4"), "L2-L4")
+        self.assertEqual(agent.config_reference(dofile, "set_scan_element false [SFFs in PLL]"), "")
+        self.assertEqual(agent.config_reference(dofile, "set_scan_cfg -chain_count 40"), "")
+
     def test_many_module_names_cannot_overflow_model_context(self):
         path = self.root / "many_modules.v"
         path.write_text("".join(f"module SNPS_CLOCK_GATE_HIGH_{i}();\nendmodule\n" for i in range(12000)) +
@@ -258,7 +315,7 @@ class AuditRegression(unittest.TestCase):
                     def create(**kwargs):
                         captures["requests"].append(kwargs)
                         clock.now += generation_seconds
-                        response = {"dofile": "exit\n", "requirement_mapping": [],
+                        response = {"dofile": "exit\n", "requirement_mapping": [{"requirement": "Finish script", "dft_config": "exit"}],
                                     "issue_resolutions": [item] if diagnosed else []}
                         return types.SimpleNamespace(choices=[types.SimpleNamespace(
                             message=types.SimpleNamespace(content=json.dumps(response)))])

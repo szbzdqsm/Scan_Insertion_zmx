@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -23,8 +23,15 @@ from scan_agent import parse_limit_seconds  # noqa: E402
 def run_case(case: Path, batch: Path, image: str, env_file: Path) -> dict:
     large = sum(path.stat().st_size for path in (case / "input/netlist").rglob("*.v")) > 64 * 1024 * 1024
     # Measured large designs use several GiB each on this WSL host; serialize them.
-    with LARGE_CASE_LOCK if large else nullcontext():
+    if not large:
         return execute_case(case, batch, image, env_file)
+    with LARGE_CASE_LOCK, (batch.parent / ".public-large.lock").open("a") as lock:
+        # flock also coordinates separate batches launched from other terminals.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            return execute_case(case, batch, image, env_file)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def execute_case(case: Path, batch: Path, image: str, env_file: Path) -> dict:

@@ -35,6 +35,14 @@
       "problemMatcher": []
     },
     {
+      "label": "Scan: 网表修复与 EQY 验证（Dev Container）",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/project_python.sh", "scripts/check_netlist_repair.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
       "label": "Scan: 构建运行镜像（WSL）",
       "type": "process",
       "command": "docker",

@@ -11,6 +11,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 RUN rm -f /submission/agent_system
 COPY agent_system /submission/agent_system
 COPY scan_agent.py /submission/scan_agent.py
+COPY netlist_repair.py /submission/netlist_repair.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system
