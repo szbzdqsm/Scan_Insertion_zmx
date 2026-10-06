@@ -1556,10 +1556,16 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                 "insert_terminal_lockup" in diagnostic and "LOCKUP" not in cited):
             # Chain summary rows do not reveal whether terminal lockup was configured.
             continue
-        signal = re.search(r"\bscan[_ ]enable\s+([A-Za-z_][\w$]*)\b", located, re.I)
+        if not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and re.search(r"\bharmless\b|clean.?script|无害|脚本整洁", diagnostic, re.I):
+            continue
+        signal = re.search(r"\b(?:scan[_ ]enable|port)\s+`?([A-Za-z_][\w$]*)\b", located, re.I)
         if (signal and re.search(r"(?m)^\s*I\s+\S+\s+\d+\s+", cited) and
                 not re.search(r"(?<![\w$])" + re.escape(signal.group(1)) + r"(?![\w$])", cited)):
             # A row about another signal cannot discover a parameter defect on this port.
+            continue
+        if (signal and re.search(r"(?m)^\s*I\s+\S+\s+\d+\s+", cited) and
+                re.search(r"off_state|usage|incomplete.{0,30}(?:declaration|command)|缺少.{0,20}参数", diagnostic, re.I) and
+                not re.search(r"OffState|Usage", cited)):
             continue
         if "ScanConfigurationParameter" in cited:
             if re.search(r"\b(?:set_scan_element|get_obj_insts|get_cells)\b", located):

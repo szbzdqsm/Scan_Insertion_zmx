@@ -93,6 +93,28 @@ class DRCSummaries(unittest.TestCase):
                                       "R1", "R2", "F1")
         self.assertEqual(issues, [])
 
+    def test_chain_enable_column_does_not_reveal_signal_usage_or_off_state(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "Chain Length Input Output ScanEnable Clocks Partition\nI 1 1 si so test_se clk p"
+        (old / "scan_chain.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "port test_se", "diagnosis": "Missing off_state and usage",
+                "root_cause": "Incomplete signal declaration", "fix": "set_scan_signal -type scan_enable -port test_se -off_state 0"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
+    def test_harmless_cleanup_is_not_an_evidence_backed_functional_fault(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "DFTR-TIE0 Warning Ignore all"
+        (old / "rule_handling.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "DFTR-TIE0 rule", "diagnosis": "Redundant and harmless but violates clean-script expectations",
+                "root_cause": "Duplicate commands", "fix": "Remove duplicate"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
     def test_unrelated_drc_rule_cannot_discover_a_suppression_fault(self):
         old = self.root / "runs/R1/reports"
         old.mkdir(parents=True)
