@@ -21,7 +21,7 @@ from typing import Any
 from openai import OpenAI
 from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerprint_paths, prepare_repair
 from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups, source_instance_map
-from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
+from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
 from report_validation import report_rows as typed_report_rows
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
@@ -1153,6 +1153,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     if not any(p.suffix.lower() in {".v", ".vg"} for p in actual_files):
         problems.append("No actual Verilog deliverable was produced")
     report_files = [p for p in actual_files if p.suffix.lower() in {".rpt", ".report", ".txt"}]
+    problems.extend(coverage_problems(report_files, dofile))
     report_text = "\n".join(read_text(p, 50000) for p in report_files)
     actual_chains = chain_rows(report_files)
     problems.extend(chain_problems(actual_chains, task_spec))
@@ -1426,7 +1427,8 @@ def locate_evidence(files: list[Path], output_dir: Path, excerpt: str,
 def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                        verification_plans: dict[str, dict[str, Any]], output_dir: Path,
                        previous_run: str, current_run: str, change_id: str,
-                       additional_change_ids: list[str] | None = None) -> None:
+                       additional_change_ids: list[str] | None = None,
+                       accepted_residual: set[str] | None = None) -> None:
     """Bind a proposed fix to the previous run that actually exposed the issue."""
     if not previous_run or not change_id:
         return
@@ -1479,12 +1481,29 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         if not isinstance(item, dict):
             continue
         cited = str(item.get("evidence_excerpt", item.get("excerpt", ""))).strip()
+        cited_rules = rule_codes(cited)
+        if (accepted_residual and cited_rules and cited_rules <= accepted_residual and
+                re.search(r"DFTDRC-|DRC rule '.+' fails", cited)):
+            # A reviewed residual condition is not an unresolved defect to invent a repair for.
+            continue
         if re.fullmatch(r"Total violations:\s*0", cited, re.I):
             # A clean DRC summary cannot discover an unrelated configuration fault.
             continue
         located = str(item.get("located_object", ""))
         diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
         fix_text = str(item.get("fix", ""))
+        diagnosed_rules = rule_codes(located + " " + diagnostic + " " + fix_text + " " + str(item.get("phenomenon", "")))
+        if cited_rules and "DFTDRC-" in cited and diagnosed_rules and not cited_rules & diagnosed_rules:
+            continue
+        if (re.search(r"Chain\s+Length\s+Input", cited) and
+                "insert_terminal_lockup" in diagnostic and "LOCKUP" not in cited):
+            # Chain summary rows do not reveal whether terminal lockup was configured.
+            continue
+        signal = re.search(r"\bscan[_ ]enable\s+([A-Za-z_][\w$]*)\b", located, re.I)
+        if (signal and re.search(r"(?m)^\s*I\s+\S+\s+\d+\s+", cited) and
+                not re.search(r"(?<![\w$])" + re.escape(signal.group(1)) + r"(?![\w$])", cited)):
+            # A row about another signal cannot discover a parameter defect on this port.
+            continue
         if "ScanConfigurationParameter" in cited:
             parameters = set(re.findall(r"(?m)^\s*([a-z_]+)\s+\S+\s*$", cited))
             relevant = located + " " + diagnostic
@@ -1546,7 +1565,113 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
     diagnosis = issue["diagnosis"]
     fix = issue.get("attempts", [{}])[-1].get("fix", {}).get("action", "")
     subject = diagnosis.get("located_object", "") + " " + fix
+    # A concrete tool failure can identify its command even when the model names
+    # only a port. The original echo supplies context, never positive evidence.
+    found = issue.get("found", {})
+    source = Path(str(found.get("source", "")))
+    locator = re.fullmatch(r"L(\d+)(?:-L(\d+))?", str(found.get("locator", "")))
+    run_ref = str(found.get("run_ref", ""))
+    excerpt = str(found.get("excerpt", ""))
+    origin = (output_dir / source).resolve()
+    if (not source.is_absolute() and source.suffix == ".log" and locator and
+            re.fullmatch(r"R\d+", run_ref) and _is_inside(origin, (output_dir / "runs" / run_ref).resolve()) and
+            origin.is_file() and re.search(r"\[(?:ERROR|FATAL)\]", excerpt)):
+        first, last = int(locator.group(1)), int(locator.group(2) or locator.group(1))
+        active_command = ""
+        failed_command = ""
+        fragment = []
+        with origin.open(encoding="utf-8", errors="replace") as stream:
+            for number, line in enumerate(stream, 1):
+                if number > last:
+                    break
+                echo = re.search(r"\bCMD-0034\]\s+@\d+:\s*(.*)", line)
+                if echo:
+                    active_command = echo.group(1)
+                if number == first:
+                    failed_command = active_command
+                if first <= number <= last:
+                    fragment.append(line)
+        words = literal_tcl_words(failed_command)
+        if (excerpt in "".join(fragment) and words and words[0] in {
+                "set_scan_signal", "set_scan_cell_mapping", "set_scan_drc_rule_handling",
+                "set_scan_cfg", "set_wrapper_cfg"}):
+            origin_port = re.search(r"-port\s+([A-Za-z_][\w$]*)\b", failed_command)
+            if (words[0] != "set_scan_signal" or origin_port and
+                    re.search(r"(?<![\w$])" + re.escape(origin_port.group(1)) + r"(?![\w$])", subject)):
+                subject += " " + failed_command
     logical_lines = dofile.replace("\\\n", " ").splitlines()
+    named_partition = re.search(r"(?:\bpartition\s+|\badd_scan_partition\s+|分区\s*)([A-Za-z_][\w$]*)",
+                                diagnosis.get("located_object", ""), re.I)
+    complete_chain_table = False
+    if (re.fullmatch(r"scan\s+chains?|扫描链", diagnosis.get("located_object", "").strip(), re.I) and
+            not source.is_absolute() and source.suffix.lower() in {".rpt", ".report", ".txt"} and
+            locator and re.fullmatch(r"R\d+", run_ref) and
+            _is_inside(origin, (output_dir / "runs" / run_ref).resolve()) and origin.is_file() and
+            re.search(r"Chain\s+Length\s+Input", excerpt)):
+        first, last = int(locator.group(1)), int(locator.group(2) or locator.group(1))
+        old_rows = [row for row in typed_report_rows(origin, {"Chain", "Length", "Clocks", "Partition", "ScanEnable"})
+                    if re.fullmatch(r"I\s+\S+|\d+", row["Chain"]) and row["Length"].isdigit()]
+        original_lines = origin.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        complete_chain_table = (bool(old_rows) and all(first <= row["line"] <= last for row in old_rows) and
+                                excerpt in "".join(original_lines[first - 1:last]) and
+                                all(original_lines[row["line"] - 1].strip() in excerpt for row in old_rows))
+    if named_partition or complete_chain_table:
+        partitions: dict[str, dict[str, Any]] = {}
+        current_partition = "Default_Partition"
+        ambiguous_partitions = set()
+        for command in logical_lines:
+            words = literal_tcl_words(command.strip())
+            if not words:
+                continue
+            if words[0] == "add_scan_partition" and len(words) >= 4:
+                name = words[1].strip('"{}')
+                options = dict(zip(words[2::2], words[3::2]))
+                clock_list = options.get("-clocks", "").strip('"{}')
+                clocks = set(clock_list.split())
+                if not re.fullmatch(r"[A-Za-z_][\w$]*", name) or not clocks or any(re.search(r"[$\[\\]", clock) for clock in clocks):
+                    continue
+                if name in partitions:
+                    ambiguous_partitions.add(name)
+                partitions[name] = {"clocks": clocks, "count": None, "enable": None}
+            elif words[0] == "set_current_scan_partition" and len(words) == 2:
+                current_partition = words[1].strip('"{}')
+            elif current_partition in partitions and words[0] in {"set_scan_cfg", "set_scan_signal"}:
+                options = {key: value.strip('"{}') for key, value in zip(words[1::2], words[2::2])}
+                if words[0] == "set_scan_cfg" and options.get("-chain_count", "").isdigit():
+                    partitions[current_partition]["count"] = int(options["-chain_count"])
+                elif words[0] == "set_scan_signal" and options.get("-type") == "scan_enable":
+                    port = options.get("-port", "")
+                    if re.fullmatch(r"[A-Za-z_][\w$]*", port):
+                        partitions[current_partition]["enable"] = port
+        names = {named_partition.group(1)} if named_partition else set(partitions)
+        if names and names <= set(partitions) and not names & ambiguous_partitions:
+            for path in files:
+                if (path.suffix.lower() not in {".rpt", ".report", ".txt"} or
+                        "chain" not in path.name.lower() or "cell" in path.name.lower()):
+                    continue
+                rows = [row for row in typed_report_rows(path, {"Chain", "Length", "Clocks", "Partition", "ScanEnable"})
+                        if re.fullmatch(r"I\s+\S+|\d+", row["Chain"]) and row["Length"].isdigit()]
+                selected = []
+                proven = True
+                for name in names:
+                    actual = [row for row in rows if row["Partition"] == name]
+                    requested = partitions[name]
+                    if not actual or any(not row["Clocks"] or not set(re.split(r",\s*", row["Clocks"])) <= requested["clocks"]
+                                         for row in actual):
+                        proven = False
+                        break
+                    if complete_chain_table and (requested["count"] is None or requested["enable"] is None or
+                                                 len(actual) != requested["count"] or
+                                                 any(row["ScanEnable"] != requested["enable"] for row in actual)):
+                        proven = False
+                        break
+                    selected.extend(actual)
+                if proven:
+                    first, last = min(row["line"] for row in selected), max(row["line"] for row in selected)
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    return {"source": path.relative_to(output_dir).as_posix(),
+                            "locator": f"L{first}" if first == last else f"L{first}-L{last}",
+                            "excerpt": "\n".join(lines[first - 1:last])}
     if "set_scan_cell_mapping" in subject:
         for command in logical_lines:
             mapping = re.match(r"\s*set_scan_cell_mapping\s+(\w+)\s+(\w+)\s*$", command)
@@ -2034,7 +2159,7 @@ def main() -> int:
                                                     "dft_config": str(item.get("dft_config", "")),
                                                     "config_ref": {"source": "final_results/deliverables/final.dofile", "locator": ""}})
             record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id,
-                               netlist_change_ids)
+                               netlist_change_ids, qa_residual_codes(task, task_spec))
             verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok,
                                permitted_residual_drc_codes(task, task_spec))
             validation_problems = problems + issue_audit_problems(task, issue_records, changes)

@@ -69,6 +69,52 @@ class DRCSummaries(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_approved_residual_is_not_recorded_as_a_defect_to_repair(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "[WARNING] [DFTDRC-4006] Clock 'rst' is connected to data. (DFTR10-1)"
+        (old / "drc.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "rst", "diagnosis": "Change reset",
+                "root_cause": "Wrong reset declaration", "fix": "Change off_state"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root,
+                                      "R1", "R2", "F1", accepted_residual={"DFTR10"})
+        self.assertEqual(issues, [])
+
+    def test_chain_row_does_not_discover_another_signals_parameters(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "I 1 1 test_si1 test_so1 test_se wb_clk_i wb_partition tool_created"
+        (old / "scan_chain.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "scan_enable se_tx", "diagnosis": "Invalid off_state",
+                "root_cause": "Wrong declaration", "fix": "set_scan_signal -type scan_enable -port se_tx -off_state 0"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root,
+                                      "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
+    def test_unrelated_drc_rule_cannot_discover_a_suppression_fault(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "[WARNING] [DFTDRC-4001] Clock input of DFF U1 is uncontrolled. (DFTR1-1)"
+        (old / "drc.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "ICG instances", "diagnosis": "Missing DFTR-TIE0 Ignore",
+                "root_cause": "DFTR-TIE0 not ignored", "fix": "set_scan_drc_rule_handling DFTR-TIE0 Ignore"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
+    def test_chain_summary_does_not_discover_an_absent_lockup_parameter(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "Chain Length Input Output ScanEnable Clocks Partition\nI 1 1 si so test_se clk p"
+        (old / "scan_chain.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "global scan config", "diagnosis": "Missing insert_terminal_lockup",
+                "root_cause": "Missing insert_terminal_lockup option", "fix": "set_scan_cfg -insert_terminal_lockup true"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
     def write_report(self, total=21, counts=None, extra=""):
         counts = {"DFTR10": 21} if counts is None else counts
         self.path.write_text("DRC Report\nTotal violations: " + str(total) + "\n" + extra + "\n" +
@@ -99,6 +145,14 @@ class DRCSummaries(unittest.TestCase):
         summaries = drc_validation.drc_summaries(self.path)
         self.assertEqual([item["total"] for item in summaries], [21, 0])
         self.assertEqual(summaries[1]["counts"], {})
+
+    def test_report_rule_counts_without_message_code_are_actual_evidence(self):
+        self.path.write_text("Design: eth_top\nDRC Report\nTotal violations: 21\n"
+                             "[INFO] There were 21 DRC rule 'DFTR10' fails. (Clock is connected to data input of cell)\n1\n")
+        summary = drc_validation.drc_summaries(self.path)[0]
+        self.assertEqual(summary["counts"], {"DFTR10": 21})
+        self.assertTrue(drc_validation.summary_permitted(summary, {"DFTR10"}))
+        self.assertIn("There were 21", summary["excerpt"])
 
     def test_allowed_residual_can_verify_other_rules_but_not_itself(self):
         self.write_report()

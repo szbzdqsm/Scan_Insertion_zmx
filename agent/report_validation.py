@@ -6,6 +6,139 @@ from pathlib import Path
 import re
 from typing import Any, Iterator
 
+from dofile_recipe import tcl_chunks
+
+
+_COVERAGE_FIELDS = (
+    "Total FF Bit Count", "Scannable FF Bit Count", "Nonscannable FF Bit Count",
+    "Scan Chain Cell Bit Count", "Wrapper Chain Cell Bit Count",
+    "Shared Wrapper Cell Bit Count", "Dedicated Wrapper Cell Bit Count",
+)
+
+
+def _full_insertion_designs(dofile: str) -> set[str]:
+    """Recognize only literal, unconditional insertion commands we can scope."""
+    try:
+        chunks = tcl_chunks(dofile)
+    except ValueError:
+        return set()
+    design = ""
+    full = set()
+    for chunk in chunks:
+        command = chunk.strip()
+        if not command or command.startswith("#"):
+            continue
+        name = re.match(r"([A-Za-z_]+)\b", command)
+        if not name:
+            continue
+        name = name.group(1)
+        if name == "load_ctl":
+            return set()
+        if re.search(r";\s*(?:load_ctl|present_design|insert_dft_logic)\b", command):
+            return set()
+        # Compound/dynamic invocation is outside this deliberately narrow check.
+        if name in {"present_design", "insert_dft_logic"} and ";" in command:
+            return set()
+        if name == "present_design":
+            match = re.fullmatch(r'present_design\s+(?:\{([\w$]+)\}|"([\w$]+)"|([\w$]+))', command)
+            design = next((item for item in match.groups() if item), "") if match else ""
+        elif name == "insert_dft_logic" and design:
+            if not re.search(r"-(?:\w+_only|replace_unscan)\b", command):
+                full.add(design)
+        elif name == "exit":
+            break
+        elif name in {"if", "foreach", "for", "while", "proc", "eval", "source", "uplevel"}:
+            if re.search(r"\b(?:load_ctl|present_design|insert_dft_logic)\b", command):
+                return set()
+    return full
+
+
+def _insertion_summary_blocks(path: Path) -> Iterator[dict[str, Any]]:
+    """Read actual Item/Quantity tables, keeping Design blocks independent."""
+    current = {"design": "", "line": 0, "values": {}, "conflicts": set(), "invalid": set()}
+    active = False
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for number, line in enumerate(stream, 1):
+            design = re.fullmatch(r"\s*Design:\s*(\S+)\s*", line)
+            if design:
+                if active:
+                    yield current
+                current = {"design": design.group(1), "line": number,
+                           "values": {}, "conflicts": set(), "invalid": set()}
+                active = False
+                continue
+            if re.fullmatch(r"\s*NO\.?\s+Item\s+Quantity\s*", line, re.I):
+                active = True
+                continue
+            if not active:
+                continue
+            item = re.fullmatch(r"\s*\d+\s+(.+?)\s{2,}(\S+)\s*", line)
+            if not item or item.group(1) not in _COVERAGE_FIELDS:
+                continue
+            name, quantity = item.groups()
+            if quantity != "-" and not quantity.isdecimal():
+                current["invalid"].add(name)
+                continue
+            value = 0 if quantity == "-" else int(quantity)
+            previous = current["values"].get(name)
+            if previous is not None and previous != value:
+                current["conflicts"].add(name)
+            current["values"][name] = value
+    if active:
+        yield current
+
+
+def coverage_problems(paths: list[Path], dofile: str) -> list[str]:
+    """Check reported FF-bit accounting after literal full insertion without CTL.
+
+    This checks the tool's own accounting, not independently inferred eligibility
+    or physical connectivity. Natural shift-register DFFs are already included
+    in chain totals. A missing entire insertion summary does not block this
+    check; it leaves coverage unverified. Partial or conflicting summary fields
+    cannot establish coverage. Replacement-only and CTL flows are outside scope.
+    """
+    designs = _full_insertion_designs(dofile)
+    if not designs:
+        return []
+    problems = []
+    seen = {}
+    equations = (
+        ("Scannable FF Bit Count", "Scan Chain Cell Bit Count", "Wrapper Chain Cell Bit Count"),
+        ("Total FF Bit Count", "Scannable FF Bit Count", "Nonscannable FF Bit Count"),
+        ("Wrapper Chain Cell Bit Count", "Shared Wrapper Cell Bit Count", "Dedicated Wrapper Cell Bit Count"),
+    )
+    for path in paths:
+        if path.suffix.lower() != ".rpt":
+            continue
+        for block in _insertion_summary_blocks(path):
+            if not block["values"] and not block["invalid"]:
+                continue
+            if not block["design"]:
+                problems.append(f"Incomplete actual insertion coverage summary at {path}: missing Design header")
+                continue
+            if block["design"] not in designs:
+                continue
+            location = f"{path}:{block['line']} (Design {block['design']})"
+            missing = set(_COVERAGE_FIELDS) - block["values"].keys()
+            if missing or block["conflicts"] or block["invalid"]:
+                details = []
+                for label, names in (("missing", missing), ("conflicting", block["conflicts"]), ("invalid", block["invalid"])):
+                    if names:
+                        details.append(label + " fields: " + ", ".join(sorted(names)))
+                problems.append(f"Incomplete actual insertion coverage summary at {location}: " + "; ".join(details))
+                continue
+            signature = tuple(block["values"][name] for name in _COVERAGE_FIELDS)
+            previous = seen.get(block["design"])
+            if previous is not None and previous != signature:
+                problems.append(f"Conflicting actual insertion coverage summaries for Design {block['design']} at {location}")
+            seen[block["design"]] = signature
+            for total, left, right in equations:
+                values = block["values"]
+                if values[total] != values[left] + values[right]:
+                    problems.append(f"Actual insertion coverage mismatch at {location}: {total} {values[total]} != "
+                                    f"{left} {values[left]} + {right} {values[right]}")
+    return problems
+
 
 def report_rows(path: Path, required: set[str]) -> Iterator[dict[str, Any]]:
     columns = []

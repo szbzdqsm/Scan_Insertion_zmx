@@ -131,6 +131,121 @@ class AuditRegression(unittest.TestCase):
         log.write_text("[INFO] [CMD-0034] @1: set_scan_signal -type scan_enable -port test_se\n" + text + "\n")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_port_diagnosis_recovers_only_the_actual_failed_signal_command(self):
+        cases = [
+            ("set_scan_signal -type clock -port wb_clk -off_state 0",
+             "[ERROR] [SCAN-1315] Port 'wb_clk' does not exist in the design.", "port wb_clk",
+             "Changed -port wb_clk to -port wb_clk_i.", "set_scan_signal -type clock -port wb_clk_i -off_state 0",
+             ["wb_clk_i", "pre_existing", "clock", "0", ""]),
+            ("set_scan_signal -type clock -port mrx_clk_pad_i -off_state 0 -usage all",
+             "[ERROR] [SCAN-1604] Signal type does not match option '-usage'.", "port mrx_clk_pad_i",
+             "Removed -usage all from mrx_clk_pad_i clock declaration.",
+             "set_scan_signal -type clock -port mrx_clk_pad_i -off_state 0",
+             ["mrx_clk_pad_i", "pre_existing", "clock", "0", ""]),
+            ("set_scan_signal -type scan_enable -port se_wb -active_state 1",
+             "[ERROR] [CMD-0074] Unknown option '-active_state' for command 'set_scan_signal'.", "scan_enable se_wb",
+             "Replaced -active_state 1 with -off_state 0 -usage all.",
+             "set_scan_signal -type scan_enable -port se_wb -off_state 0 -usage all",
+             ["se_wb", "tool_created", "scan_enable(spec)", "0", "all"]),
+        ]
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        headers = ["Port", "PortProperty", "SignalType", "OffState", "Usage"]
+        for original, error, located, fix, repaired, row in cases:
+            with self.subTest(located=located):
+                item = dict(self.item, evidence_excerpt=error, located_object=located, fix=fix)
+                (self.out / "runs/R1/R1.log").write_text("[INFO] [CMD-0034] @1: " + original + "\n" + error + "\n")
+                issues, plans = self.record(item)
+                (run / "deliverables/R2.dofile").write_text(repaired + "\nexit\n")
+                report = run / "reports/scan_signal.rpt"
+                wrong = list(row)
+                wrong[3] = "1"
+                report.write_text(''.join(f'{value:<28}' for value in headers) + '\n' +
+                                  ''.join(f'{value:<28}' for value in wrong) + '\n')
+                agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+                self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+                report.write_text(''.join(f'{value:<28}' for value in headers) + '\n' +
+                                  ''.join(f'{value:<28}' for value in row) + '\n')
+                agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+                self.assertTrue(issues[0]["attempts"][-1]["verify"]["resolved"])
+                self.assertIn("scan_signal.rpt", issues[0]["attempts"][-1]["verify"]["source"])
+
+    def test_signal_command_recovery_requires_exact_log_source_locator_and_object(self):
+        error = "[ERROR] [SCAN-1315] Port 'wb_clk' does not exist in the design."
+        item = dict(self.item, evidence_excerpt=error, located_object="port wb_clk", fix="Changed wb_clk to wb_clk_i")
+        original = "set_scan_signal -type clock -port wb_clk -off_state 0"
+        (self.out / "runs/R1/R1.log").write_text("[INFO] [CMD-0034] @1: " + original + "\n" + error + "\n")
+        issues, _ = self.record(item)
+        run = self.out / "runs/R2"
+        headers = ["Port", "PortProperty", "SignalType", "OffState", "Usage"]
+        (run / "reports/scan_signal.rpt").write_text(''.join(f'{value:<28}' for value in headers) + '\n' +
+                                                    ''.join(f'{value:<28}' for value in ["wb_clk_i", "pre_existing", "clock", "0", ""]) + '\n')
+        dofile = "set_scan_signal -type clock -port wb_clk_i -off_state 0\n"
+        files = [run / "reports/scan_signal.rpt"]
+        (self.out / "runs/R1/reports/failure.rpt").write_text(error + "\n")
+        for fields in ({"source": "runs/R1/reports/failure.rpt", "locator": "L1"}, {"locator": "L1"},
+                       {"source": "runs/R1/../R2/R2.log"}, {"source": str((self.out / "runs/R1/R1.log").resolve())}):
+            with self.subTest(fields=fields):
+                changed = dict(issues[0], found=dict(issues[0]["found"], **fields))
+                self.assertIsNone(agent.configuration_evidence(changed, files, self.out, dofile))
+        (self.out / "runs/R1/R1.log").write_text("[INFO] [CMD-0034] @1: set_scan_signal -type clock -port other_clk\n" + error + "\n")
+        self.assertIsNone(agent.configuration_evidence(issues[0], files, self.out, dofile))
+
+    def test_partition_clock_fix_needs_all_actual_rows_in_the_named_partition(self):
+        item = dict(self.item, located_object="partition wb_partition", root_cause="wrong partition clock",
+                    fix="Changed -clocks {tx_clk} to -clocks {wb_clk}")
+        issues, _ = self.record(item)
+        path = self.out / "runs/R2/reports/scan_chain.rpt"
+        headers = ["Chain", "Length", "Input", "Output", "ScanEnable", "Clocks", "Partition"]
+        rows = [["I 1", "10", "si1", "so1", "se_wb", "wb_clk", "wb_partition"],
+                ["I 2", "10", "si2", "so2", "se_wb", "tx_clk", "wb_partition"]]
+        def write(rows):
+            path.write_text(''.join(f'{value:<24}' for value in headers) + '\n' +
+                            ''.join(''.join(f'{value:<24}' for value in row) + '\n' for row in rows))
+        dofile = "add_scan_partition wb_partition -clocks {wb_clk}\n"
+        write(rows)
+        self.assertIsNone(agent.configuration_evidence(issues[0], [path], self.out, dofile))
+        rows[1][5] = "wb_clk"
+        write(rows)
+        evidence = agent.configuration_evidence(issues[0], [path], self.out, dofile)
+        self.assertEqual(evidence["locator"], "L2-L3")
+        self.assertEqual(evidence["excerpt"], '\n'.join(path.read_text().splitlines()[1:3]))
+        write([])
+        self.assertIsNone(agent.configuration_evidence(issues[0], [path], self.out, dofile))
+
+    def test_complete_chain_discovery_checks_each_literal_partition_count_clock_and_enable(self):
+        old = self.out / "runs/R1/reports/scan_chain.rpt"
+        final = self.out / "runs/R2/reports/scan_chain.rpt"
+        headers = ["Chain", "Length", "Input", "Output", "ScanEnable", "Clocks", "Partition"]
+        def write(path, rows):
+            path.write_text(''.join(f'{value:<24}' for value in headers) + '\n' +
+                            ''.join(''.join(f'{value:<24}' for value in row) + '\n' for row in rows))
+        write(old, [["I 1", "1", "si1", "so1", "test_se", "tx_clk", "wb_partition"]])
+        item = dict(self.item, evidence_excerpt=old.read_text().rstrip('\n'), located_object="scan chains",
+                    root_cause="wrong partition configuration", fix="Fixed all partition settings")
+        issues, _ = self.record(item)
+        dofile = ("add_scan_partition wb_partition -clocks {wb_clk}\nadd_scan_partition tx_partition -clocks {tx_clk}\n"
+                  "set_current_scan_partition wb_partition\nset_scan_cfg -chain_count 2\n"
+                  "set_scan_signal -type scan_enable -port se_wb -off_state 0\n"
+                  "set_current_scan_partition tx_partition\nset_scan_cfg -chain_count 1\n"
+                  "set_scan_signal -type scan_enable -port se_tx -off_state 0\n")
+        rows = [["I 1", "10", "si1", "so1", "se_wb", "wb_clk", "wb_partition"],
+                ["I 2", "10", "si2", "so2", "se_tx", "tx_clk", "tx_partition"],
+                ["I 3", "10", "si3", "so3", "se_wb", "wb_clk", "wb_partition"]]
+        write(final, rows)
+        evidence = agent.configuration_evidence(issues[0], [final], self.out, dofile)
+        self.assertEqual(evidence["locator"], "L2-L4")
+        header_only = dict(issues[0], found=dict(issues[0]["found"], excerpt=old.read_text().splitlines()[0], locator="L1-L2"))
+        self.assertIsNone(agent.configuration_evidence(header_only, [final], self.out, dofile))
+        for column, wrong in ((4, "wrong_se"), (5, "wrong_clk"), (6, "wb_partition")):
+            changed = [list(row) for row in rows]
+            changed[1][column] = wrong
+            write(final, changed)
+            self.assertIsNone(agent.configuration_evidence(issues[0], [final], self.out, dofile))
+        write(final, rows)
+        write(old, [["I 1", "1", "si1", "so1", "test_se", "tx_clk", "wb_partition"],
+                    ["I 2", "1", "si2", "so2", "test_se", "tx_clk", "wb_partition"]])
+        self.assertIsNone(agent.configuration_evidence(issues[0], [final], self.out, dofile))
     def test_command_only_generic_failure_cannot_choose_between_different_objects(self):
         text = "[ERROR] Command 'set_scan_signal' execution failed"
         item = dict(self.item, evidence_excerpt=text, located_object="set_scan_signal")

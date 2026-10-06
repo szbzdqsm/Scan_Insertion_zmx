@@ -29,7 +29,7 @@ def drc_summaries(path: Path) -> list[dict]:
                     span = []
                     continue
                 span.append(line.rstrip("\r\n"))
-                counted = re.search(r"\[DFTDRC-7001\].*There were (\d+) DRC rule '([^']+)' fails", line)
+                counted = re.search(r"\[INFO\]\s+(?:\[DFTDRC-7001\]\s+)?There were (\d+) DRC rule '([^']+)' fails", line)
                 if counted:
                     codes = rule_codes(counted.group(2))
                     if len(codes) == 1:
