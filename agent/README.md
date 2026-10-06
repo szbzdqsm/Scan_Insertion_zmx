@@ -1,8 +1,8 @@
 # Scan Insertion Agent
 
-## Latest status (2026-10-06)
+## Latest status (2026-10-07)
 
-The local Bailian Key has passed a real `deepseek-v4-pro` request. A live-model baseline ran all 11 Public cases and passed none of the current Agent checks. Revised images are being retested and have passed several small cases. See [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for measured results and remaining work. The earlier Golden replay described below is historical tool validation, not an autonomous Agent pass.
+The latest complete live-model Public batch passed the current checks in 7/11 cases (v30). Later v34 subsets passed 2/2 small cases and failed both large cases (0/2). The current source has passed 191 local regression checks, Ruff and a fresh Docker build, but has not completed a full live Public rerun. See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for the current requirements audit and [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for measured results. Earlier Golden replay results below are historical tool validation.
 
 The runtime now uses build-time official command help, bounded structural context with actual Liberty pin names, command preflight, report redirection normalization, live tool logs, process-group timeouts, and indexed audit evidence. Task 1 mappings must refer to literal executed Tcl. A bounded private Pre-scan editing/EQY workflow is implemented and has passed small real proofs, including sky130 cells; see [NETLIST_REPAIR.md](NETLIST_REPAIR.md) for its restrictions. Some ICGs still lack usable functional models, and complete Public and semantic validation remain unfinished. Do not upload this development version for evaluation.
 
@@ -43,7 +43,7 @@ docker run --rm \
 - Tool calls are bounded by the case time limit. `AGENT_MAX_TOOL_CALLS` is an optional local budget, with no default count limit.
 - Task 2 may propose localized edits when the case allows them and Dofile settings are insufficient. The runtime edits a private copy and requires actual EQY PASS before use. Task 1 and explicit no-edit cases always refuse edits. Proof failures remain incomplete; input netlists are never overwritten.
 
-## Validation status (2026-10-04)
+## Historical validation status (2026-10-04)
 
 - All 11 Public cases were exercised with the real ScanInsertion binary through an offline replay harness that returns the case's `golden.dofile`. The runtime agent itself never reads `golden.dofile` or `preset_issues.json`.
 - The final saved artifacts passed the current independent DRC/artifact/scan-chain checks. Task 2 case 3 required two tool calls; its first run exposed DRC failures and the replayed second run passed.

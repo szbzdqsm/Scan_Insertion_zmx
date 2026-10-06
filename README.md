@@ -2,6 +2,8 @@
 
 开发源码位于 [agent/](agent/README.md)，正式 Word 和宣讲 PPT 也保存在该目录。[要求核对](agent/CONTEST_REQUIREMENTS.md)和[主办方 Q&A 核对](agent/CONTEST_QA.md)记录规则与待办；当前仍是开发版本。
 
+2026-10-07 核对：191 项回归检查、Ruff 和镜像构建通过。最新完整 Public 批次为 7/11，当前源码尚未完成完整重跑，仍有大型用例和语义验收缺口。已清理约 2.77 GiB 旧日志，最新验证现场保留。
+
 ## VS Code + WSL 开发
 
 用 VS Code 的 WSL 窗口打开整个 `~/scan-agent-dev`。仓库内已有 Python 环境选择、Ruff、测试发现、调试和任务配置。当前本机已建立 `.venv` 并安装依赖；换机器时执行：

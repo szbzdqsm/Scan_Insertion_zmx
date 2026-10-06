@@ -25,7 +25,8 @@ from report_validation import chain_problems, chain_rows, coverage_problems, ctl
 from report_validation import report_rows as typed_report_rows
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
-from clock_latch_context import clock_latch_context
+from clock_latch_context import clock_latch_context, clock_latch_hints
+from clock_association_recipe import clock_association_problems, configure_clock_associations
 from model_script_view import model_owned_script
 from drc_retry_preflight import unchanged_control_retry_problems
 from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets
@@ -810,7 +811,8 @@ def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
     return candidate if config_reference(dofile, candidate) else configuration
 
 
-def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "") -> str:
+def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
+                    clock_candidates: list[dict] | None = None) -> str:
     lib_names = [str(p) for p in libs]
     lib_summary = [liberty_summary(p) for p in libs]
     shift_summary = shift_register_context(netlists, libraries=libs) if re.search(r"移位寄存器|scan\s+segment", task_spec, re.I) else "Not requested"
@@ -836,7 +838,7 @@ Liberty files: {lib_names}
 {shift_summary}
 
 # Literal clock-buffer and enable-latch connections (structural candidates, not proof)
-{clock_latch_context(netlists, libs) if re.search(r'ICG|门控|缓冲|latch|闩锁', task_spec, re.I) else 'Not requested'}
+{clock_latch_context(netlists, libs, hints=clock_candidates) if re.search(r'ICG|门控|缓冲|latch|闩锁', task_spec, re.I) else 'Not requested'}
 
 # ScanInsertion manual excerpts (authoritative syntax reference)
 {manual_context(task_spec)}
@@ -865,7 +867,10 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     instances: dict[str, Any] | None = None,
                     floating: dict[str, list[str]] | None = None,
                     previous_actual_dofile: str | None = None,
-                    previous_unallowed_codes: set[str] | None = None) -> tuple[str, dict[str, Any]]:
+                    previous_unallowed_codes: set[str] | None = None,
+                    known_reset_ports: set[str] | None = None,
+                    reset_inference_evidenced: bool = False,
+                    clock_candidates: list[dict] | None = None) -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
@@ -1004,8 +1009,20 @@ The actual read-only input directory is {input_dir}. The current run directory a
                     item["dft_config"] = "; ".join(normalize_wrapper_roots(
                         normalize_associated_pin_paths(normalize_reset_levels(normalize_scan_port_formats(normalize_load_file_lists(normalize_report_redirection(clause))), control_hints or {}, dofile), instances or {}, dofile), dofile).strip() for clause in clauses)
                     item["dft_config"] = normalize_mapping_annotation(dofile, item["dft_config"])
-            problems = unsupported_options(dofile, spec, known_reset_ports=set(control_hints or {}),
-                                           permit_reset_inference=bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
+            dofile, clock_references = configure_clock_associations(dofile, clock_candidates or [], spec, literal_tcl_words)
+            if clock_references:
+                mappings = result.get("requirement_mapping", [])
+                if not isinstance(mappings, list) or (task == "task1" and not mappings):
+                    raise ValueError("Model-provided key requirement mappings are still required before clock propagation compilation")
+                requirement = "Source-derived CE-latch clock outputs propagate the declared primary clock"
+                mappings = [item for item in mappings if not isinstance(item, dict) or item.get("requirement") != requirement]
+                mappings.append({"requirement": requirement, "dft_config": "; ".join(clock_references)})
+                result["requirement_mapping"] = mappings
+                (run_dir / "llm_clock_association_recipe.json").write_text(json.dumps({"input_candidates": clock_candidates,
+                    "actual_commands": clock_references}, ensure_ascii=False, indent=2))
+            problems = unsupported_options(dofile, spec, known_reset_ports=set(control_hints or {}) | (known_reset_ports or set()),
+                                           permit_reset_inference=reset_inference_evidenced or
+                                           bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
             if previous_actual_dofile is not None:
                 problems.extend(unchanged_control_retry_problems(
                     previous_actual_dofile, dofile, previous_unallowed_codes or set(),
@@ -1158,7 +1175,8 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
 
 def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: str,
                  expected_segments: list[dict[str, Any]] | None = None,
-                 expected_floating: dict[str, list[str]] | None = None) -> tuple[bool, list[str]]:
+                 expected_floating: dict[str, list[str]] | None = None,
+                 clock_candidates: list[dict] | None = None) -> tuple[bool, list[str]]:
     problems: list[str] = []
     log_path = run_dir / f"{run_dir.name}.log"
     log = read_text(log_path, 100000)
@@ -1194,6 +1212,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     report_files = [p for p in actual_files if p.suffix.lower() in {".rpt", ".report", ".txt"}]
     problems.extend(coverage_problems(report_files, dofile))
     problems.extend(wrapper_problems(report_files, task_spec))
+    problems.extend(clock_association_problems(report_files, dofile, clock_candidates or [], task_spec, literal_tcl_words))
     report_text = "\n".join(read_text(p, 50000) for p in report_files)
     actual_chains = chain_rows(report_files)
     problems.extend(chain_problems(actual_chains, task_spec))
@@ -2087,8 +2106,11 @@ def main() -> int:
         last_log = ""
         generation_error = ""
         validation_problems: list[str] = []
-        static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "")
+        clock_candidates = (clock_latch_hints(netlists, libs) if re.search(r"ICG|门控|缓冲|latch|闩锁", task_spec, re.I) else [])
+        static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "", clock_candidates=clock_candidates)
         control_hints = reset_polarity_hints(netlists, libs)
+        known_reset_ports = set(control_hints)
+        reset_inference_evidenced = False
         instances = source_instance_map(netlists) if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else {}
         floating = (floating_clock_outputs(netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
                     re.search(r"伪|pseudo", task_spec, re.I) and re.search(r"时钟|clock", task_spec, re.I) else {})
@@ -2128,6 +2150,7 @@ def main() -> int:
             generation_actual_base = generation_base
             previous_unallowed_codes = (redirected_drc_codes(runs_root / run_records[-1]["run_id"], {}) -
                                         permitted_residual_drc_codes(task, task_spec) if run_records else set())
+            reset_inference_evidenced = reset_inference_evidenced or bool(previous_unallowed_codes & {"DFTR2", "DFTR3"})
             if run_records:
                 generation_base = model_owned_script(generation_base)
             context = (static_context + f"\n# Current Dofile (output paths already rebased to this round)\n{generation_base}\n\n"
@@ -2168,7 +2191,10 @@ def main() -> int:
                                                  catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir, task_spec=task_spec) if run_records else None,
                                                  segments=expected_segments, control_hints=control_hints, instances=instances, floating=floating,
                                                  previous_actual_dofile=generation_actual_base if run_records else None,
-                                                 previous_unallowed_codes=previous_unallowed_codes)
+                                                 previous_unallowed_codes=previous_unallowed_codes,
+                                                 known_reset_ports=known_reset_ports,
+                                                 reset_inference_evidenced=reset_inference_evidenced,
+                                                 clock_candidates=clock_candidates)
                     if meta.get("netlist_edits"):
                         edits = meta["netlist_edits"]
                         if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
@@ -2239,6 +2265,14 @@ def main() -> int:
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path,
                               abort_on_error=not (task == "task2" and index == 1),
                               allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
+            if not (task == "task2" and index == 1):
+                for statement in dofile.replace("\\\n", " ").splitlines():
+                    if re.match(r"\s*set_scan_signal\b", statement) and re.search(r"-type\s+reset\b", statement):
+                        words = literal_tcl_words(statement)
+                        if "-port" in words and words.index("-port") + 1 < len(words):
+                            port = words[words.index("-port") + 1].strip('"{}')
+                            if re.fullmatch(r"[A-Za-z_][\w$]*", port):
+                                known_reset_ports.add(port)
             record = {k: v for k, v in result.items() if k != "log_path"}
             record["log_file"] = str((run_dir / f"{rid}.log").relative_to(output_dir)).replace("\\", "/")
             record["exit_status"] = result["status"]
@@ -2249,7 +2283,7 @@ def main() -> int:
             last_log = diagnostic_excerpt(run_dir / f"{rid}.log")
             previous = dofile
             final_run_dir = run_dir
-            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating)
+            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates)
             modified = changed_paths(snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
@@ -2294,7 +2328,7 @@ def main() -> int:
         copy_tree_contents(final_run_dir / "reports", reports)
         copy_tree_contents(final_run_dir / "deliverables", deliverables)
         tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile,
-                                                         run_records[-1]["exit_status"], expected_segments, floating)
+                                                         run_records[-1]["exit_status"], expected_segments, floating, clock_candidates)
         if integrity_problems:
             tool_checks_passed = False
             final_problems.extend(integrity_problems)

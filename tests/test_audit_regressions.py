@@ -495,6 +495,17 @@ class AuditRegression(unittest.TestCase):
             self.assertEqual(agent.unsupported_options(script, "Complete insertion", permit_reset_inference=True), [])
             self.assertTrue(agent.unsupported_options(script, "没有复位端口，reset_n 不作为 reset", permit_reset_inference=True))
 
+    def test_admitted_reset_survives_an_intervening_round_without_drc_output(self):
+        (self.root / "task_spec.md").write_text("Complete insertion and clear all DRC")
+        (self.root / "tool_help.json").write_text("{}")
+        script = "set_scan_signal -type reset -port rst_l -off_state 1\nexit\n"
+        response = json.dumps({"dofile": script, "summary": "Preserve the source-supported reset", "issue_resolutions": []})
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")), patch.object(agent, "ask", return_value=response):
+            for state in ({"known_reset_ports": {"rst_l"}}, {"reset_inference_evidenced": True}):
+                candidate, _ = agent.call_for_dofile(object(), "task2", "Actual previous uncontrolled reset; latest run failed before DRC",
+                    "exit\n", self.root, self.out / "runs/R2", previous_unallowed_codes=set(), **state)
+                self.assertIn("-type reset -port rst_l", candidate)
+
     def test_bare_partition_name_binds_to_its_real_old_chain_row(self):
         headers = ["Chain", "Length", "Input", "Output", "ScanEnable", "Clocks", "Partition"]
         def table(clock):

@@ -16,3 +16,4 @@
 !model_script_view.py
 !drc_retry_preflight.py
 !wrapper_validation.py
+!clock_association_recipe.py

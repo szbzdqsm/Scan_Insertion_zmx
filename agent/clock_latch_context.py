@@ -370,8 +370,9 @@ def clock_latch_hints(paths: list[Path], libraries: list[Path], maximum_hints: i
     return hints
 
 
-def clock_latch_context(paths: list[Path], libraries: list[Path], limit: int = 5000) -> str:
-    hints = clock_latch_hints(paths, libraries)
+def clock_latch_context(paths: list[Path], libraries: list[Path], limit: int = 5000,
+                        *, hints: list[dict] | None = None) -> str:
+    hints = clock_latch_hints(paths, libraries) if hints is None else hints
     if not hints:
         return ""
     header = ("Source-only candidates for simple latch-based clock gates; verify with actual tool reports. "
