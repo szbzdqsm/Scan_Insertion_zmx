@@ -21,6 +21,7 @@ from openai import OpenAI
 from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerprint_paths, prepare_repair
 from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups, source_instance_map
 from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
+from report_validation import report_rows as typed_report_rows
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
 
@@ -376,6 +377,11 @@ def parse_tool_limit(text: str) -> int:
         if m:
             return max(1, int(m.group(1)))
     return max(1, int(os.environ.get("AGENT_MAX_TOOL_CALLS", "4")))
+
+
+def model_request_timeout(remaining: float) -> float:
+    default = 120 if remaining >= 180 else 90
+    return max(1.0, min(float(os.environ.get("AGENT_LLM_TIMEOUT", str(default))), remaining))
 
 
 def contest_model() -> str:
@@ -880,8 +886,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
             remaining = deadline - time.monotonic()
             if remaining <= 1:
                 raise TimeoutError("Dofile generation exhausted its remaining case budget")
-            client = client.with_options(timeout=min(float(os.environ.get("AGENT_LLM_TIMEOUT", "90")),
-                                                     remaining), max_retries=0)
+            client = client.with_options(timeout=model_request_timeout(remaining), max_retries=0)
         log_name = "llm_response.json" if attempt == 0 else "llm_response_retry.json"
         raw = ask(client, system, user, request_log=run_dir / log_name)
         try:
@@ -1411,6 +1416,9 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         located = str(item.get("located_object", ""))
         diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
         fix_text = str(item.get("fix", ""))
+        if (not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and
+                re.search(r"already corrected|already correct|no further change|already.*fixed|无需进一步|已经修复", fix_text, re.I)):
+            continue
         if re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and re.search(r"redundan|duplicate configuration|冗余", diagnostic, re.I):
             continue
         if (re.search(r"Chain\s+Length\s+Input", cited) and
@@ -1465,6 +1473,22 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
     fix = issue.get("attempts", [{}])[-1].get("fix", {}).get("action", "")
     subject = diagnosis.get("located_object", "") + " " + fix
     logical_lines = dofile.replace("\\\n", " ").splitlines()
+    if "set_scan_cell_mapping" in subject:
+        for command in logical_lines:
+            mapping = re.match(r"\s*set_scan_cell_mapping\s+(\w+)\s+(\w+)\s*$", command)
+            if not mapping or mapping.group(2) not in subject:
+                continue
+            for path in files:
+                if not any(name in path.name.lower() for name in ("cell", "element")):
+                    continue
+                for row in typed_report_rows(path, {"RefName"}):
+                    if row.get("RefName") == mapping.group(2):
+                        number = row["line"]
+                        with path.open(encoding="utf-8", errors="replace") as stream:
+                            for index, line in enumerate(stream, 1):
+                                if index == number:
+                                    return {"source": path.relative_to(output_dir).as_posix(),
+                                            "locator": f"L{number}", "excerpt": line.strip()}
     if "set_scan_drc_rule_handling" in subject:
         for command in logical_lines:
             match = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|DFTR[\w-]+)\s+(Error|Warning|Info|Ignore)\b", command)
@@ -1811,8 +1835,7 @@ def main() -> int:
                         generation_error = f"Insufficient time for Dofile generation before {rid}; finalization reserve retained"
                         break
                     request_client = client.with_options(
-                        timeout=max(1.0, min(float(os.environ.get("AGENT_LLM_TIMEOUT", "90")),
-                                             remaining - finalize_reserve - 1)), max_retries=0)
+                        timeout=model_request_timeout(remaining - finalize_reserve - 1), max_retries=0)
                     dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
                                                  input_dir, run_dir, start + timeout_total - finalize_reserve - 1,
                                                  base_dofile=generation_base if run_records else None,

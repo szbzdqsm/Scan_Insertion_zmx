@@ -150,6 +150,28 @@ class AuditRegression(unittest.TestCase):
         agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
         self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
 
+    def test_cell_mapping_fix_needs_actual_target_cell_type(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Command 'set_scan_cell_mapping' execution failed",
+                    located_object="set_scan_cell_mapping DFF NAND", root_cause="wrong mapping target", fix="Map DFF to SFF")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text("set_scan_cell_mapping DFF SFF\nexit\n")
+        report = run / "reports/scan_cell.rpt"
+        report.write_text("InstanceName                RefName\nff                          NAND\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        report.write_text("InstanceName                RefName\nff                          SFF\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_model_timeout_keeps_small_deadlines_and_allows_longer_case_budget(self):
+        with patch.dict(agent.os.environ, {}, clear=True):
+            self.assertEqual(agent.model_request_timeout(290), 120)
+            self.assertEqual(agent.model_request_timeout(140), 90)
+            self.assertEqual(agent.model_request_timeout(20), 20)
+
     def test_command_echo_cannot_prove_completion(self):
         item = dict(self.item, evidence_excerpt="ERROR: unknown argument for add_scan_chains",
                     located_object="add_scan_chains argument", root_cause="wrong option",
