@@ -82,11 +82,83 @@ class AuditRegression(unittest.TestCase):
         item = dict(self.item, evidence_excerpt=text, located_object="set_wrapper_cfg -max_length 100", diagnosis="Redundant wrapper configuration", root_cause="duplicate configuration")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_scan_configuration_table_does_not_discover_path_or_report_faults(self):
+        text = "ScanConfigurationParameter Value\nmax_length 100\nreplace True"
+        (self.out / "runs/R1/reports/scan_cfg.rpt").write_text(text + "\n")
+        item = dict(self.item, evidence_excerpt=text, located_object="examine_scan_drc command", diagnosis="No drc.rpt was written", root_cause="Missing output report")
+        self.assertEqual(self.record(item)[0], [])
+
     def test_error_in_another_command_is_not_discovery_for_a_dump_command(self):
         text = "[ERROR] Command 'set_scan_drc_rule_handling' execution failed"
         (self.out / "runs/R1/R1.log").write_text(text + "\n")
         item = dict(self.item, evidence_excerpt=text, located_object="dump_scan_def", fix="Replace with dump_def -section scan_chain")
         self.assertEqual(self.record(item)[0], [])
+
+    def test_generic_failures_keep_distinct_signal_objects_and_real_error_lines(self):
+        text = "[ERROR] [CMD-0074] Command 'set_scan_signal' execution failed"
+        (self.out / "runs/R1/R1.log").write_text(
+            "[INFO] [CMD-0034] @1: set_scan_signal -type clock -port resetn -off_state 0\n" + text + "\n" +
+            "[INFO] [CMD-0034] @2: set_scan_signal -type scan_enable -port test_se -usage scan\n" + text + "\n")
+        clock = dict(self.item, phenomenon="wrong clock port", evidence_excerpt=text,
+                     located_object="set_scan_signal -type clock -port resetn", root_cause="wrong clock port",
+                     fix="set_scan_signal -type clock -port clk -off_state 0")
+        enable = dict(self.item, phenomenon="wrong scan enable usage", evidence_excerpt=text,
+                      located_object="set_scan_signal -type scan_enable -port test_se -usage scan",
+                      root_cause="wrong scan enable usage", fix="set_scan_signal -type scan_enable -port test_se -usage all")
+        issues, plans = [], {}
+        agent.record_issue_fixes({"issue_resolutions": [clock, enable]}, issues, plans, self.out, "R1", "R2", "F1")
+        self.assertEqual(len(issues), 2)
+        self.assertEqual([issue["found"]["locator"] for issue in issues], ["L2", "L4"])
+        self.assertEqual([issue["phenomenon"] for issue in issues], [clock["phenomenon"], enable["phenomenon"]])
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text(clock["fix"] + "\n" + enable["fix"] + " -off_state 0\nexit\n")
+        headers = ["Port", "PortProperty", "SignalType", "OffState", "Usage"]
+        rows = [["clk", "pre_existing", "clock", "0", ""], ["test_se", "tool_created", "scan_enable(spec)", "0", "all"]]
+        (run / "reports/scan_signal.rpt").write_text(
+            ''.join(f'{value:<28}' for value in headers) + '\n' +
+            ''.join(''.join(f'{value:<28}' for value in row) + '\n' for row in rows))
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertEqual([issue["attempts"][-1]["verify"]["resolved"] for issue in issues], [True, True])
+        self.assertEqual([issue["attempts"][-1]["verify"]["locator"] for issue in issues], ["L2", "L3"])
+
+    def test_generic_failure_without_matching_command_echo_is_not_discovery(self):
+        text = "[ERROR] Command 'set_scan_signal' execution failed"
+        item = dict(self.item, evidence_excerpt=text, located_object="set_scan_signal -type clock -port clk")
+        log = self.out / "runs/R1/R1.log"
+        log.write_text(text + "\n")
+        self.assertEqual(self.record(item)[0], [])
+        log.write_text("[INFO] [CMD-0034] @1: set_scan_signal -type scan_enable -port test_se\n" + text + "\n")
+        self.assertEqual(self.record(item)[0], [])
+
+    def test_command_only_generic_failure_cannot_choose_between_different_objects(self):
+        text = "[ERROR] Command 'set_scan_signal' execution failed"
+        item = dict(self.item, evidence_excerpt=text, located_object="set_scan_signal")
+        (self.out / "runs/R1/R1.log").write_text(
+            "[INFO] [CMD-0034] @1: set_scan_signal -type clock -port clk\n" + text + "\n" +
+            "[INFO] [CMD-0034] @2: set_scan_signal -type scan_enable -port test_se\n" + text + "\n")
+        self.assertEqual(self.record(item)[0], [])
+
+    def test_repeated_concrete_root_cause_retains_discovery_and_reopens_verification(self):
+        issues, plans = self.record()
+        original_found = dict(issues[0]["found"])
+        (self.out / "runs/R2/reports/drc.rpt").write_text("DRC Report\nTotal violations: 0\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][-1]["verify"]["resolved"])
+        (self.out / "runs/R2/reports/drc.rpt").write_text(self.cited + "\n")
+        agent.record_issue_fixes({"issue_resolutions": [self.item]}, issues, plans, self.out, "R2", "R3", "F2")
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["found"], original_found)
+        self.assertEqual(len(issues[0]["attempts"]), 2)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+        self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+        self.assertTrue(agent.issue_audit_problems("task2", issues, [{"change_id": "F1"}, {"change_id": "F2"}]))
+
+    def test_identical_diagnostic_does_not_merge_different_concrete_root_causes(self):
+        issues, plans = self.record()
+        other = dict(self.item, root_cause="different concrete cause")
+        agent.record_issue_fixes({"issue_resolutions": [other]}, issues, plans, self.out, "R1", "R2", "F1")
+        self.assertEqual(len(issues), 2)
 
     def test_model_evidence_id_expands_only_actual_prior_excerpt(self):
         catalog = agent.evidence_catalog(self.out / "runs/R1", self.out)
@@ -121,6 +193,47 @@ class AuditRegression(unittest.TestCase):
         self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
         self.assertTrue(agent.issue_audit_problems("task2", issues, [{"change_id": "F1"}]))
 
+    def test_allowed_residual_does_not_use_an_earlier_zero_as_repair_evidence(self):
+        item = dict(self.item, evidence_excerpt="Warning: clock on data pin (DFTR10-1)",
+                    located_object="U1/D", root_cause="clock connected to data input")
+        (self.out / "runs/R1/reports/drc.rpt").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        (self.out / "runs/R2/reports/drc.rpt").write_text(
+            "DRC Report\nTotal violations: 0\nDRC Report\nTotal violations: 21\n" +
+            "[INFO] [DFTDRC-7001] There were 21 DRC rule 'DFTR10' fails.\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True, {"DFTR10"})
+        self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+
+    def test_rule_handling_table_requires_actual_parameter_evidence_even_when_drc_is_zero(self):
+        row = "DFTR-TIE1 Warning Warning all"
+        item = dict(self.item, evidence_excerpt=row, located_object="set_scan_drc_rule_handling DFTR-TIE1 Warning",
+                    root_cause="permitted constant rule was not ignored", fix="set_scan_drc_rule_handling DFTR-TIE1 Ignore")
+        (self.out / "runs/R1/reports/rpt_scan_drc_rule_handling.audit.rpt").write_text(row + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text(item["fix"] + "\nexit\n")
+        (run / "reports/drc.rpt").write_text("DRC Report\nTotal violations: 0\n")
+        report = run / "reports/rpt_scan_drc_rule_handling.audit.rpt"
+        report.write_text(row + "\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True, {"DFTRTIE1"})
+        self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+        report.write_text("DFTR-TIE1 Warning Ignore all\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True, {"DFTRTIE1"})
+        verify = issues[0]["attempts"][-1]["verify"]
+        self.assertTrue(verify["resolved"])
+        self.assertIn("rule_handling", verify["source"])
+        self.assertEqual(verify["excerpt"], "DFTR-TIE1 Warning Ignore all")
+
+    def test_rule_table_without_command_name_is_not_a_drc_violation(self):
+        item = dict(self.item, evidence_excerpt="DFTR7 Warning Warning all", located_object="DFTR7 level",
+                    root_cause="wrong configured severity", fix="change configured severity")
+        (self.out / "runs/R1/reports/rpt_scan_drc_rule_handling.audit.rpt").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        (self.out / "runs/R2/reports/drc.rpt").write_text("DRC Report\nTotal violations: 0\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+
     def test_config_needs_its_own_report_value(self):
         item = dict(self.item, evidence_excerpt="Number of chains: 4", located_object="set_scan_cfg -chain_count",
                     root_cause="chain count wrong", violated_requirement="扫描链数量应为 8 条",
@@ -153,7 +266,8 @@ class AuditRegression(unittest.TestCase):
     def test_cell_mapping_fix_needs_actual_target_cell_type(self):
         item = dict(self.item, evidence_excerpt="[ERROR] Command 'set_scan_cell_mapping' execution failed",
                     located_object="set_scan_cell_mapping DFF NAND", root_cause="wrong mapping target", fix="Map DFF to SFF")
-        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        (self.out / "runs/R1/R1.log").write_text(
+            "[INFO] [CMD-0034] @1: set_scan_cell_mapping DFF NAND\n" + item["evidence_excerpt"] + "\n")
         issues, plans = self.record(item)
         run = self.out / "runs/R2"
         (run / "deliverables").mkdir()

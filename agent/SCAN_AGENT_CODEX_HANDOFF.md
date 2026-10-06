@@ -4,9 +4,11 @@
 
 本目录已补入用户提供的原始正式赛题 Word 文档 `赛题指南_广立微.docx`，并于 2026-10-04 读取原文核对实现。技术要求核对与剩余缺口见 `CONTEST_REQUIREMENTS.md`。后续补充文档时请单独提取新增文件；整包解压会覆盖目录里的已开发源码。
 
-同时包含并已阅读 `EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx`（11 张幻灯片，标注页码 6–16），作为补充参考。PPT 输入目录截图划掉了工具调用次数限制，但 Word 仍保留限制；在正式规则澄清前，继续执行各 case 的 `limitations.md`，不要仅凭截图取消调用上限。
+同时包含并已阅读 `EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx`（11 张幻灯片，标注页码 6–16），作为补充参考。2026-10-06 已读取主办方 Q&A，规则与实现核对见 [CONTEST_QA.md](CONTEST_QA.md)。下文较早版本的轮数限制说明已经过时。
 
 ## 最新接手状态（2026-10-06）
+
+Q&A 已纳入运行时上下文和检查器。`live-v26` 针对子集的真实模型运行为 2/2：Task 1 case6、Task 2 case1；独立复核随后修正了通用错误去重，旧现场保留。不能把不同版本的成绩相加作为全批成绩。新版将重新构建并验证，实时结果见 [LIVE_VALIDATION.md](../LIVE_VALIDATION.md)。
 
 开发目录直接关联 GitHub，打开 VS Code 时使用仓库根目录 `~/scan-agent-dev`。本地 Key 已配置并验证指定模型成功，11 个真实模型 Public 基线已执行完成但均未通过当前检查，修正版正在重跑。详细状态、修复内容和验证命令见仓库根目录 `LIVE_VALIDATION.md`。下文未配置 Key 的描述为历史状态。自动网表修复已实现受限的私有副本/EQY 流程，并完成小电路及真实库验证，见 `NETLIST_REPAIR.md`；实际复杂网表及部分 ICG 功能模型仍待验证，禁止据此宣称提交成品。
 
@@ -52,7 +54,7 @@ code ~/scan-agent-dev/agent
 - task 1：输入 task spec、Pre-scan 网表、Liberty 和 limits；运行时不允许修改网表。输出 Dofile、任务要求的真实网表/报告、逐轮日志、decision log。
 - task 2：从 `original.dofile` 开始；根据工具日志、DRC、任务要求和报告定位 Dofile/DFT 配置问题；只有确需时才能改 Pre-scan 网表，并必须提供 diff 和 LEC 证据。
 - 隐藏用例不会提供 `golden.dofile` 或 `preset_issues.json`。运行时代码绝不能读取这些文件；Public case 里的它们仅用于离线开发和人工比对。
-- 每个 case 的总耗时和工具调用次数都有限制，读取 `limitations.md` 并在代码层严格计时/限轮。失败、超时、缺产物必须如实记录，绝不能生成模拟报告或占位 Post-scan 网表。
+- 读取 `limitations.md` 并严格控制总耗时；调用次数按最新 Q&A 处理。失败、超时、缺产物必须如实记录，绝不能生成模拟报告或占位 Post-scan 网表。
 - 赛题输出根目录需有 `decision_log.json`、`runs/Rn/`、`final_results/`、`diffs/`。工具运行日志和证据路径均使用相对 `/output` 的路径；final 必须是实际通过验证的那一轮产物。
 
 ## Public case 内容
@@ -102,7 +104,7 @@ code ~/scan-agent-dev/agent
 1. 通读正式赛题指南、ScanInsertion PDF 手册、全部 Public case 的 task spec/limits 和 Dofile；列出每个 case 的目标和验证方式。
 2. 修正 starter 的输入路径、脚本目录和报告收集，确保在 task 1 和 task 2 目录结构下都能稳定工作。
 3. 设计严格 JSON decision log：要求映射到真实 Dofile 行号/真实报告行；`found → diagnosis → fix → verify` 必须有文件证据。不能把 LLM 自述当作证据。
-4. 实现增量工具闭环：保存每轮 Dofile、完整日志、真实报告、diff；从日志和报告提取错误类型；按剩余时间/工具调用额度决定重试或停止。
+4. 实现增量工具闭环：保存每轮 Dofile、完整日志、真实报告、diff；从日志和报告提取错误类型；按剩余时间决定重试或停止。
 5. 报告检查至少覆盖任务要求的 DRC 状态及明确允许的例外、扫描链数量/域/长度、扫描单元覆盖、Wrapper 目标和所需文件存在性。不能仅凭 WARNING 等级认定违规符合要求；不能把旧错误文本消失当成完整修复证据。
 6. task 2 只有在证据表明无法通过 Dofile/DFT 配置解决时才考虑网表修改；限制改动范围，自动生成 Verilog diff，并调用 Yosys EQY 做 LEC。正式指南要求最终实际采用的 Pre-scan 网表通过 LEC，允许保留中间失败尝试；自动回滚是开发策略。
 7. 使用自己保存的百炼 Key 在容器运行；Key 只从运行时 `.env` 注入。用真实模型重新跑全部 11 个 Public case，保存日志和输出，检查模型生成质量、每项 requirement mapping 和问题闭环。

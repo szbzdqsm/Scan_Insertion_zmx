@@ -9,3 +9,5 @@
 !report_validation.py
 !dofile_recipe.py
 !floating_inputs.py
+!contest_rules.py
+!drc_validation.py

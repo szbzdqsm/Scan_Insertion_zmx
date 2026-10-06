@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Auditable ScanInsertion agent starter for the contest container."""
+"""Auditable ScanInsertion agent runtime for the contest container."""
 from __future__ import annotations
 
 import argparse
 from collections import deque
 import difflib
 import functools
+import itertools
 import json
 import os
 import re
@@ -24,6 +25,8 @@ from report_validation import chain_problems, chain_rows, ctl_overlength_excepti
 from report_validation import report_rows as typed_report_rows
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
+from contest_rules import QA_READ_DATE, QA_URL, qa_context, qa_residual_codes
+from drc_validation import drc_summaries, excluded_scan_cells, residual_positive_evidence, rule_codes, summary_permitted
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -243,12 +246,24 @@ def command_syntax(query: str, max_chars: int = 30000) -> str:
 
 def allowed_drc_codes(spec: str) -> set[str]:
     allowed = set()
-    for clause in re.split(r"[\n，,;；。]", spec):
-        if (re.search(r"忽略|允许|无需处理|不需要处理|\ballow|\bignore|\bpermit", clause, re.I) and
-                not re.search(r"不允许|不得|禁止|不忽略|not allowed|must not|do not ignore", clause, re.I)):
-            allowed.update(re.sub(r"[-_ ]", "", code).upper()
-                           for code in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", clause, re.I))
+    for sentence in re.split(r"[\n;；。]", spec):
+        pending = set()
+        for clause in re.split(r"[，,]", sentence):
+            codes = rule_codes(clause)
+            negative = re.search(r"不允许|不得|禁止|不忽略|not allowed|must not|do not ignore", clause, re.I)
+            positive = re.search(r"忽略|允许|无需处理|不需要处理|\ballow|\bignore|\bpermit", clause, re.I)
+            if negative:
+                pending = set()
+                continue
+            if positive:
+                allowed.update(codes or pending)
+            if codes:
+                pending = codes
     return allowed
+
+
+def permitted_residual_drc_codes(task: str, spec: str) -> set[str]:
+    return allowed_drc_codes(spec) | qa_residual_codes(task, spec)
 
 
 def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
@@ -258,6 +273,9 @@ def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
         return []
     syntax = json.loads(path.read_text())
     problems = []
+    if (task_spec is not None and qa_residual_codes("task2", task_spec) and
+            re.search(r"(?m)^\s*set_scan_element\s+(?:false|0|no|off)\b", dofile, re.I)):
+        problems.append("Q19 permits visible DFTR10, not exclusion of scan FFs; remove set_scan_element false")
     if re.search(r"set_dft_clock_gating_cfg[^\n]*-exclude_elements\s+(?:\{\s*\}|\"\")", dofile):
         problems.append("Empty -exclude_elements is invalid; omit this option when no objects are excluded")
     design = ""
@@ -370,13 +388,10 @@ def parse_limit_seconds(text: str) -> int:
     return int(n) * (60 if unit and ("分" in unit or "min" in unit.lower()) else 1)
 
 
-def parse_tool_limit(text: str) -> int:
-    patterns = [r"(?:工具调用次数|调用次数)[^\d]{0,30}(\d+)", r"(?:最多|不超过)[^\d]{0,20}(\d+)\s*(?:次|calls?)"]
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if m:
-            return max(1, int(m.group(1)))
-    return max(1, int(os.environ.get("AGENT_MAX_TOOL_CALLS", "4")))
+def parse_tool_limit(text: str) -> int | None:
+    """Q15/A16 cancels old case call limits; an explicit local budget remains optional."""
+    configured = os.environ.get("AGENT_MAX_TOOL_CALLS", "").strip()
+    return max(1, int(configured)) if configured else None
 
 
 def model_request_timeout(remaining: float) -> float:
@@ -791,6 +806,9 @@ def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list
 # Runtime limits
 {limits or 'Not supplied'}
 
+# Reviewed organizer clarifications
+{qa_context('task2' if (input_dir / 'original.dofile').is_file() else 'task1', task_spec)}
+
 # Input files
 Input directory: {input_dir}
 Netlists: {[str(p) for p in netlists]}
@@ -1114,16 +1132,23 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     diagnostic_text = log + "\n" + diagnostics
     if re.search(r"\[(?:ERROR|FATAL)\]", diagnostic_text + diagnostic_excerpt(log_path), re.I):
         problems.append("Tool log or DRC report contains an ERROR/FATAL diagnostic")
-    allowed_codes = allowed_drc_codes(task_spec)
-    violation_total = re.search(r"Total violations:\s*(\d+)", diagnostic_text, re.I)
+    allowed_codes = permitted_residual_drc_codes(task, task_spec)
     drc_required = bool(re.search(r"\bDRC\b|违例", task_spec, re.I))
-    if drc_required and violation_total and int(violation_total.group(1)) > 0:
-        found_codes = {re.sub(r"[-_ ]", "", c).upper()
-                       for c in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", diagnostic_text, re.I)}
-        blocking_codes = found_codes - allowed_codes
-        if not found_codes or blocking_codes:
-            problems.append("DRC report has nonzero violations" +
-                            (f" (unallowed codes: {', '.join(sorted(blocking_codes))})" if blocking_codes else " whose codes could not be verified"))
+    summaries = [summary for path in [log_path, *diagnostic_files] if path.is_file()
+                 for summary in drc_summaries(path)]
+    if qa_residual_codes(task, task_spec):
+        exclusions = excluded_scan_cells([path for path in [log_path, *diagnostic_files] if path.is_file()])
+        if exclusions:
+            problems.append("Scan FFs were excluded instead of retaining the permitted DFTR10: " + exclusions[0])
+    if drc_required:
+        if not summaries:
+            problems.append("No actual DRC summary was produced")
+        for summary in summaries:
+            if not summary_permitted(summary, allowed_codes):
+                blocking_codes = set(summary["counts"]) - allowed_codes
+                problems.append("DRC report has nonzero violations" +
+                                (f" (unallowed codes: {', '.join(sorted(blocking_codes))})" if blocking_codes else
+                                 " whose complete rule counts could not be verified"))
     actual_files = [p for p in run_dir.rglob("*") if p.is_file() and p.suffix.lower() not in {".dofile", ".log"} and not _is_inside(p, run_dir / "input")]
     if not any(p.suffix.lower() in {".v", ".vg"} for p in actual_files):
         problems.append("No actual Verilog deliverable was produced")
@@ -1406,6 +1431,50 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
     if not previous_run or not change_id:
         return
     files = run_evidence_files(output_dir / "runs" / previous_run)
+
+    def command_failure_evidence(excerpt: str, command: str, located: str) -> dict[str, str] | None:
+        """Locate a generic failure only in the concrete command's actual log block."""
+        expected = literal_tcl_words(located.strip())
+        if not expected or expected[0] != command:
+            return None
+
+        def matches(words: list[str]) -> bool:
+            if not words or words[0] != command:
+                return False
+            actual = [word.strip('"{}') for word in words[1:]]
+            requested = [word.strip('"{}') for word in expected[1:]]
+            index = 0
+            while index < len(requested):
+                word = requested[index]
+                if word.startswith("-") and index + 1 < len(requested) and not requested[index + 1].startswith("-"):
+                    if not any(actual[n:n + 2] == requested[index:index + 2] for n in range(len(actual) - 1)):
+                        return False
+                    index += 2
+                else:
+                    if word not in actual:
+                        return False
+                    index += 1
+            return True
+
+        candidates = []
+        for path in files:
+            if path.suffix != ".log":
+                continue
+            active_command: list[str] = []
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                for number, line in enumerate(stream, 1):
+                    echo = re.search(r"\bCMD-0034\]\s+@\d+:\s*(.*)", line)
+                    if echo:
+                        active_command = literal_tcl_words(echo.group(1))
+                        continue
+                    if excerpt in line and re.search(r"\[(?:ERROR|FATAL)\]", line) and matches(active_command):
+                        candidates.append((path, number, tuple(active_command)))
+        # A command-only diagnosis must not choose among distinct failed objects.
+        if not candidates or (len(expected) == 1 and len({words for _, _, words in candidates}) != 1):
+            return None
+        path, number, _ = candidates[0]
+        return {"source": path.relative_to(output_dir).as_posix(), "locator": f"L{number}", "excerpt": excerpt}
+
     for item in meta.get("issue_resolutions", []):
         if not isinstance(item, dict):
             continue
@@ -1416,6 +1485,11 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         located = str(item.get("located_object", ""))
         diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
         fix_text = str(item.get("fix", ""))
+        if "ScanConfigurationParameter" in cited:
+            parameters = set(re.findall(r"(?m)^\s*([a-z_]+)\s+\S+\s*$", cited))
+            relevant = located + " " + diagnostic
+            if "set_scan_cfg" not in relevant and not any(re.search(r"\b" + re.escape(name) + r"\b", relevant) for name in parameters):
+                continue
         if (not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and
                 re.search(r"already corrected|already correct|no further change|already.*fixed|无需进一步|已经修复", fix_text, re.I)):
             continue
@@ -1431,13 +1505,15 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
             actual = failed_command.group(1) or failed_command.group(2)
             if actual not in commands and actual not in fix_text:
                 continue
-        artifact_names = re.findall(r"[\w.-]+\.(?:rpt|report|txt|ctl|def)\b", located)
+        artifact_names = re.findall(r"[\w.-]+\.(?:rpt|report|txt|ctl|def)\b", located + " " + diagnostic)
         if (artifact_names and re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and
                 re.search(r"\bempty\b|\bmissing\b|\bno\b.{0,60}(?:written|produced)|未生成|为空|缺失", diagnostic, re.I) and
                 not any(name in cited for name in artifact_names)):
             # A configuration table does not discover a missing output file.
             continue
-        evidence = locate_evidence(files, output_dir, cited)
+        generic_failure = re.search(r"Command '([a-z_]+)' execution failed", cited)
+        evidence = (command_failure_evidence(cited, generic_failure.group(1), located) if generic_failure
+                    else locate_evidence(files, output_dir, cited))
         if not evidence:
             continue
         diagnosis = {"summary": str(item.get("diagnosis", "")),
@@ -1445,9 +1521,7 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                      "root_cause": str(item.get("root_cause", "")),
                      "violated_requirement": str(item.get("violated_requirement", ""))}
         existing = next((issue for issue in issues
-                         if (issue["found"]["source"] == evidence["source"] and
-                             issue["found"]["excerpt"] == cited) or
-                         (diagnosis["located_object"] and diagnosis["root_cause"] and
+                         if (diagnosis["located_object"] and diagnosis["root_cause"] and
                           issue["diagnosis"]["located_object"] == diagnosis["located_object"] and
                           issue["diagnosis"]["root_cause"] == diagnosis["root_cause"])), None)
         if existing is None:
@@ -1520,6 +1594,14 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
             port, kind = options.get("port", ""), options.get("type", "")
             association = options.get("associated_internal_clocks", "")
             targeted = bool(re.search(r"(?<![\w$])" + re.escape(port) + r"(?![\w$])", subject))
+            if not targeted and "set_scan_signal" in subject and "-type " + kind in subject:
+                candidates = set()
+                for line in logical_lines:
+                    if re.match(r"\s*set_scan_signal\b", line) and re.search(r"-type\s+" + re.escape(kind) + r"\b", line):
+                        candidate = re.search(r"-port\s+([A-Za-z_][\w$]*)\b", line)
+                        if candidate:
+                            candidates.add(candidate.group(1))
+                targeted = candidates == {port}
             if association and "associated_internal_clocks" in subject and association in subject:
                 targeted = True
             if not port or not kind or not targeted:
@@ -1575,7 +1657,8 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
 
 
 def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
-                           files: list[Path], output_dir: Path) -> dict[str, str] | None:
+                           files: list[Path], output_dir: Path,
+                           permitted_drc: set[str] | None = None) -> dict[str, str] | None:
     """Accept conservative, issue-specific positive evidence from a real rerun."""
     found = issue["found"]["excerpt"]
     diagnosis = issue["diagnosis"]
@@ -1658,8 +1741,16 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
                                 "locator": f"L{number}", "excerpt": line.strip()}
     # A zero DRC summary proves a DRC condition only; it says nothing about configuration.
     if re.search(r"\bDFTR[-_ ]?(?:\d+|TIE[01]|L[12])\b|Total violations:\s*[1-9]\d*", found, re.I):
-        drc_files = [p for p in files if "drc" in p.name.lower() or "violation" in p.name.lower()]
-        return locate_evidence(drc_files, output_dir, "Total violations: 0", positive=True)
+        fix = issue.get("attempts", [{}])[-1].get("fix", {}).get("action", "")
+        subject = diagnosis.get("located_object", "") + " " + fix
+        rule_configuration = ("set_scan_drc_rule_handling" in subject or
+                              "RuleType" in found and "SpecifiedLevel" in found or
+                              re.search(r"(?m)^\s*DFTR[-\w]+\s+(?:Error|Warning|Info|Ignore)\s+"
+                                        r"(?:Error|Warning|Info|Ignore)\s+all\s*$", found))
+        if rule_configuration:
+            # An allowed Ignore setting needs the actual rule-handling row, not a zero DRC total.
+            return None
+        return residual_positive_evidence(files, output_dir, permitted_drc or set(), rule_codes(found))
     expected = str(plan.get("expected_excerpt", "")).strip()
     source = str(plan.get("source", "")).strip().replace("\\", "/")
     if len(expected) < 8 or "\n" in expected or not source or expected == found:
@@ -1686,7 +1777,8 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
 
 
 def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[str, dict[str, Any]],
-                       output_dir: Path, current_run: str, tool_checks_passed: bool) -> None:
+                       output_dir: Path, current_run: str, tool_checks_passed: bool,
+                       permitted_drc: set[str] | None = None) -> None:
     if not tool_checks_passed:
         return
     files = run_evidence_files(output_dir / "runs" / current_run)
@@ -1698,7 +1790,8 @@ def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[st
         verify = attempts[-1]["verify"]
         if verify["resolved"]:
             continue
-        evidence = positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir)
+        evidence = positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir,
+                                          permitted_drc)
         if not evidence:
             evidence = configuration_evidence(issue, files, output_dir, dofile)
         if evidence:
@@ -1763,8 +1856,6 @@ def main() -> int:
         # 150-second budget. Large netlists retain the longer copy/audit reserve.
         finalize_reserve = 30 if sum(path.stat().st_size for path in netlists) > 64 * 1024 * 1024 else 8
         max_calls = parse_tool_limit(limits)
-        # Contest tool-call ceiling always includes a strict local cap.
-        max_calls = min(max_calls, int(os.environ.get("AGENT_MAX_TOOL_CALLS", str(max_calls))))
         client: OpenAI | None = None
         original = read_text(original_path, 50000) if original_path else None
         previous = original or ""
@@ -1778,7 +1869,9 @@ def main() -> int:
                     re.search(r"伪|pseudo", task_spec, re.I) and re.search(r"时钟|clock", task_spec, re.I) else {})
         expected_segments = (shift_register_groups(netlists, libraries=libs) if
                              re.search(r"所有.{0,20}移位寄存器|all.{0,20}shift.{0,20}register", task_spec, re.I) else [])
-        for index in range(1, max_calls + 1):
+        for index in itertools.count(1):
+            if max_calls is not None and index > max_calls:
+                break
             remaining = timeout_total - (time.monotonic() - start)
             if remaining <= finalize_reserve + 1:
                 break
@@ -1911,7 +2004,7 @@ def main() -> int:
             per_run_timeout = max(1, int(remaining - finalize_reserve))
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path,
                               abort_on_error=not (task == "task2" and index == 1),
-                              allowed_drc=allowed_drc_codes(task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
+                              allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
             record = {k: v for k, v in result.items() if k != "log_path"}
             record["log_file"] = str((run_dir / f"{rid}.log").relative_to(output_dir)).replace("\\", "/")
             record["exit_status"] = result["status"]
@@ -1942,7 +2035,8 @@ def main() -> int:
                                                     "config_ref": {"source": "final_results/deliverables/final.dofile", "locator": ""}})
             record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id,
                                netlist_change_ids)
-            verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok)
+            verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok,
+                               permitted_residual_drc_codes(task, task_spec))
             validation_problems = problems + issue_audit_problems(task, issue_records, changes)
             if integrity_problems:
                 break
@@ -1951,8 +2045,6 @@ def main() -> int:
                              for issue in issue_records)
             if ok and not unresolved and not issue_audit_problems(task, issue_records, changes):
                 break
-            if index < max_calls:
-                continue
         if not run_records:
             raise RuntimeError("No ScanInsertion tool call was made within the time budget")
         final_run_dir = runs_root / run_records[-1]["run_id"]
@@ -1980,6 +2072,9 @@ def main() -> int:
             mapping.setdefault("config_ref", {})["locator"] = config_reference(final_dofile, config)
         decision = {
             "case_id": case_id_for(input_dir),
+            "organizer_clarifications": {"source": QA_URL, "read_date": QA_READ_DATE,
+                                        "tool_call_limit": max_calls,
+                                        "permitted_residual_rules": sorted(qa_residual_codes(task, task_spec))},
             "task": task,
             "final_run": run_records[-1]["run_id"],
             "summary": f"Tool calls: {len(run_records)}; wall time: {time.monotonic() - start:.1f}s. Verified artifact checks: {'passed' if tool_checks_passed else 'incomplete'}; issue audit: {'complete' if audit_complete else 'incomplete'}. " + ("; ".join(final_problems + audit_problems) if final_problems or audit_problems else "") + (f"; {generation_error}" if generation_error else ""),

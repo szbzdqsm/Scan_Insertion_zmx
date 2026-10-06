@@ -1,6 +1,6 @@
 # Scan Insertion Agent
 
-开发源码位于 [agent/](agent/README.md)，正式 Word 和宣讲 PPT 也保存在该目录。[要求核对](agent/CONTEST_REQUIREMENTS.md)记录已实现内容和待办；当前仍是开发版本。
+开发源码位于 [agent/](agent/README.md)，正式 Word 和宣讲 PPT 也保存在该目录。[要求核对](agent/CONTEST_REQUIREMENTS.md)和[主办方 Q&A 核对](agent/CONTEST_QA.md)记录规则与待办；当前仍是开发版本。
 
 ## VS Code + WSL 开发
 
@@ -44,7 +44,7 @@ docker build -t scan-agent-dev:local -f agent/Dockerfile agent
 
 ## 真实模型验证
 
-本地百炼 Key 已验证可调用 `deepseek-v4-pro`。真实模型的完整 Public 基线已跑完；最新已完成的小用例批次通过当前检查 4/9，失败问题仍在修复。实际结果与未完成能力见 [LIVE_VALIDATION.md](LIVE_VALIDATION.md)，不能把早期 Golden 回放结果当作 Agent 自主通过。
+本地百炼 Key 已验证可调用 `deepseek-v4-pro`。真实模型的完整 Public 基线已跑完，修正版持续重跑。每个版本的实际结果与未完成能力见 [LIVE_VALIDATION.md](LIVE_VALIDATION.md)，不同版本的结果不可合并成全批成绩。
 
 ```bash
 .venv/bin/python scripts/check_model.py
