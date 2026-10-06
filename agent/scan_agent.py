@@ -1592,10 +1592,10 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
             if actual not in commands and actual not in fix_text:
                 continue
         artifact_names = re.findall(r"[\w.-]+\.(?:rpt|report|txt|ctl|def)\b", located + " " + diagnostic)
-        if (artifact_names and re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and
+        if (artifact_names and not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and
                 re.search(r"\bempty\b|\bmissing\b|\bno\b.{0,60}(?:written|produced)|未生成|为空|缺失", diagnostic, re.I) and
                 not any(name in cited for name in artifact_names)):
-            # A configuration table does not discover a missing output file.
+            # An unrelated report row does not discover a missing output file.
             continue
         generic_failure = re.search(r"Command '([a-z_]+)' execution failed", cited)
         evidence = (command_failure_evidence(cited, generic_failure.group(1), located) if generic_failure

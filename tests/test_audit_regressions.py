@@ -76,6 +76,13 @@ class AuditRegression(unittest.TestCase):
         item = dict(self.item, evidence_excerpt=text, located_object="reports/drc.rpt", diagnosis="No drc.rpt is written", root_cause="missing report")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_unrelated_wrapper_row_cannot_discover_a_missing_file(self):
+        text = "120 key_data[0] (I) dedicated User Specified user_defined Default_Partition"
+        (self.out / "runs/R1/reports/wrapper_implementation.rpt").write_text(text + "\n")
+        item = dict(self.item, evidence_excerpt=text, located_object="examine_scan_drc command",
+                    diagnosis="No drc.rpt file was written to the reports directory.", root_cause="Missing -file argument")
+        self.assertEqual(self.record(item)[0], [])
+
     def test_configuration_table_does_not_prove_redundant_commands(self):
         text = "WrapperConfigurationParameter Value\nmax_length 100"
         (self.out / "runs/R1/reports/wrapper_cfg.rpt").write_text(text + "\n")
