@@ -149,6 +149,17 @@ class DRCSummaries(unittest.TestCase):
         scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
         self.assertEqual(issues, [])
 
+    def test_runtime_wrapper_length_already_matches_the_proposed_fix(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "WrapperConfigurationParameter Value\nenable Y\nmax_length 100"
+        (old / "wrapper_cfg.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "set_wrapper_cfg enable", "diagnosis": "Wrapper max_length defaults to unlimited",
+                "root_cause": "Missing -max_length 100", "fix": "Add -max_length 100 to set_wrapper_cfg enable"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
     def write_report(self, total=21, counts=None, extra=""):
         counts = {"DFTR10": 21} if counts is None else counts
         self.path.write_text("DRC Report\nTotal violations: " + str(total) + "\n" + extra + "\n" +

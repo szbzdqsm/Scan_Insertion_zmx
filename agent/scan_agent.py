@@ -1567,13 +1567,14 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                 re.search(r"off_state|usage|incomplete.{0,30}(?:declaration|command)|缺少.{0,20}参数", diagnostic, re.I) and
                 not re.search(r"OffState|Usage", cited)):
             continue
-        if "ScanConfigurationParameter" in cited:
+        if re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited):
+            config_command = "set_wrapper_cfg" if "WrapperConfigurationParameter" in cited else "set_scan_cfg"
             if re.search(r"\b(?:set_scan_element|get_obj_insts|get_cells)\b", located):
                 # A configuration table does not discover a failed object query or exclusion.
                 continue
             parameters = set(re.findall(r"(?m)^\s*([a-z_]+)\s+\S+\s*$", cited))
             relevant = located + " " + diagnostic
-            if "set_scan_cfg" not in relevant and not any(re.search(r"\b" + re.escape(name) + r"\b", relevant) for name in parameters):
+            if config_command not in relevant and not any(re.search(r"\b" + re.escape(name) + r"\b", relevant) for name in parameters):
                 continue
             current_values = dict(re.findall(r"(?m)^\s*([a-z_]+)\s+(\S+)\s*$", cited))
             requested_values = [(name, value.strip('"{}')) for name, value in
@@ -1583,7 +1584,7 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                 # Already effective values do not prove an absent explicit declaration is a defect.
                 continue
         if (not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and
-                re.search(r"already corrected|already correct|no further change|already.*fixed|无需进一步|已经修复", fix_text, re.I)):
+                re.search(r"already corrected|already correct|^no (?:further )?changes? (?:needed|required)|no further change|already.*fixed|无需进一步|已经修复", fix_text, re.I)):
             continue
         if re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and re.search(r"redundan|duplicate configuration|冗余", diagnostic, re.I):
             continue
