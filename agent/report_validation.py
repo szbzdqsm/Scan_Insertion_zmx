@@ -69,6 +69,10 @@ def scan_formats(spec: str) -> tuple[str, str] | None:
 def chain_problems(rows: list[dict[str, Any]], spec: str) -> list[str]:
     problems = []
     internal = [row for row in rows if not row["Chain"].startswith("W")]
+    if re.search(r"不得跨时钟域|不允许.{0,20}混合.{0,20}时钟域|不允许.{0,20}混合不同时钟", spec):
+        mixed = next((row for row in internal if len(set(re.split(r",\s*", row.get("Clocks", "")))) > 1), None)
+        if mixed:
+            problems.append(f"Chain {mixed['Chain']} mixes clock domains {mixed['Clocks']} contrary to the task")
     formats = scan_formats(spec)
     if formats:
         if not internal:
@@ -97,6 +101,19 @@ def chain_problems(rows: list[dict[str, Any]], spec: str) -> list[str]:
         if clock and actual and any(row.get("Clocks") != clock for row in actual):
             problems.append(f"Partition {name} does not preserve its requested clock domain {clock}")
     return problems
+
+
+def pseudo_clock_problems(paths: list[Path], expected: list[str]) -> list[str]:
+    if not expected:
+        return []
+    actual = set()
+    for path in paths:
+        if "signal" in path.name.lower():
+            for row in report_rows(path, {"Port", "PortProperty", "SignalType", "OffState"}):
+                if row["PortProperty"] == "pseudo" and row["SignalType"] == "clock":
+                    actual.add(row["Port"].lstrip("/"))
+    missing = sorted(set(expected) - actual)
+    return ["Actual signal reports do not prove these independent pseudo clocks: " + ", ".join(missing[:12])] if missing else []
 
 
 def ctl_overlength_exceptions(rows: list[dict[str, Any]], paths: list[Path], spec: str,

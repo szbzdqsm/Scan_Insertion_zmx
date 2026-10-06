@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, segment_problems  # noqa: E402
+from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems  # noqa: E402
 
 
 def table(headers, rows, width=28):
@@ -51,6 +51,20 @@ class ReportValidation(unittest.TestCase):
         self.assertIn("does not match", chain_problems(rows, spec)[0])
         rows[0]["Input"] = "scan_si_1"
         self.assertEqual(chain_problems(rows, spec), [])
+
+    def test_independent_pseudo_clocks_need_actual_signal_rows(self):
+        report = self.root / "scan_signal.rpt"
+        report.write_text(table(["Port", "PortProperty", "SignalType", "OffState"],
+                                [["gate/clk_out", "pseudo", "constant", "0"]]))
+        self.assertTrue(pseudo_clock_problems([report], ["gate/clk_out"]))
+        report.write_text(table(["Port", "PortProperty", "SignalType", "OffState"],
+                                [["gate/clk_out", "pseudo", "clock", "0"]]))
+        self.assertEqual(pseudo_clock_problems([report], ["gate/clk_out"]), [])
+
+    def test_unallowed_clock_domain_mixing_is_rejected(self):
+        rows = chain_rows([self.report([["I 1", "10", "si1", "so1", "se", "clk_a, clk_b", "P"]])])
+        self.assertTrue(chain_problems(rows, "不得跨时钟域"))
+        self.assertEqual(chain_problems(rows, "允许混合时钟域"), [])
 
     def test_partitions_have_individual_length_enable_and_clock_limits(self):
         spec = "| 分区 | chain_count | max_length | scan_enable | 划分（-clocks） |\n|---|---|---|---|---|\n| P | 1 | 10 | se | clk |\n| Q | 1 | 300 | se_q | clk_q |\n"

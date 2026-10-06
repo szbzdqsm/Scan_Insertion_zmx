@@ -19,9 +19,10 @@ from typing import Any
 
 from openai import OpenAI
 from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerprint_paths, prepare_repair
-from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups
-from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, segment_problems
-from dofile_recipe import configure_shift_segments, normalize_unrequested_counts
+from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups, source_instance_map
+from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
+from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
+from floating_inputs import floating_clock_outputs
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -273,6 +274,12 @@ def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
         if re.match(r"\s*set_wrapper_cfg\b", line) and re.search(r"-style\s+none\b", line):
             if not re.search(r"\s-port\s+(?!\{\s*\}|\"\")(?:\S)", line):
                 problems.append("set_wrapper_cfg -style none requires actual -port objects; use set_wrapper_cfg disable for global disable")
+        rules_command = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|\S+)\s+(Error|Warning|Info|Ignore)\b", line)
+        if rules_command:
+            invalid = [rule for rule in rules_command.group(1).strip("{}").split()
+                       if not re.fullmatch(r"DFTR(?:[1-9]|1[0-7]|-(?:TIE[01]|L[12]))", rule)]
+            if invalid:
+                problems.append("Invalid DRC IDs; spell each actual rule individually, without ranges: " + ", ".join(invalid))
         level = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|DFTR[\w-]+)\s+(Info|Ignore)\b", line)
         if level:
             rules = re.findall(r"DFTR\d+\b", level.group(1))
@@ -296,7 +303,7 @@ def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
         if signal_type and port:
             key, kind = (design, port.group(1)), signal_type.group(1)
             previous_type = declared_signals.get(key)
-            if previous_type and (previous_type != kind or kind == "clock"):
+            if previous_type and (previous_type != kind or kind in {"clock", "reset", "wrapper_clock", "wrp_in_shift_en", "wrp_out_shift_en", "wrp_in_capture_en", "wrp_out_capture_en"}):
                 problems.append(f"Port {port.group(1)} has conflicting or duplicate declarations ({previous_type}, {kind}); combine clock options and use separate wrapper control ports")
             declared_signals[key] = kind
         if signal_type and signal_type.group(1) != "scan_enable" and re.search(r"\s-usage\s", line):
@@ -509,12 +516,12 @@ def append_audit_reports(dofile: str, run_dir: Path) -> str:
     if not cache.is_file():
         return dofile
     known = json.loads(cache.read_text())
-    commands = [name for name in ("rpt_scan_signal", "rpt_scan_cfg", "rpt_scan_drc_rule_handling", "rpt_wrapper_cfg")
+    commands = [name for name in ("rpt_scan_signal", "rpt_scan_cfg", "rpt_scan_drc_rule_handling", "rpt_wrapper_cfg", "rpt_pseudo_pi")
                 if name in known]
     # Incremental repairs inherit the preceding script. Replace our own report
     # block so each round records its current state once, in its own directory.
     dofile = re.sub(r"(?m)^\n?# Agent audit reports from actual tool state\n"
-                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling)|wrapper_cfg) > [^\n]+\.audit\.rpt\"?\n)+"
+                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling)|wrapper_cfg|pseudo_pi) > [^\n]+\.audit\.rpt\"?\n)+"
                     r"(?:# End agent audit reports\n)?", "", dofile)
     extra = "\n# Agent audit reports from actual tool state\n" + "\n".join(
         f'{name} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name in commands) + "\n# End agent audit reports\n"
@@ -647,6 +654,38 @@ def normalize_reset_levels(dofile: str, hints: dict[str, Any], configuration: st
     return "\n".join(result) + "\n"
 
 
+def normalize_associated_pin_paths(dofile: str, instances: dict[str, Any], configuration: str | None = None) -> str:
+    """Correct a nonexistent prefix only when the exact pin exists directly at top."""
+    designs = re.findall(r"(?m)^\s*present_design\s+([\w$]+)\s*$", configuration or "")
+    current = designs[0] if len(set(designs)) == 1 else ""
+    result = []
+    for line in dofile.splitlines():
+        present = re.match(r"\s*present_design\s+([\w$]+)\s*$", line)
+        if present:
+            current = present.group(1)
+        words = literal_tcl_words(line.strip())
+        if words and words[0] == "set_scan_signal" and "-associated_internal_clocks" in words:
+            index = words.index("-associated_internal_clocks")
+            if index + 1 < len(words):
+                path = words[index+1].strip('"{}').lstrip("/").removeprefix(current + "/")
+                pieces = path.split("/")
+                if len(pieces) >= 2 and "$" not in path and not re.search(r"\s", path):
+                    module = current
+                    target = None
+                    for name in pieces[:-1]:
+                        target = instances.get(module, {}).get(name)
+                        if not target:
+                            break
+                        module = target["type"]
+                    valid = target and pieces[-1] in target["pins"]
+                    direct = instances.get(current, {}).get(pieces[-2])
+                    if not valid and direct and pieces[-1] in direct["pins"]:
+                        words[index+1] = "{" + pieces[-2] + "/" + pieces[-1] + "}"
+                        line = line[:len(line)-len(line.lstrip())] + " ".join(words)
+        result.append(line)
+    return "\n".join(result) + "\n"
+
+
 def apply_dofile_edits(base: str, edits: Any) -> str:
     """Validate unique, disjoint spans against the same original round, then apply."""
     if not isinstance(edits, list) or not 0 <= len(edits) <= 12:
@@ -720,6 +759,22 @@ def config_reference(dofile: str, configuration: str) -> str:
     return f"L{first}" if first == last else f"L{first}-L{last}"
 
 
+def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
+    """Remove trailing prose only when the remaining complete Tcl already exists."""
+    if config_reference(dofile, configuration):
+        return configuration
+    candidate = re.sub(r"\s+[（(][^()（）]*[）)]\s*$", "", configuration)
+    words = literal_tcl_words(candidate)
+    if not words or words[0] not in {"set_scan_cfg", "set_scan_signal", "set_wrapper_cfg", "set_scan_drc_cfg", "set_dft_clock_gating_cfg"}:
+        return configuration
+    options = words[1:]
+    if words[0] == "set_wrapper_cfg" and options and options[0] in {"enable", "disable"}:
+        options = options[1:]
+    if len(options) % 2 or any(not re.fullmatch(r"-[a-z_]+", value) for value in options[::2]):
+        return configuration
+    return candidate if config_reference(dofile, candidate) else configuration
+
+
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "") -> str:
     lib_names = [str(p) for p in libs]
     lib_summary = [liberty_summary(p) for p in libs]
@@ -765,7 +820,9 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     previous_mapping: list[dict[str, Any]] | None = None,
                     catalog: dict[str, dict[str, str]] | None = None,
                     segments: list[dict[str, Any]] | None = None,
-                    control_hints: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+                    control_hints: dict[str, Any] | None = None,
+                    instances: dict[str, Any] | None = None,
+                    floating: dict[str, list[str]] | None = None) -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
@@ -777,6 +834,8 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
         (run_dir / "llm_evidence_catalog.json").write_text(json.dumps(catalog, ensure_ascii=False, indent=2))
     if control_hints:
         context += "\n# Reset inactive levels traced from actual Liberty clear/preset functions and input connections\n" + json.dumps(control_hints, ensure_ascii=False)
+    if floating:
+        context += "\n# Clock outputs of gates whose input clocks are literally disconnected in original source\n" + json.dumps(floating, ensure_ascii=False)
     spec = read_text(input_dir / "task_spec.md", 60000)
     netlist_rule = (("Task 1 strictly forbids modifying Pre-scan input netlists. Return no netlist_edits."
                      if task == "task1" else "This case strictly forbids modifying Pre-scan input netlists. Return no netlist_edits.")
@@ -801,6 +860,12 @@ The actual read-only input directory is {input_dir}. The current run directory a
                    "commands and focus on clock, scan, wrapper and output settings. Keep ordinary top-level "
                    "examine_scan_drc/examine_scan_chain before insertion, as the recipe is inserted before them. "
                    "Any segment commands you do provide must be separate statements or pure segment loops.")
+    if floating:
+        system += ("\nThe runtime declares the listed clock output pins of gates with disconnected inputs as pseudo primary inputs "
+                   "and independent scan clocks before DRC. Omit your own pseudo-input discovery queries and clock "
+                   "declarations for these pins; configure the normal top-level clocks and remaining DFT settings. "
+                   "A clock-gating enable latch Q is an enable signal, not a clock waveform. For a buffer ANDing "
+                   "the source clock with stored enable, its final clock output carries the clock, not that latch Q.")
     if base_dofile is not None:
         system += ("\nFor this repair, prefer dofile_edits: an array of at most 12 objects with old and new literal "
                    "Tcl spans copied exactly from the CURRENT Dofile. Each old span must occur once; provide enough "
@@ -840,7 +905,9 @@ The actual read-only input directory is {input_dir}. The current run directory a
             adapted = normalize_wrapper_roots(normalize_scan_port_formats(
                 normalize_load_file_lists(normalize_report_redirection(dofile))))
             adapted = normalize_reset_levels(adapted, control_hints or {})
+            adapted = normalize_associated_pin_paths(adapted, instances or {})
             adapted, segment_references = configure_shift_segments(adapted, segments or [], spec)
+            adapted, floating_references = configure_floating_inputs(adapted, floating or {})
             if adapted.strip() != dofile.strip():
                 (run_dir / "llm_normalization.json").write_text(json.dumps({
                     "kind": "documented_api_and_input_derived_recipes", "original_dofile": dofile,
@@ -864,11 +931,25 @@ The actual read-only input directory is {input_dir}. The current run directory a
                 result["requirement_mapping"] = mappings
                 (run_dir / "llm_shift_register_recipe.json").write_text(json.dumps({"input_groups": segments,
                     "actual_commands": segment_references}, ensure_ascii=False, indent=2))
+            if floating_references:
+                mappings = result.get("requirement_mapping", [])
+                if not isinstance(mappings, list) or (task == "task1" and not mappings):
+                    raise ValueError("Model-provided key requirement mappings are still required")
+                requirement = "Literal disconnected gating-clock inputs become independent pseudo primary clocks"
+                mappings = [item for item in mappings if not isinstance(item, dict) or item.get("requirement") != requirement]
+                for item in mappings:
+                    if isinstance(item, dict) and "add_pseudo_pi" in str(item.get("dft_config", "")):
+                        item["dft_config"] = "; ".join(floating_references)
+                mappings.append({"requirement": requirement, "dft_config": "; ".join(floating_references)})
+                result["requirement_mapping"] = mappings
+                (run_dir / "llm_floating_clock_recipe.json").write_text(json.dumps({"input_pins": floating,
+                    "actual_commands": floating_references}, ensure_ascii=False, indent=2))
             for item in result.get("requirement_mapping", []):
                 if isinstance(item, dict) and isinstance(item.get("dft_config"), str):
                     clauses = re.split(r";\s*(?=[A-Za-z_]+\b)", item["dft_config"])
                     item["dft_config"] = "; ".join(normalize_wrapper_roots(
-                        normalize_reset_levels(normalize_scan_port_formats(normalize_load_file_lists(clause)), control_hints or {}, dofile), dofile).strip() for clause in clauses)
+                        normalize_associated_pin_paths(normalize_reset_levels(normalize_scan_port_formats(normalize_load_file_lists(normalize_report_redirection(clause))), control_hints or {}, dofile), instances or {}, dofile), dofile).strip() for clause in clauses)
+                    item["dft_config"] = normalize_mapping_annotation(dofile, item["dft_config"])
             problems = unsupported_options(dofile, spec)
             if task == "task1":
                 mappings = result.get("requirement_mapping")
@@ -949,7 +1030,7 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
 
 
 def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path: Path | None = None,
-             abort_on_error: bool = True) -> dict[str, Any]:
+             abort_on_error: bool = True, allowed_drc: set[str] | None = None) -> dict[str, Any]:
     delivery = run_dir / "deliverables"
     reports = run_dir / "reports"
     delivery.mkdir(parents=True, exist_ok=True)
@@ -969,11 +1050,25 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
                                 start_new_session=True)
         error = None
         suffix = ""
+        drc_count = 0
+        observed_rules: set[str] = set()
         with log_path.open(encoding="utf-8", errors="replace") as monitor:
             while proc.poll() is None:
                 chunk = monitor.read(262144)
+                window = suffix + chunk
+                for line in window.splitlines():
+                    if "CMD-0034" in line:
+                        continue
+                    if re.search(r"\[(?:WARNING|INFO)\].*\[\s*DFTDRC-", line):
+                        observed_rules.update(re.sub(r"[-_ ]", "", rule).upper()
+                                              for rule in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", line))
+                    summary = re.fullmatch(r"\s*Total violations:\s*(\d+)\s*", line)
+                    if summary:
+                        drc_count = int(summary.group(1))
                 if abort_on_error and re.search(r"\[(?:ERROR|FATAL)\]", suffix + chunk):
                     error = "early_tool_error"
+                elif abort_on_error and allowed_drc is not None and drc_count > 0 and observed_rules - allowed_drc:
+                    error = "unallowed_drc"
                 elif time.monotonic() - started >= max(1, timeout):
                     error = "timeout"
                 if error:
@@ -983,6 +1078,8 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
                         pass
                     proc.wait()
                     log.write("\n[agent] tool timeout\n" if error == "timeout" else
+                              "\n[agent] generated script stopped after actual unallowed DRC; remaining commands were not executed\n"
+                              if error == "unallowed_drc" else
                               "\n[agent] generated script stopped after actual ERROR; remaining commands were not executed\n")
                     break
                 suffix = (suffix + chunk)[-100:]
@@ -998,7 +1095,8 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
 
 
 def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: str,
-                 expected_segments: list[dict[str, Any]] | None = None) -> tuple[bool, list[str]]:
+                 expected_segments: list[dict[str, Any]] | None = None,
+                 expected_floating: dict[str, list[str]] | None = None) -> tuple[bool, list[str]]:
     problems: list[str] = []
     log_path = run_dir / f"{run_dir.name}.log"
     log = read_text(log_path, 100000)
@@ -1029,6 +1127,8 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     actual_chains = chain_rows(report_files)
     problems.extend(chain_problems(actual_chains, task_spec))
     problems.extend(segment_problems(report_files, expected_segments or []))
+    top = re.findall(r"(?m)^\s*present_design\s+([\w$]+)\s*$", dofile)
+    problems.extend(pseudo_clock_problems(report_files, (expected_floating or {}).get(top[-1], []) if top else []))
     desired = re.search(r"(?:共\s*)\*{0,2}(\d+)\*{0,2}\s*条\s*(?:扫描)?链", task_spec)
     if desired is None:
         desired = re.search(r"(?:scan\s*chain(?:s)?\s*(?:count|number)?|chain_count)\s*(?:is|=|:|：|为|应为)?\s*(\d+)", task_spec, re.I)
@@ -1200,8 +1300,15 @@ def evidence_catalog(run_dir: Path, output_dir: Path, maximum: int = 24) -> dict
                 category = re.search(r"DFTR[-_]?(?:\d+|TIE[01])|\[(?:ERROR|FATAL)\]|^\s*[IW]\s+\S+\s+\d+", line, re.I)
                 if not category or line in seen or counts.get(category.group(), 0) >= 2:
                     continue
+                key = category.group()
+                if re.search(r"\[(?:ERROR|FATAL)\]", line):
+                    code = re.search(r"\[\s*((?:CMD|COM|SCAN|DFTDRC)-[\w-]+)\s*\]", line)
+                    if code:
+                        key = code.group(1)
+                if counts.get(key, 0) >= 2:
+                    continue
                 seen.add(line)
-                counts[category.group()] = counts.get(category.group(), 0) + 1
+                counts[key] = counts.get(key, 0) + 1
                 catalog[f"E{len(catalog)+1}"] = {
                     "source": path.relative_to(output_dir).as_posix(), "locator": f"L{number}",
                     "excerpt": line.strip()[:600]}
@@ -1300,6 +1407,27 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         cited = str(item.get("evidence_excerpt", item.get("excerpt", ""))).strip()
         if re.fullmatch(r"Total violations:\s*0", cited, re.I):
             # A clean DRC summary cannot discover an unrelated configuration fault.
+            continue
+        located = str(item.get("located_object", ""))
+        diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
+        fix_text = str(item.get("fix", ""))
+        if re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and re.search(r"redundan|duplicate configuration|冗余", diagnostic, re.I):
+            continue
+        if (re.search(r"Chain\s+Length\s+Input", cited) and
+                re.search(r"empty.{0,25}chain|no scan chains|chains were (?:not|never)|no.*stitched", diagnostic, re.I) and
+                re.search(r"(?m)^\s*[IW]\s+\S+\s+\d+\s+", cited)):
+            continue
+        failed_command = re.search(r"Command '([a-z_]+)' execution failed|for command '([a-z_]+)'", cited)
+        commands = set(re.findall(r"\b(?:dump_[a-z_]+|set_[a-z_]+|rpt_[a-z_]+|examine_[a-z_]+|insert_[a-z_]+|present_design)\b", located))
+        if failed_command and commands:
+            actual = failed_command.group(1) or failed_command.group(2)
+            if actual not in commands and actual not in fix_text:
+                continue
+        artifact_names = re.findall(r"[\w.-]+\.(?:rpt|report|txt|ctl|def)\b", located)
+        if (artifact_names and re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and
+                re.search(r"\bempty\b|\bmissing\b|\bno\b.{0,60}(?:written|produced)|未生成|为空|缺失", diagnostic, re.I) and
+                not any(name in cited for name in artifact_names)):
+            # A configuration table does not discover a missing output file.
             continue
         evidence = locate_evidence(files, output_dir, cited)
         if not evidence:
@@ -1405,7 +1533,10 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
         for command in logical_lines:
             if not re.match(r"\s*set_scan_cfg\b", command):
                 continue
-            for parameter, value in re.findall(r"-([a-z_]+)\s+([\w]+)", command):
+            words = literal_tcl_words(command)
+            parameters = [(key.removeprefix("-"), value.strip('"{}')) for key, value in zip(words[1::2], words[2::2])
+                          if re.fullmatch(r"-[a-z_]+", key) and "$" not in value and not value.startswith("[")]
+            for parameter, value in parameters:
                 if not any(parameter.startswith(option) for option in mentioned):
                     continue
                 for path in files:
@@ -1464,7 +1595,9 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
                         # The caller has already checked permitted residual rules.
                         # This evidence proves execution order, not zero violations.
                         summary = (number, line.strip())
-    if re.search(r"Cannot execute command 'examine_scan_chain' after executing 'insert_dft_logic'", found):
+    empty_chain_table = (bool(re.search(r"Chain\s+Length\s+Input", found)) and
+                         not re.search(r"(?m)^\s*[IW]\s+\S+\s+\d+\s+", found))
+    if re.search(r"Cannot execute command 'examine_scan_chain' after executing 'insert_dft_logic'", found) or empty_chain_table:
         # The tool's own final chain examination supplies positive counts, not just silence.
         for path in files:
             if path.suffix != ".log":
@@ -1616,6 +1749,9 @@ def main() -> int:
         validation_problems: list[str] = []
         static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "")
         control_hints = reset_polarity_hints(netlists, libs)
+        instances = source_instance_map(netlists) if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else {}
+        floating = (floating_clock_outputs(netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
+                    re.search(r"伪|pseudo", task_spec, re.I) and re.search(r"时钟|clock", task_spec, re.I) else {})
         expected_segments = (shift_register_groups(netlists, libraries=libs) if
                              re.search(r"所有.{0,20}移位寄存器|all.{0,20}shift.{0,20}register", task_spec, re.I) else [])
         for index in range(1, max_calls + 1):
@@ -1682,7 +1818,7 @@ def main() -> int:
                                                  base_dofile=generation_base if run_records else None,
                                                  previous_mapping=generation_mapping,
                                                  catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir) if run_records else None,
-                                                 segments=expected_segments, control_hints=control_hints)
+                                                 segments=expected_segments, control_hints=control_hints, instances=instances, floating=floating)
                     if meta.get("netlist_edits"):
                         edits = meta["netlist_edits"]
                         if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
@@ -1749,9 +1885,10 @@ def main() -> int:
             if remaining <= finalize_reserve + 1:
                 generation_error = f"Insufficient time after fingerprinting before {rid}"
                 break
-            per_run_timeout = max(1, min(900, int(remaining - finalize_reserve)))
+            per_run_timeout = max(1, int(remaining - finalize_reserve))
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path,
-                              abort_on_error=not (task == "task2" and index == 1))
+                              abort_on_error=not (task == "task2" and index == 1),
+                              allowed_drc=allowed_drc_codes(task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
             record = {k: v for k, v in result.items() if k != "log_path"}
             record["log_file"] = str((run_dir / f"{rid}.log").relative_to(output_dir)).replace("\\", "/")
             record["exit_status"] = result["status"]
@@ -1762,7 +1899,7 @@ def main() -> int:
             last_log = diagnostic_excerpt(run_dir / f"{rid}.log")
             previous = dofile
             final_run_dir = run_dir
-            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments)
+            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating)
             modified = changed_paths(snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
@@ -1808,7 +1945,7 @@ def main() -> int:
         copy_tree_contents(final_run_dir / "reports", reports)
         copy_tree_contents(final_run_dir / "deliverables", deliverables)
         tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile,
-                                                         run_records[-1]["exit_status"], expected_segments)
+                                                         run_records[-1]["exit_status"], expected_segments, floating)
         if integrity_problems:
             tool_checks_passed = False
             final_problems.extend(integrity_problems)

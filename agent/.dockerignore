@@ -8,3 +8,4 @@
 !netlist_structure.py
 !report_validation.py
 !dofile_recipe.py
+!floating_inputs.py

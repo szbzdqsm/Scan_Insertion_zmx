@@ -70,6 +70,24 @@ class AuditRegression(unittest.TestCase):
         (self.out / "runs/R1/reports/drc.rpt").write_text("DRC Report\nTotal violations: 0\n")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_configuration_table_cannot_discover_a_missing_file(self):
+        text = "ScanConfigurationParameter Value\nmax_length 100"
+        (self.out / "runs/R1/reports/scan_cfg.rpt").write_text(text + "\n")
+        item = dict(self.item, evidence_excerpt=text, located_object="reports/drc.rpt", diagnosis="No drc.rpt is written", root_cause="missing report")
+        self.assertEqual(self.record(item)[0], [])
+
+    def test_configuration_table_does_not_prove_redundant_commands(self):
+        text = "WrapperConfigurationParameter Value\nmax_length 100"
+        (self.out / "runs/R1/reports/wrapper_cfg.rpt").write_text(text + "\n")
+        item = dict(self.item, evidence_excerpt=text, located_object="set_wrapper_cfg -max_length 100", diagnosis="Redundant wrapper configuration", root_cause="duplicate configuration")
+        self.assertEqual(self.record(item)[0], [])
+
+    def test_error_in_another_command_is_not_discovery_for_a_dump_command(self):
+        text = "[ERROR] Command 'set_scan_drc_rule_handling' execution failed"
+        (self.out / "runs/R1/R1.log").write_text(text + "\n")
+        item = dict(self.item, evidence_excerpt=text, located_object="dump_scan_def", fix="Replace with dump_def -section scan_chain")
+        self.assertEqual(self.record(item)[0], [])
+
     def test_model_evidence_id_expands_only_actual_prior_excerpt(self):
         catalog = agent.evidence_catalog(self.out / "runs/R1", self.out)
         evidence_id = next(key for key, value in catalog.items() if self.cited in value["excerpt"])
@@ -119,6 +137,18 @@ class AuditRegression(unittest.TestCase):
         (self.out / "runs/R2/reports/scan_chain.rpt").write_text("header\nNumber of chains: 8\n")
         agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
         self.assertEqual(issues[0]["attempts"][0]["verify"]["locator"], "L2")
+
+    def test_scan_port_format_fix_uses_complete_percent_format_value(self):
+        item = dict(self.item, evidence_excerpt="si_port_format test_si%d", located_object="set_scan_cfg -si_port_format",
+                    root_cause="wrong port format", fix="Set -si_port_format scan_si_%d")
+        (self.out / "runs/R1/reports/scan_cfg.rpt").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text('set_scan_cfg -si_port_format "scan_si_%d"\nexit\n')
+        (run / "reports/scan_cfg.rpt").write_text("si_port_format scan_si_%d\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
 
     def test_command_echo_cannot_prove_completion(self):
         item = dict(self.item, evidence_excerpt="ERROR: unknown argument for add_scan_chains",
@@ -274,6 +304,12 @@ class AuditRegression(unittest.TestCase):
             self.assertTrue(agent.unsupported_options('set_scan_drc_rule_handling {DFTR-TIE0} Ignore', "DRC 必须无违例"))
             self.assertEqual(agent.unsupported_options('set_scan_drc_rule_handling {DFTR-TIE0} Ignore', "允许忽略 DFTR-TIE0"), [])
 
+    def test_drc_rule_ranges_and_unknown_ids_are_not_real_rule_names(self):
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options("set_scan_drc_rule_handling {DFTR1-12 DFTR999} Warning"))
+            self.assertEqual(agent.unsupported_options("set_scan_drc_rule_handling {DFTR1 DFTR17 DFTR-TIE0 DFTR-L1} Warning"), [])
+
     def test_chain_order_fix_requires_positive_success_counts(self):
         item = dict(self.item, evidence_excerpt="[ERROR] Cannot execute command 'examine_scan_chain' "
                     "after executing 'insert_dft_logic' command.", located_object="examine_scan_chain",
@@ -390,6 +426,15 @@ class AuditRegression(unittest.TestCase):
         self.assertIn("-off_state 1", agent.normalize_reset_levels(mapping, hints, script))
         self.assertEqual(agent.normalize_reset_levels(script, {}), script)
 
+    def test_wrong_associated_prefix_is_corrected_only_with_actual_direct_pin(self):
+        instances = {"top": {"core": {"type": "child", "pins": ["clk"]}, "latch": {"type": "DL", "pins": ["D", "Q"]}},
+                     "child": {"real_latch": {"type": "DL", "pins": ["D", "Q"]}}}
+        line = "set_scan_signal -type clock -port clk -associated_internal_clocks core/latch/Q\n"
+        fixed = agent.normalize_associated_pin_paths("present_design top\n" + line, instances)
+        self.assertIn("-associated_internal_clocks {latch/Q}", fixed)
+        self.assertIn("core/real_latch/Q", agent.normalize_associated_pin_paths("present_design top\n" + line.replace("core/latch", "core/real_latch"), instances))
+        self.assertEqual(agent.normalize_associated_pin_paths(line, {}), line)
+
     def generate_patch(self, responses, base="set_scan_cfg -chain_count 4\nexit\n", mapping=None):
         run = self.out / "runs/R2"
         (self.root / "task_spec.md").write_text("Configure a scan chain count.")
@@ -483,6 +528,14 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(agent.config_reference(dofile, "set_scan_cfg -max_length 100 -chain_count 4"), "L3-L4")
         self.assertEqual(agent.config_reference(dofile, "set_scan_cfg -max_length 100 (in all partitions)"), "")
 
+    def test_mapping_prose_is_removed_only_after_matching_complete_actual_tcl(self):
+        script = "set_scan_cfg -chain_count 4 -max_length 100\n"
+        self.assertEqual(agent.normalize_mapping_annotation(script, "set_scan_cfg -chain_count 4 (applied to all partitions)"), "set_scan_cfg -chain_count 4")
+        invalid = "set_scan_cfg -chain_count 40 (applied globally)"
+        self.assertEqual(agent.normalize_mapping_annotation(script, invalid), invalid)
+        incomplete = "set_scan_cfg -chain_count ($count)"
+        self.assertEqual(agent.normalize_mapping_annotation(script, incomplete), incomplete)
+
     def test_many_module_names_cannot_overflow_model_context(self):
         path = self.root / "many_modules.v"
         path.write_text("".join(f"module SNPS_CLOCK_GATE_HIGH_{i}();\nendmodule\n" for i in range(12000)) +
@@ -530,6 +583,19 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(result["returncode"], 0)
         self.assertIn("original reached its end", (self.out / "runs/R1/R1.log").read_text())
 
+    def test_generated_unallowed_drc_stops_but_permitted_rule_is_retained(self):
+        wrapper = self.root / "tool_fixture.py"
+        wrapper.write_text(f"#!{sys.executable}\nimport time\n"
+                           "print('[WARNING] [DFTDRC-4001] uncontrolled clock (DFTR1-1)', flush=True)\n"
+                           "print('Total violations: 1', flush=True)\ntime.sleep(0.3)\nprint('reached end', flush=True)\n")
+        wrapper.chmod(0o700)
+        with patch.object(agent, "TOOL", str(wrapper)):
+            bad = agent.tool_run("exit\n", self.out / "runs/R2", "R2", 4, allowed_drc=set())
+            allowed = agent.tool_run("exit\n", self.out / "runs/R1", "R1", 4, allowed_drc={"DFTR1"})
+        self.assertEqual(bad["error"], "unallowed_drc")
+        self.assertEqual(allowed["status"], "completed")
+        self.assertIn("reached end", (self.out / "runs/R1/R1.log").read_text())
+
     def run_main(self, task2=False, diagnosed=False, generation_seconds=17, task_spec="Generate a real post-scan netlist."):
         input_dir = self.root / "work/input/hidden_case_1/input"
         output_dir = self.root / "work/output/hidden_case_1"
@@ -561,7 +627,7 @@ class AuditRegression(unittest.TestCase):
                         return types.SimpleNamespace(choices=[types.SimpleNamespace(
                             message=types.SimpleNamespace(content=json.dumps(response)))])
 
-        def tool(dofile, run_dir, run_id, timeout, execution_path, abort_on_error=True):
+        def tool(dofile, run_dir, run_id, timeout, execution_path, abort_on_error=True, allowed_drc=None):
             captures["calls"].append(timeout)
             delivery = run_dir / "deliverables"
             reports = run_dir / "reports"

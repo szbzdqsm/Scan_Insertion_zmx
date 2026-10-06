@@ -14,7 +14,8 @@ def normalized_net(value: str) -> str:
 
 def shift_register_groups(paths: list[Path], minimum: int = 10,
                           libraries: list[Path] | None = None,
-                          reset_hints: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                          reset_hints: dict[str, Any] | None = None,
+                          instance_map: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Find unbranched Q-to-D chains starting with actual scan FFs within a module."""
     if sum(path.stat().st_size for path in paths) > 64 * 1024 * 1024:
         return []
@@ -61,7 +62,7 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
                 if pending is None:
                     cell = re.match(r"\s*([\w$]+)\s+(\\\S+|[\w$\[\].]+)\s*\(", line)
                     if cell and cell.group(1) != "module" and (not cell.group(1).startswith("sky130_fd_sc_") or
-                            any(marker in cell.group(1) for marker in ("__df", "__sdf", "__buf_", "__clkbuf_", "__inv_", "__clkinv_"))):
+                            any(marker in cell.group(1) for marker in ("__df", "__sdf", "__dl", "__sdl", "__buf_", "__clkbuf_", "__inv_", "__clkinv_"))):
                         pending = (cell.group(1), cell.group(2).removeprefix("\\"), line)
                 else:
                     pending = (pending[0], pending[1], pending[2] + line)
@@ -69,6 +70,8 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
                     kind, instance, text = pending
                     pins = dict((name, normalized_net(net)) for name, net in
                                 re.findall(r"\.([\w$]+)\s*\(\s*([^()]*)\)", text))
+                    if instance_map is not None:
+                        instance_map.setdefault(current, {})[instance] = {"type": kind, "pins": sorted(pins)}
                     if any(marker in kind for marker in ("__buf_", "__clkbuf_")) and "X" in pins and "A" in pins:
                         aliases[current][pins["X"]] = pins["A"]
                     elif any(marker in kind for marker in ("__inv_", "__clkinv_")) and "Y" in pins and "A" in pins:
@@ -218,3 +221,9 @@ def reset_polarity_hints(paths: list[Path], libraries: list[Path]) -> dict[str, 
     hints: dict[str, Any] = {}
     shift_register_groups(paths, libraries=libraries, reset_hints=hints)
     return {root: values for root, values in hints.items() if values}
+
+
+def source_instance_map(paths: list[Path]) -> dict[str, Any]:
+    instances: dict[str, Any] = {}
+    shift_register_groups(paths, instance_map=instances)
+    return instances

@@ -100,6 +100,12 @@ def configure_shift_segments(script: str, groups: list[dict[str, Any]], spec: st
     script = normalize_unrequested_counts(script, spec)
     script = re.sub(r"(?ms)^# Agent recipe from actual input shift-register connections\n.*?^# End agent shift-register recipe\n", "", script)
     recipe, references = shift_segment_recipe(groups, spec)
+    existing_limits = re.findall(r"(?m)^\s*set_wrapper_cfg\b(?![^\n]*\s-port\s)[^\n]*?-max_length\s+(\d+)\b", script)
+    if existing_limits:
+        repeated = "set_wrapper_cfg -max_length " + existing_limits[-1]
+        if repeated in references:
+            recipe = recipe.replace(repeated + "\n", "")
+            references.remove(repeated)
     result = []
     inserted = False
     for chunk in tcl_chunks(script):
@@ -120,3 +126,34 @@ def configure_shift_segments(script: str, groups: list[dict[str, Any]], spec: st
     if not inserted:
         raise ValueError("No safe insertion point for scan segments before scan examination/insertion")
     return "".join(result), references
+
+
+def configure_floating_inputs(script: str, inputs: dict[str, list[str]]) -> tuple[str, list[str]]:
+    tops = re.findall(r"(?m)^\s*present_design\s+([\w$]+)\s*$", script)
+    if len(set(tops)) != 1 or not inputs.get(tops[0]):
+        return script, []
+    pins = inputs[tops[0]]
+    if any(re.search(r"[{}\\]", pin) for pin in pins):
+        raise ValueError("Literal floating-pin recipe cannot safely quote these uncommon identifiers")
+    statement = "add_pseudo_pi [list " + " ".join("{" + pin + "}" for pin in pins) + "]"
+    clocks = ["set_scan_signal -type clock -port {" + pin + "} -off_state 0" for pin in pins]
+    script = re.sub(r"(?ms)^# Agent literal floating-clock inputs\n.*?^# End agent floating-clock inputs\n", "", script)
+    result = []
+    inserted = False
+    for chunk in tcl_chunks(script):
+        stripped = chunk.lstrip()
+        if not stripped.startswith("#") and re.search(r"\badd_pseudo_pi\b", chunk):
+            command = re.match(r"([A-Za-z_]+)\b", stripped)
+            names = set(re.findall(r"(?m)^\s*([a-z_]+)\b", chunk))
+            if (not command or command.group(1) not in {"add_pseudo_pi", "foreach", "foreach_in_collection", "cluster_foreach", "if"} or
+                    names - {"add_pseudo_pi", "foreach", "foreach_in_collection", "cluster_foreach", "if", "set", "lappend", "incr", "continue", "break"}):
+                raise ValueError("Keep pseudo-input configuration separate from other operations; the runtime supplies actual disconnected clock pins")
+            continue
+        if not inserted and re.match(r"(?:examine_scan_drc|examine_scan_chain|insert_dft_logic)\b", stripped):
+            result.extend(["# Agent literal floating-clock inputs\n", statement + "\n",
+                           "\n".join(clocks) + "\n", "# End agent floating-clock inputs\n"])
+            inserted = True
+        result.append(chunk)
+    if not inserted:
+        raise ValueError("No safe point to declare floating clock inputs before DFT analysis")
+    return "".join(result), [statement] + clocks
