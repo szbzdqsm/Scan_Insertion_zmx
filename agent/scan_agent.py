@@ -26,6 +26,9 @@ from report_validation import report_rows as typed_report_rows
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
 from clock_latch_context import clock_latch_context
+from model_script_view import model_owned_script
+from drc_retry_preflight import unchanged_control_retry_problems
+from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets
 from contest_rules import QA_READ_DATE, QA_URL, qa_context, qa_residual_codes
 from drc_validation import drc_summaries, excluded_scan_cells, redirected_drc_codes, residual_positive_evidence, rule_codes, summary_permitted
 from scan_exclusion_evidence import exclusion_command_evidence
@@ -268,7 +271,9 @@ def permitted_residual_drc_codes(task: str, spec: str) -> set[str]:
     return allowed_drc_codes(spec) | qa_residual_codes(task, spec)
 
 
-def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
+def unsupported_options(dofile: str, task_spec: str | None = None, *,
+                        known_reset_ports: set[str] | None = None,
+                        permit_reset_inference: bool = False) -> list[str]:
     """Check literal options on simple commands against the installed tool's help."""
     path = Path(__file__).with_name("tool_help.json")
     if not path.is_file():
@@ -316,10 +321,12 @@ def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
             continue
         signal_type = re.search(r"-type\s+(\w+)", line)
         if signal_type and signal_type.group(1) == "reset" and task_spec is not None:
-            if not re.search(r"复位|reset|rst", task_spec, re.I):
-                problems.append("Task does not request a reset signal; remove the invented reset declaration")
-            elif re.search(r"没有复位端口|不作为.{0,20}(?:reset|复位)|no reset port", task_spec, re.I):
+            reset_port = re.search(r"-port\s+(\{[^}]+\}|\"[^\"]+\"|\S+)", line)
+            traced = bool(reset_port and reset_port.group(1).strip('"{}') in (known_reset_ports or set()))
+            if re.search(r"没有复位端口|不作为.{0,20}(?:reset|复位)|no reset port", task_spec, re.I):
                 problems.append("Task explicitly says no reset declaration is required; preserve ordinary functional inputs")
+            elif not re.search(r"复位|reset|rst", task_spec, re.I) and not traced and not permit_reset_inference:
+                problems.append("Task does not request a reset signal; remove the invented reset declaration")
         port = re.search(r"-port\s+([A-Za-z_][\w]*)\b", line)
         if signal_type and port:
             key, kind = (design, port.group(1)), signal_type.group(1)
@@ -544,11 +551,13 @@ def append_audit_reports(dofile: str, run_dir: Path) -> str:
     # Incremental repairs inherit the preceding script. Replace our own report
     # block so each round records its current state once, in its own directory.
     dofile = re.sub(r"(?m)^\n?# Agent audit reports from actual tool state\n"
-                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling|element)|wrapper_cfg|pseudo_pi)(?: -type all)? > [^\n]+\.audit\.rpt\"?\n)+"
+                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling|element)|wrapper_(?:cfg|implementation)|pseudo_pi)(?: -type all)? > [^\n]+\.audit\.rpt\"?\n)+"
                     r"(?:# End agent audit reports\n)?", "", dofile)
     reports = [(name, "") for name in commands]
     if "rpt_scan_element" in known and re.search(r"\bset_scan_element\b", dofile):
         reports.append(("rpt_scan_element", " -type all"))
+    if "rpt_wrapper_implementation" in known and re.search(r"\bset_wrapper_cfg\b", dofile):
+        reports.append(("rpt_wrapper_implementation", ""))
     extra = "\n# Agent audit reports from actual tool state\n" + "\n".join(
         f'{name}{options} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name, options in reports) + "\n# End agent audit reports\n"
     if not reports:
@@ -854,7 +863,9 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     segments: list[dict[str, Any]] | None = None,
                     control_hints: dict[str, Any] | None = None,
                     instances: dict[str, Any] | None = None,
-                    floating: dict[str, list[str]] | None = None) -> tuple[str, dict[str, Any]]:
+                    floating: dict[str, list[str]] | None = None,
+                    previous_actual_dofile: str | None = None,
+                    previous_unallowed_codes: set[str] | None = None) -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
@@ -868,6 +879,11 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
         context += "\n# Reset inactive levels traced from actual Liberty clear/preset functions and input connections\n" + json.dumps(control_hints, ensure_ascii=False)
     if floating:
         context += "\n# Clock outputs of gates whose input clocks are literally disconnected in original source\n" + json.dumps(floating, ensure_ascii=False)
+    if previous_unallowed_codes:
+        context += ("\n# Actual blocking DRC rules from the preceding tool result\n" +
+                    ", ".join(sorted(previous_unallowed_codes)) +
+                    "\nThe displayed current Dofile contains the editable model code. Runtime-owned recipes "
+                    "and audit reports are restored automatically; removing their former text cannot repair these rules.")
     spec = read_text(input_dir / "task_spec.md", 60000)
     netlist_rule = (("Task 1 strictly forbids modifying Pre-scan input netlists. Return no netlist_edits."
                      if task == "task1" else "This case strictly forbids modifying Pre-scan input netlists. Return no netlist_edits.")
@@ -883,7 +899,7 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
 Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts, this tool's built-in help and evidence from existing Dofiles. Built-in help determines valid command options; do not use options from another EDA product. Correct every earlier ERROR before retrying. Use the actual Liberty pin names, never guess SE/SI/CLK. Choose the requested top module from root-module evidence, rather than an internal module whose name appears first. For reset signals, -off_state is the INACTIVE level: active-low reset means -off_state 1; active-high reset means -off_state 0. get_cells/get_pins return tool collections; use foreach_in_collection to iterate them. Declare wrapper control signals with set_scan_signal before referring to them in set_wrapper_cfg. Complete examine_scan_drc/examine_scan_chain before insert_dft_logic; do not call examine_scan_chain after insertion. For a clock passed through a latch, use the documented associated_internal_clocks option and exclude that latch from scan elements as required. Group repeated diagnostics by concrete root cause, rather than one issue per cell. Keep each diagnosis and summary short. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
 For a gated scan partition, its scan_enable usually needs usage all so it controls both scan FFs and that partition's clock gates; usage scan alone does not connect gating control. Use a separate clock_gating signal only when the task specifies one. Clock off_state can be 0 or 1; when a latch passes a clock through its D pin, diagnose the source off level with DRC and associated_internal_clocks before proposing a netlist edit. Declare each clock port once, including associated_internal_clocks on that same set_scan_signal command; a second declaration fails instead of updating it. Use the actual parent module and instance from source excerpts, not an assumed hierarchy. To select a hierarchical subtree, filter full_name using the actual path and optional leading hierarchy prefix. Check sizeof_collection before applying a command that requires a nonempty instance list; a missing required object must remain unresolved. Use the derived shift-register endpoint/index hints where supplied, and use brace quoting/format for array pin paths so Tcl does not interpret numeric brackets as commands.
 Configure indexed scan data port names with set_scan_cfg -si_port_format and -so_port_format, not set_scan_signal -port containing %d. DRC rules DFTR1-6 and DFTR8-16 accept only Error/Warning. If the task allows a residual warning, leave it as Warning and retain actual evidence; do not request Ignore. When an instance path/pattern is specified, use full_name rather than ref_name (which is a cell type). Hierarchical positional query patterns may not match; use get_cells -hier -filter with full_name, e.g. {{full_name =~ */core/* && full_name !~ *keep_reg* && is_sequential == true}}, substituting actual source paths. If separate uninstantiated wrapper modules must remain available, load all netlist roots without -top, then use present_design to select the real scan top. Apply shift-register templates to ALL supplied index tuples, using concise Tcl loops rather than configuring only index zero. Global wrapper disable is set_wrapper_cfg disable, never -style none without an actual -port list. When the task does not request wrappers, remove spurious wrapper settings inherited from a faulty original script.
-Return exactly one compact JSON object with keys: dofile (complete Tcl script as a string), summary (one short sentence), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_id or evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Use concise scripts with few comments and brief diagnosis fields; execution time is limited. Task 1 requires a nonempty mapping of key requirements; dft_config must contain literal Tcl statements copied from your returned Dofile, never descriptions or invented placeholders for collections. Prefer evidence_id such as E1 from the supplied actual evidence catalog; the runtime inserts its exact prior-run excerpt. Otherwise evidence_excerpt must be an exact short contiguous excerpt copied from the supplied PREVIOUS run's tool log or report. Never combine fragments, omit text inside a line, or cite the task specification as tool evidence. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it. Only declare reset ports explicitly identified as resets by the task; functional data ports must retain their role. Wrapper shift and capture controls should use separate newly created ports, unless the task explicitly requires reusing existing ones.
+Return exactly one compact JSON object with keys: dofile (complete Tcl script as a string), summary (one short sentence), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_id or evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Use concise scripts with few comments and brief diagnosis fields; execution time is limited. Task 1 requires a nonempty mapping of key requirements; dft_config must contain literal Tcl statements copied from your returned Dofile, never descriptions or invented placeholders for collections. Prefer evidence_id such as E1 from the supplied actual evidence catalog; the runtime inserts its exact prior-run excerpt. Otherwise evidence_excerpt must be an exact short contiguous excerpt copied from the supplied PREVIOUS run's tool log or report. Never combine fragments, omit text inside a line, or cite the task specification as tool evidence. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it. Declare reset ports named by the task or supported by actual FF set/clear connections, Liberty functions and uncontrolled-reset diagnostics. A generic task may leave these names implicit. Never classify functional data as reset based on its name alone; explicit task prohibitions take precedence. Wrapper shift and capture controls should use separate newly created ports, unless the task explicitly requires reusing existing ones.
 The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Load multiple netlists together in one load_netlist file-list command with explicit -top when needed; separate load_netlist calls can change the scan engine's analyzed top. Use property names from the supplied actual cell property table, and get_property/get_attribute (not the nonexistent get_attr). For a user-defined dedicated wrapper, -interface is a list of semantic_role actual_module_port polarity triples; semantic roles are shift_clk, capture_en, shift_en, cti, cto, cfi, cfo. Read the provided module port declarations. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
     user = f"{mode}\n\n{context}\n\nReturn the JSON object now."
     system += ("\nPrioritize the recorded blocking tool and DRC findings. A functional clock violation "
@@ -988,7 +1004,12 @@ The actual read-only input directory is {input_dir}. The current run directory a
                     item["dft_config"] = "; ".join(normalize_wrapper_roots(
                         normalize_associated_pin_paths(normalize_reset_levels(normalize_scan_port_formats(normalize_load_file_lists(normalize_report_redirection(clause))), control_hints or {}, dofile), instances or {}, dofile), dofile).strip() for clause in clauses)
                     item["dft_config"] = normalize_mapping_annotation(dofile, item["dft_config"])
-            problems = unsupported_options(dofile, spec)
+            problems = unsupported_options(dofile, spec, known_reset_ports=set(control_hints or {}),
+                                           permit_reset_inference=bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
+            if previous_actual_dofile is not None:
+                problems.extend(unchanged_control_retry_problems(
+                    previous_actual_dofile, dofile, previous_unallowed_codes or set(),
+                    netlist_edits=result.get("netlist_edits"), words_for=literal_tcl_words))
             if task == "task1":
                 mappings = result.get("requirement_mapping")
                 if not isinstance(mappings, list) or not mappings:
@@ -1172,6 +1193,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
         problems.append("No actual Verilog deliverable was produced")
     report_files = [p for p in actual_files if p.suffix.lower() in {".rpt", ".report", ".txt"}]
     problems.extend(coverage_problems(report_files, dofile))
+    problems.extend(wrapper_problems(report_files, task_spec))
     report_text = "\n".join(read_text(p, 50000) for p in report_files)
     actual_chains = chain_rows(report_files)
     problems.extend(chain_problems(actual_chains, task_spec))
@@ -1323,9 +1345,22 @@ def run_evidence_files(run_dir: Path) -> list[Path]:
     return sorted(reports, key=lambda p: p.stat().st_size) + ([log] if log.is_file() else [])
 
 
-def evidence_catalog(run_dir: Path, output_dir: Path, maximum: int = 24) -> dict[str, dict[str, str]]:
+def evidence_catalog(run_dir: Path, output_dir: Path, maximum: int = 24,
+                     task_spec: str = "") -> dict[str, dict[str, str]]:
     """Give the model stable IDs for actual diagnostics, never generated answers."""
     catalog = {}
+    files = run_evidence_files(run_dir)
+    for port in wrapper_targets(task_spec):
+        rows = port_wrapper_rows(files, port)
+        if rows:
+            row = rows[0]
+            path = Path(row["source"])
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                excerpt = next((line.strip() for number, line in enumerate(stream, 1) if number == row["line"]), "")
+            catalog[f"E{len(catalog)+1}"] = {"source": path.relative_to(output_dir).as_posix(),
+                                           "locator": f"L{row['line']}", "excerpt": excerpt}
+            if len(catalog) >= maximum:
+                return catalog
     seen = set()
     counts = {}
     files = run_evidence_files(run_dir)
@@ -1511,6 +1546,10 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
         fix_text = str(item.get("fix", ""))
         diagnosed_rules = rule_codes(located + " " + diagnostic + " " + fix_text + " " + str(item.get("phenomenon", "")))
+        if "WrapperConfigurationParameter" in cited and re.search(r"\bport\s+`?([A-Za-z_][\w$]*)", located, re.I):
+            target_port = re.search(r"\bport\s+`?([A-Za-z_][\w$]*)", located, re.I).group(1)
+            if not re.search(r"(?<![\w$])" + re.escape(target_port) + r"(?![\w$])", cited):
+                continue
         if cited_rules and "DFTDRC-" in cited and diagnosed_rules and not cited_rules & diagnosed_rules:
             continue
         if (re.search(r"Chain\s+Length\s+Input", cited) and
@@ -1631,8 +1670,31 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                     re.search(r"(?<![\w$])" + re.escape(origin_port.group(1)) + r"(?![\w$])", subject)):
                 subject += " " + failed_command
     logical_lines = dofile.replace("\\\n", " ").splitlines()
+    for command in logical_lines:
+        if not re.match(r"\s*set_wrapper_cfg\b", command):
+            continue
+        words = literal_tcl_words(command)
+        if "-style" not in words or "-port" not in words:
+            continue
+        style = words[words.index("-style") + 1].strip('"{}')
+        ports = words[words.index("-port") + 1].strip('"{}').split()
+        for port in ports:
+            if re.fullmatch(r"[A-Za-z_][\w$]*", port) and re.search(r"(?<![\w$])" + re.escape(port) + r"(?![\w$])", subject):
+                evidence = wrapper_style_evidence(files, output_dir, port, style)
+                if evidence:
+                    return evidence
     named_partition = re.search(r"(?:\bpartition\s+|\badd_scan_partition\s+|分区\s*)([A-Za-z_][\w$]*)",
                                 diagnosis.get("located_object", ""), re.I)
+    bare_partition = diagnosis.get("located_object", "").strip()
+    if (named_partition is None and re.fullmatch(r"[A-Za-z_][\w$]*", bare_partition) and
+            not source.is_absolute() and re.fullmatch(r"R\d+", run_ref) and
+            _is_inside(origin, (output_dir / "runs" / run_ref).resolve()) and
+            source.suffix.lower() in {".rpt", ".report", ".txt"} and origin.is_file() and locator and
+            re.search(r"(?m)^\s*add_scan_partition\s+" + re.escape(bare_partition) + r"\s", dofile)):
+        first, last = int(locator.group(1)), int(locator.group(2) or locator.group(1))
+        if any(row["Partition"] == bare_partition and first <= row["line"] <= last
+               for row in typed_report_rows(origin, {"Chain", "Partition"})):
+            named_partition = re.search(r"partition\s+([A-Za-z_][\w$]*)", "partition " + bare_partition)
     complete_chain_table = False
     if (re.fullmatch(r"scan\s+chains?|扫描链", diagnosis.get("located_object", "").strip(), re.I) and
             not source.is_absolute() and source.suffix.lower() in {".rpt", ".report", ".txt"} and
@@ -2056,6 +2118,11 @@ def main() -> int:
             if run_records:
                 generation_base, generation_mapping = rebase_round(
                     previous, requirement_mapping, runs_root / run_records[-1]["run_id"], run_dir)
+            generation_actual_base = generation_base
+            previous_unallowed_codes = (redirected_drc_codes(runs_root / run_records[-1]["run_id"], {}) -
+                                        permitted_residual_drc_codes(task, task_spec) if run_records else set())
+            if run_records:
+                generation_base = model_owned_script(generation_base)
             context = (static_context + f"\n# Current Dofile (output paths already rebased to this round)\n{generation_base}\n\n"
                        f"# Most recent tool log / diagnostics\n{last_log[-18000:] if last_log else '(no run yet)'}\n\n"
                        f"# Most recent tool reports\n{previous_reports[-18000:] if previous_reports else '(no reports captured yet)'}\n")
@@ -2091,8 +2158,10 @@ def main() -> int:
                                                  input_dir, run_dir, start + timeout_total - finalize_reserve - 1,
                                                  base_dofile=generation_base if run_records else None,
                                                  previous_mapping=generation_mapping,
-                                                 catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir) if run_records else None,
-                                                 segments=expected_segments, control_hints=control_hints, instances=instances, floating=floating)
+                                                 catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir, task_spec=task_spec) if run_records else None,
+                                                 segments=expected_segments, control_hints=control_hints, instances=instances, floating=floating,
+                                                 previous_actual_dofile=generation_actual_base if run_records else None,
+                                                 previous_unallowed_codes=previous_unallowed_codes)
                     if meta.get("netlist_edits"):
                         edits = meta["netlist_edits"]
                         if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):

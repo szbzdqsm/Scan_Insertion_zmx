@@ -20,6 +20,9 @@ COPY contest_rules.py /submission/contest_rules.py
 COPY drc_validation.py /submission/drc_validation.py
 COPY scan_exclusion_evidence.py /submission/scan_exclusion_evidence.py
 COPY clock_latch_context.py /submission/clock_latch_context.py
+COPY model_script_view.py /submission/model_script_view.py
+COPY drc_retry_preflight.py /submission/drc_retry_preflight.py
+COPY wrapper_validation.py /submission/wrapper_validation.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system

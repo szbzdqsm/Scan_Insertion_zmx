@@ -480,6 +480,38 @@ class AuditRegression(unittest.TestCase):
             self.assertTrue(agent.unsupported_options("set_scan_signal -type reset -port reset", "Single-clock scan insertion"))
             self.assertTrue(agent.unsupported_options("set_scan_signal -type reset -port reset_n", "没有复位端口，reset_n 不作为 reset"))
 
+    def test_implicit_reset_can_follow_actual_trace_or_uncontrolled_reset_diagnostic(self):
+        (self.root / "tool_help.json").write_text("{}")
+        script = "set_scan_signal -type reset -port reset_n -off_state 1"
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertEqual(agent.unsupported_options(script, "Complete insertion", known_reset_ports={"reset_n"}), [])
+            self.assertEqual(agent.unsupported_options(script, "Complete insertion", permit_reset_inference=True), [])
+            self.assertTrue(agent.unsupported_options(script, "没有复位端口，reset_n 不作为 reset", permit_reset_inference=True))
+
+    def test_bare_partition_name_binds_to_its_real_old_chain_row(self):
+        headers = ["Chain", "Length", "Input", "Output", "ScanEnable", "Clocks", "Partition"]
+        def table(clock):
+            return ''.join(f'{value:<24}' for value in headers) + '\n' + ''.join(
+                f'{value:<24}' for value in ["I 1", "10", "si1", "so1", "se_wb", clock, "wb_partition"]) + '\n'
+        old = self.out / "runs/R1/reports/scan_chain.rpt"
+        new = self.out / "runs/R2/reports/scan_chain.rpt"
+        old.write_text(table("tx_clk"))
+        new.write_text(table("wb_clk"))
+        row = old.read_text().splitlines()[1].strip()
+        item = dict(self.item, evidence_excerpt=row, located_object="wb_partition", root_cause="wrong partition clock",
+                    fix="Changed -clocks {tx_clk} to -clocks {wb_clk}")
+        issues, _ = self.record(item)
+        proof = agent.configuration_evidence(issues[0], [new], self.out, "add_scan_partition wb_partition -clocks {wb_clk}\n")
+        self.assertIsNotNone(proof)
+        self.assertIn("wb_clk", proof["excerpt"])
+
+    def test_global_wrapper_default_cannot_discover_a_port_override_fault(self):
+        text = "WrapperConfigurationParameter Value\nstyle shared\nenable Y"
+        (self.out / "runs/R1/reports/wrapper_cfg.rpt").write_text(text + "\n")
+        item = dict(self.item, evidence_excerpt=text, located_object="Port functional_input", root_cause="wrong port style",
+                    fix="set_wrapper_cfg -style none -port {functional_input}")
+        self.assertEqual(self.record(item)[0], [])
+
     def test_associated_clock_fix_requires_actual_typed_pin_value(self):
         item = dict(self.item, evidence_excerpt="[ERROR] Pin 'wrong/Q' defined in option '-associated_internal_clocks' does not exist.",
                     located_object="wrong/Q", root_cause="wrong pin path", fix="Change associated_internal_clocks to latch/Q")
