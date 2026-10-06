@@ -6,3 +6,4 @@
 !extract_tool_help.py
 !netlist_repair.py
 !netlist_structure.py
+!report_validation.py

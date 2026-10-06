@@ -13,6 +13,7 @@ COPY agent_system /submission/agent_system
 COPY scan_agent.py /submission/scan_agent.py
 COPY netlist_repair.py /submission/netlist_repair.py
 COPY netlist_structure.py /submission/netlist_structure.py
+COPY report_validation.py /submission/report_validation.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system

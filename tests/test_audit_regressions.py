@@ -65,6 +65,24 @@ class AuditRegression(unittest.TestCase):
         (self.out / "runs/R2/R2.log").write_text(item["evidence_excerpt"] + "\n")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_model_evidence_id_expands_only_actual_prior_excerpt(self):
+        catalog = agent.evidence_catalog(self.out / "runs/R1", self.out)
+        evidence_id = next(key for key, value in catalog.items() if self.cited in value["excerpt"])
+        (self.root / "task_spec.md").write_text("Repair the real clock diagnostic.")
+        reply = {"dofile": "exit\n", "issue_resolutions": [dict(self.item, evidence_id=evidence_id, evidence_excerpt="invented")],
+                 "requirement_mapping": [{"requirement": "Finish script", "dft_config": "exit"}]}
+        with patch.object(agent, "ask", return_value=json.dumps(reply)), \
+             patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            _, meta = agent.call_for_dofile(object(), "task1", "fixture", None, self.root,
+                                           self.out / "runs/R2", catalog=catalog)
+        self.assertEqual(meta["issue_resolutions"][0]["evidence_excerpt"], self.cited)
+        reply["issue_resolutions"][0]["evidence_id"] = "E999"
+        with patch.object(agent, "ask", return_value=json.dumps(reply)), \
+             patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            with self.assertRaisesRegex(ValueError, "Unknown evidence_id"):
+                agent.call_for_dofile(object(), "task1", "fixture", None, self.root,
+                                      self.out / "runs/R2", catalog=catalog)
+
     def test_tcl_echo_and_comments_cannot_supply_discovery_evidence(self):
         path = self.out / "runs/R1/reports/drc.rpt"
         path.write_text("# " + self.cited + "\n")
@@ -148,6 +166,20 @@ class AuditRegression(unittest.TestCase):
         self.assertIn('rpt_scan_drc_violation -verbose > "report with spaces.rpt"', text)
         self.assertIn('rpt_scan_chain -file "chain.rpt"', text)
 
+    def test_report_file_adapter_keeps_complete_tcl_substitution(self):
+        (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_drc_violation": "[-verbose]"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            text = agent.normalize_report_redirection('rpt_scan_drc_violation -verbose -file [file join $out_dir "drc report.rpt"]\n')
+        self.assertEqual(text, 'rpt_scan_drc_violation -verbose > [file join $out_dir "drc report.rpt"]\n')
+
+    def test_global_wrapper_none_and_empty_port_are_invalid(self):
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            for command in ('set_wrapper_cfg -style none', 'set_wrapper_cfg -style none -port {}'):
+                self.assertTrue(agent.unsupported_options(command))
+            self.assertEqual(agent.unsupported_options('set_wrapper_cfg disable'), [])
+            self.assertEqual(agent.unsupported_options('set_wrapper_cfg -style none -port functional_in'), [])
+
     def test_cell_filter_preflight_uses_real_properties_and_skips_pin_queries(self):
         (self.root / "tool_help.json").write_text(json.dumps({"__cell_properties": "ref_name cell string A,R\nis_sequential cell boolean A,R"}))
         with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
@@ -164,6 +196,42 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(agent.normalize_load_file_lists('load_netlist {/a.v /b.v} -top top\n'),
                          'load_netlist {/a.v /b.v} -top top\n')
 
+    def test_indexed_data_ports_use_documented_format_configuration(self):
+        text = agent.normalize_scan_port_formats('set_scan_signal -type scan_data_in -port scan_si_%d\n'
+                                                'set_scan_signal -port scan_so_%d -type scan_data_out\n'
+                                                'set_scan_signal -type scan_data_in -port existing_si\n')
+        self.assertIn('set_scan_cfg -si_port_format scan_si_%d', text)
+        self.assertIn('set_scan_cfg -so_port_format scan_so_%d', text)
+        self.assertIn('set_scan_signal -type scan_data_in -port existing_si', text)
+        self.assertEqual(agent.normalize_scan_port_formats(text), text)
+
+    def test_auxiliary_wrapper_load_retains_both_roots_and_present_design(self):
+        text = ('load_netlist -top main [list /input/main.v /input/wrapper.v]\n'
+                'present_design main\nadd_dedicated_wrapper_cell_type -design_name helper -interface {}\n')
+        adapted = agent.normalize_wrapper_roots(text)
+        self.assertIn('load_netlist [list /input/main.v /input/wrapper.v]', adapted)
+        self.assertIn('present_design main', adapted)
+        self.assertNotIn('-top', adapted)
+        self.assertEqual(agent.normalize_wrapper_roots(adapted), adapted)
+        self.assertEqual(agent.normalize_wrapper_roots('load_netlist -top main /input/main.v\npresent_design main\n'),
+                         'load_netlist -top main /input/main.v\npresent_design main\n')
+
+    def test_unsupported_drc_ignore_is_rejected_before_execution(self):
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options('set_scan_drc_rule_handling {DFTR10} Ignore'))
+            self.assertTrue(agent.unsupported_options('set_scan_drc_rule_handling {DFTR1 DFTR9} Info'))
+            self.assertEqual(agent.unsupported_options('set_scan_drc_rule_handling {DFTR-TIE0 DFTR17} Ignore'), [])
+            self.assertEqual(agent.unsupported_options('set_scan_drc_rule_handling {DFTR10} Warning'), [])
+
+    def test_drc_exceptions_need_explicit_task_authorization(self):
+        self.assertEqual(agent.allowed_drc_codes("不允许忽略 DFTR10"), set())
+        self.assertEqual(agent.allowed_drc_codes("禁止修改网表，但允许忽略 DFTR-TIE0/DFTR-TIE1"), {"DFTRTIE0", "DFTRTIE1"})
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options('set_scan_drc_rule_handling {DFTR-TIE0} Ignore', "DRC 必须无违例"))
+            self.assertEqual(agent.unsupported_options('set_scan_drc_rule_handling {DFTR-TIE0} Ignore', "允许忽略 DFTR-TIE0"), [])
+
     def test_chain_order_fix_requires_positive_success_counts(self):
         item = dict(self.item, evidence_excerpt="[ERROR] Cannot execute command 'examine_scan_chain' "
                     "after executing 'insert_dft_logic' command.", located_object="examine_scan_chain",
@@ -177,6 +245,27 @@ class AuditRegression(unittest.TestCase):
         log.write_text("Total scan chains checked: 4\nSuccess: 4\nFail: 0\n")
         agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
         self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_drc_order_fix_requires_actual_zero_before_insertion(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Cannot execute command 'examine_scan_drc' after executing 'insert_dft_logic' command.",
+                    located_object="examine_scan_drc", root_cause="wrong execution order", fix="check before insertion")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        log = self.out / "runs/R2/R2.log"
+        log.write_text("[INFO] [CMD-0034] @1: insert_dft_logic\n[INFO] [CMD-0034] @2: examine_scan_drc\nTotal violations: 0\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        log.write_text("[INFO] [CMD-0034] @1: examine_scan_drc\nDRC Report\nTotal violations: 0\n[INFO] [CMD-0034] @2: insert_dft_logic\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_order_and_signal_conflicts_are_preflight_errors(self):
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options("insert_dft_logic\nexamine_scan_drc -file late.rpt\n"))
+            self.assertTrue(agent.unsupported_options("set_scan_signal -type scan_enable -port se\nset_scan_signal -type wrp_in_shift_en -port se\n"))
+            self.assertTrue(agent.unsupported_options("set_scan_signal -type clock -port clk\nset_scan_signal -type clock -port clk -associated_internal_clocks latch/Q\n"))
+            self.assertEqual(agent.unsupported_options("set_scan_signal -type scan_enable -port se -view existing\nset_scan_signal -type scan_enable -port se -view spec\n"), [])
 
     def test_liberty_context_includes_actual_scan_pins(self):
         path = self.root / "cells.lib"
@@ -280,6 +369,11 @@ class AuditRegression(unittest.TestCase):
             edit = {"dofile_edits": [{"old": old, "new": "new"}]}
             with self.assertRaisesRegex(ValueError, "unique"):
                 self.generate_patch([edit, edit], base=base)
+
+    def test_edits_use_original_spans_and_reject_overlap(self):
+        self.assertEqual(agent.apply_dofile_edits("A\nB\n", [{"old": "A", "new": "B"}, {"old": "B", "new": "C"}]), "B\nC\n")
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            agent.apply_dofile_edits("A\nB\n", [{"old": "A\nB", "new": "X"}, {"old": "B", "new": "C"}])
 
     def test_later_successful_round_can_verify_an_earlier_fix(self):
         issues, plans = self.record()
@@ -445,7 +539,7 @@ class AuditRegression(unittest.TestCase):
         result, decision, captures, input_dir, output_dir = self.run_main()
         self.assertEqual(result, 0)
         self.assertEqual(decision["case_id"], "hidden_case_1")
-        self.assertEqual(captures["calls"], [53])
+        self.assertEqual(captures["calls"], [75])
         system = captures["requests"][0]["messages"][0]["content"]
         user = captures["requests"][0]["messages"][1]["content"]
         self.assertIn(str(input_dir), system)
@@ -473,7 +567,7 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(issue["attempts"][0]["verify"]["run_ref"], "R2")
 
     def test_tool_is_not_started_when_generation_consumes_reserve(self):
-        result, decision, captures, _, _ = self.run_main(generation_seconds=75)
+        result, decision, captures, _, _ = self.run_main(generation_seconds=95)
         self.assertEqual(result, 1)
         self.assertEqual(captures["calls"], [])
         self.assertEqual(decision["tool_runs"], [])

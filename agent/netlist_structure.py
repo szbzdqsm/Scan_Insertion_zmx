@@ -12,11 +12,11 @@ def normalized_net(value: str) -> str:
     return re.sub(r"\s+", "", value).removeprefix("\\")
 
 
-def shift_register_context(paths: list[Path], minimum: int = 10, limit: int = 16000,
-                           libraries: list[Path] | None = None) -> str:
+def shift_register_groups(paths: list[Path], minimum: int = 10,
+                          libraries: list[Path] | None = None) -> list[dict[str, Any]]:
     """Find unbranched Q-to-D chains starting with actual scan FFs within a module."""
     if sum(path.stat().st_size for path in paths) > 64 * 1024 * 1024:
-        return "Shift-register structural scan omitted for inputs larger than 64 MiB; use real tool evidence."
+        return []
     modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
     aliases: dict[str, dict[str, str]] = defaultdict(dict)
     clock_inversions: dict[str, dict[str, str]] = defaultdict(dict)
@@ -171,6 +171,14 @@ def shift_register_context(paths: list[Path], minimum: int = 10, limit: int = 16
                           "scan_enable_pin": signature[5], "scan_data_out_pin": signature[6],
                           "index_tuples": [[int(values[index]) for index in variable] for values in starts],
                           "count": len(rows)})
+    return hints
+
+
+def shift_register_context(paths: list[Path], minimum: int = 10, limit: int = 16000,
+                           libraries: list[Path] | None = None) -> str:
+    if sum(path.stat().st_size for path in paths) > 64 * 1024 * 1024:
+        return "Shift-register structural scan omitted for inputs larger than 64 MiB; use real tool evidence."
+    hints = shift_register_groups(paths, minimum=minimum, libraries=libraries)
     return ("Best-effort unbranched shift-register candidates from actual input connections. "
             "Templates include concrete hierarchy and correlated indices; preserve existing scan enables and verify with the tool. "
             "This scan does not cover branched paths, concatenated/sliced bus bindings or arbitrary HDL.\n" +
