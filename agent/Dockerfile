@@ -18,6 +18,8 @@ COPY dofile_recipe.py /submission/dofile_recipe.py
 COPY floating_inputs.py /submission/floating_inputs.py
 COPY contest_rules.py /submission/contest_rules.py
 COPY drc_validation.py /submission/drc_validation.py
+COPY scan_exclusion_evidence.py /submission/scan_exclusion_evidence.py
+COPY clock_latch_context.py /submission/clock_latch_context.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system

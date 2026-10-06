@@ -25,8 +25,10 @@ from report_validation import chain_problems, chain_rows, coverage_problems, ctl
 from report_validation import report_rows as typed_report_rows
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
+from clock_latch_context import clock_latch_context
 from contest_rules import QA_READ_DATE, QA_URL, qa_context, qa_residual_codes
-from drc_validation import drc_summaries, excluded_scan_cells, residual_positive_evidence, rule_codes, summary_permitted
+from drc_validation import drc_summaries, excluded_scan_cells, redirected_drc_codes, residual_positive_evidence, rule_codes, summary_permitted
+from scan_exclusion_evidence import exclusion_command_evidence
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -542,11 +544,14 @@ def append_audit_reports(dofile: str, run_dir: Path) -> str:
     # Incremental repairs inherit the preceding script. Replace our own report
     # block so each round records its current state once, in its own directory.
     dofile = re.sub(r"(?m)^\n?# Agent audit reports from actual tool state\n"
-                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling)|wrapper_cfg|pseudo_pi) > [^\n]+\.audit\.rpt\"?\n)+"
+                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling|element)|wrapper_cfg|pseudo_pi)(?: -type all)? > [^\n]+\.audit\.rpt\"?\n)+"
                     r"(?:# End agent audit reports\n)?", "", dofile)
+    reports = [(name, "") for name in commands]
+    if "rpt_scan_element" in known and re.search(r"\bset_scan_element\b", dofile):
+        reports.append(("rpt_scan_element", " -type all"))
     extra = "\n# Agent audit reports from actual tool state\n" + "\n".join(
-        f'{name} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name in commands) + "\n# End agent audit reports\n"
-    if not commands:
+        f'{name}{options} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name, options in reports) + "\n# End agent audit reports\n"
+    if not reports:
         return dofile
     exits = list(re.finditer(r"(?m)^\s*exit\s*$", dofile))
     if exits:
@@ -821,6 +826,9 @@ Liberty files: {lib_names}
 # Shift-register structures requested by the task
 {shift_summary}
 
+# Literal clock-buffer and enable-latch connections (structural candidates, not proof)
+{clock_latch_context(netlists, libs) if re.search(r'ICG|门控|缓冲|latch|闩锁', task_spec, re.I) else 'Not requested'}
+
 # ScanInsertion manual excerpts (authoritative syntax reference)
 {manual_context(task_spec)}
 
@@ -878,6 +886,13 @@ Configure indexed scan data port names with set_scan_cfg -si_port_format and -so
 Return exactly one compact JSON object with keys: dofile (complete Tcl script as a string), summary (one short sentence), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_id or evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Use concise scripts with few comments and brief diagnosis fields; execution time is limited. Task 1 requires a nonempty mapping of key requirements; dft_config must contain literal Tcl statements copied from your returned Dofile, never descriptions or invented placeholders for collections. Prefer evidence_id such as E1 from the supplied actual evidence catalog; the runtime inserts its exact prior-run excerpt. Otherwise evidence_excerpt must be an exact short contiguous excerpt copied from the supplied PREVIOUS run's tool log or report. Never combine fragments, omit text inside a line, or cite the task specification as tool evidence. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it. Only declare reset ports explicitly identified as resets by the task; functional data ports must retain their role. Wrapper shift and capture controls should use separate newly created ports, unless the task explicitly requires reusing existing ones.
 The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Load multiple netlists together in one load_netlist file-list command with explicit -top when needed; separate load_netlist calls can change the scan engine's analyzed top. Use property names from the supplied actual cell property table, and get_property/get_attribute (not the nonexistent get_attr). For a user-defined dedicated wrapper, -interface is a list of semantic_role actual_module_port polarity triples; semantic roles are shift_clk, capture_en, shift_en, cti, cto, cfi, cfo. Read the provided module port declarations. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
     user = f"{mode}\n\n{context}\n\nReturn the JSON object now."
+    system += ("\nPrioritize the recorded blocking tool and DRC findings. A functional clock violation "
+               "needs a clock/control-path diagnosis based on literal source connections; changing SI/SO "
+               "port names does not activate that clock. Configuration tables show effective values, "
+               "including defaults; an omitted explicit declaration is not itself a defect when the "
+               "effective value already satisfies the task. A gated-clock CE latch stores enable data: "
+               "its Q is not a clock merely because the downstream clock is inactive. Associate a source "
+               "clock only with a demonstrated derived clock output or clock pin, using actual hierarchy.")
     if segments:
         system += ("\nThe runtime compiles ALL supplied actual shift-register candidates into set_scan_segment "
                    "commands and preserves their actual scan-enable pin connections. You may omit your own segment "
@@ -1075,6 +1090,7 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
         suffix = ""
         drc_count = 0
         observed_rules: set[str] = set()
+        report_monitor_cache = {}
         with log_path.open(encoding="utf-8", errors="replace") as monitor:
             while proc.poll() is None:
                 chunk = monitor.read(262144)
@@ -1090,6 +1106,8 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
                         drc_count = int(summary.group(1))
                 if abort_on_error and re.search(r"\[(?:ERROR|FATAL)\]", suffix + chunk):
                     error = "early_tool_error"
+                elif abort_on_error and allowed_drc is not None and redirected_drc_codes(run_dir, report_monitor_cache) - allowed_drc:
+                    error = "unallowed_drc"
                 elif abort_on_error and allowed_drc is not None and drc_count > 0 and observed_rules - allowed_drc:
                     error = "unallowed_drc"
                 elif time.monotonic() - started >= max(1, timeout):
@@ -1505,9 +1523,19 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
             # A row about another signal cannot discover a parameter defect on this port.
             continue
         if "ScanConfigurationParameter" in cited:
+            if re.search(r"\b(?:set_scan_element|get_obj_insts|get_cells)\b", located):
+                # A configuration table does not discover a failed object query or exclusion.
+                continue
             parameters = set(re.findall(r"(?m)^\s*([a-z_]+)\s+\S+\s*$", cited))
             relevant = located + " " + diagnostic
             if "set_scan_cfg" not in relevant and not any(re.search(r"\b" + re.escape(name) + r"\b", relevant) for name in parameters):
+                continue
+            current_values = dict(re.findall(r"(?m)^\s*([a-z_]+)\s+(\S+)\s*$", cited))
+            requested_values = [(name, value.strip('"{}')) for name, value in
+                                re.findall(r'-([a-z_]+)\s+(\{[^{}]+\}|"[^"\n]+"|[^\s,;]+)', fix_text)
+                                if name in current_values and not re.search(r"[$\[\\]", value)]
+            if requested_values and all(current_values[name].lower() == value.lower() for name, value in requested_values):
+                # Already effective values do not prove an absent explicit declaration is a defect.
                 continue
         if (not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and
                 re.search(r"already corrected|already correct|no further change|already.*fixed|无需进一步|已经修复", fix_text, re.I)):
@@ -1562,6 +1590,9 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
 def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir: Path,
                            dofile: str) -> dict[str, str] | None:
     """Bind the executed literal configuration to typed rows from the real tool."""
+    exclusion = exclusion_command_evidence(issue, files, output_dir, dofile, literal_tcl_words)
+    if exclusion:
+        return exclusion
     diagnosis = issue["diagnosis"]
     fix = issue.get("attempts", [{}])[-1].get("fix", {}).get("action", "")
     subject = diagnosis.get("located_object", "") + " " + fix
@@ -2016,7 +2047,9 @@ def main() -> int:
                 excerpts = []
                 for rp in previous_dir.rglob("*"):
                     if rp.is_file() and rp.suffix.lower() in {".rpt", ".report", ".txt"}:
-                        excerpts.append(f"### {rp.relative_to(previous_dir)}\n{read_text(rp, 12000)}")
+                        report_context = (diagnostic_excerpt(rp, 10000) if re.search(r"drc|violation", rp.name, re.I)
+                                          else read_text(rp, 12000))
+                        excerpts.append(f"### {rp.relative_to(previous_dir)}\n{report_context}")
                 previous_reports = "\n\n".join(excerpts)[:18000]
             generation_base = previous
             generation_mapping = requirement_mapping
@@ -2027,8 +2060,8 @@ def main() -> int:
                        f"# Most recent tool log / diagnostics\n{last_log[-18000:] if last_log else '(no run yet)'}\n\n"
                        f"# Most recent tool reports\n{previous_reports[-18000:] if previous_reports else '(no reports captured yet)'}\n")
             netlist_changes: list[dict[str, Any]] = []
-            if task == "task2" and run_records and edits_allowed(task, task_spec):
-                context += "\n# Localized actual netlist source around prior diagnostics\n" + netlist_diagnostic_context(active_netlists, last_log)
+            if run_records:
+                context += "\n# Localized actual input source around prior diagnostics (Dofile repairs also need source traces)\n" + netlist_diagnostic_context(active_netlists, last_log + "\n" + previous_reports)
             if active_netlist_root != input_dir / "netlist":
                 context += f"\n# EQY-proven current netlist directory\n{active_netlist_root}\n"
             if validation_problems:

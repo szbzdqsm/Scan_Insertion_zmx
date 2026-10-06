@@ -11,3 +11,5 @@
 !floating_inputs.py
 !contest_rules.py
 !drc_validation.py
+!scan_exclusion_evidence.py
+!clock_latch_context.py

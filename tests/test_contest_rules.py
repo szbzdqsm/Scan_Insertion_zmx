@@ -115,6 +115,18 @@ class DRCSummaries(unittest.TestCase):
         scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
         self.assertEqual(issues, [])
 
+    def test_configuration_default_already_matches_the_proposed_fix(self):
+        old = self.root / "runs/R1/reports"
+        old.mkdir(parents=True)
+        excerpt = "ScanConfigurationParameter Value\nsi_port_format test_si%d\nso_port_format test_so%d"
+        (old / "scan_cfg.rpt").write_text(excerpt + "\n")
+        item = {"evidence_excerpt": excerpt, "located_object": "set_scan_cfg", "diagnosis": "Formats not explicitly declared",
+                "root_cause": "Missing si_port_format and so_port_format declarations",
+                "fix": "Add -si_port_format test_si%d -so_port_format test_so%d to set_scan_cfg"}
+        issues = []
+        scan_agent.record_issue_fixes({"issue_resolutions": [item]}, issues, {}, self.root, "R1", "R2", "F1")
+        self.assertEqual(issues, [])
+
     def write_report(self, total=21, counts=None, extra=""):
         counts = {"DFTR10": 21} if counts is None else counts
         self.path.write_text("DRC Report\nTotal violations: " + str(total) + "\n" + extra + "\n" +

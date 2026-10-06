@@ -88,6 +88,14 @@ class AuditRegression(unittest.TestCase):
         item = dict(self.item, evidence_excerpt=text, located_object="examine_scan_drc command", diagnosis="No drc.rpt was written", root_cause="Missing output report")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_scan_configuration_table_cannot_discover_exclusion_query_fault_by_mentioning_chain_count(self):
+        text = "ScanConfigurationParameter Value\nchain_count 55\nmax_length 100"
+        (self.out / "runs/R1/reports/scan_cfg.rpt").write_text(text + "\n")
+        for located in ("set_scan_element false $targets", "get_obj_insts -hier -filter wrong"):
+            item = dict(self.item, evidence_excerpt=text, located_object=located,
+                        diagnosis="The query failed earlier; scan_cfg confirms chain_count 55.", root_cause="empty query result")
+            self.assertEqual(self.record(item)[0], [])
+
     def test_error_in_another_command_is_not_discovery_for_a_dump_command(self):
         text = "[ERROR] Command 'set_scan_drc_rule_handling' execution failed"
         (self.out / "runs/R1/R1.log").write_text(text + "\n")
@@ -656,6 +664,20 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(second.count("rpt_scan_cfg >"), 1)
         self.assertNotIn(str(self.out / "runs/R1"), second)
         self.assertIn(str(self.out / "runs/R2"), second)
+
+    def test_exclusion_audit_requests_actual_all_states_once_and_rebases_the_report(self):
+        (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_cfg": "rpt_scan_cfg",
+                                                            "rpt_scan_element": "rpt_scan_element -type all"}))
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            first = agent.append_audit_reports("set_scan_element false {U1}\nexit\n", self.out / "runs/R1")
+            second = agent.append_audit_reports(first, self.out / "runs/R2")
+            repeated = agent.append_audit_reports(second, self.out / "runs/R2")
+            ordinary = agent.append_audit_reports("insert_dft_logic\nexit\n", self.out / "runs/R2")
+        self.assertEqual(second, repeated)
+        self.assertEqual(second.count("rpt_scan_element -type all >"), 1)
+        self.assertIn(str(self.out / "runs/R2/reports/rpt_scan_element.audit.rpt"), second)
+        self.assertNotIn(str(self.out / "runs/R1"), second)
+        self.assertNotIn("rpt_scan_element", ordinary)
 
     def test_round_rebases_script_and_mapping_without_mutating_evidence(self):
         before, after = self.out / "runs/R1", self.out / "runs/R2"

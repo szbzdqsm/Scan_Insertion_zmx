@@ -10,6 +10,40 @@ def rule_codes(text: str) -> set[str]:
             for rule in re.findall(r"\bDFTR[-_ ]?(?:TIE[01]|L[12]|\d+)\b", text, re.I)}
 
 
+def redirected_drc_codes(run_dir: Path, cache: dict) -> set[str]:
+    """Preview growing actual reports so redirection does not hide blocking DRC from the monitor."""
+    observed = set()
+    for path in run_dir.rglob("*"):
+        if path.suffix.lower() not in {".rpt", ".report", ".txt"} or path.name.startswith("llm_") or not path.is_file():
+            continue
+        try:
+            info = path.stat()
+            stamp = (info.st_mtime_ns, info.st_size)
+            old = cache.get(path)
+            if old and old[0] == stamp:
+                observed.update(old[1])
+                continue
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                head = stream.read(8192)
+                if "DRC Report" not in head or not re.search(r"(?m)^\s*Total violations:\s*[1-9]\d*\s*$", head):
+                    codes = set()
+                else:
+                    stream.seek(max(0, info.st_size - 8192))
+                    text = head + "\n" + stream.read(8192)
+                    codes = set()
+                    for line in text.splitlines():
+                        if ("CMD-0034" not in line and
+                                (re.search(r"\[(?:WARNING|INFO)\].*\[\s*DFTDRC-", line) or
+                                 re.search(r"\[INFO\]\s+There were \d+ DRC rule '.+' fails", line))):
+                            codes.update(rule_codes(line))
+        except OSError:
+            # The tool may rotate an output between directory enumeration and reading.
+            continue
+        cache[path] = (stamp, codes)
+        observed.update(codes)
+    return observed
+
+
 def drc_summaries(path: Path) -> list[dict]:
     """Collect each total and its tool-generated per-rule fail counts, streaming the file."""
     summaries = []
