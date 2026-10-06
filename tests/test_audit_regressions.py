@@ -65,6 +65,11 @@ class AuditRegression(unittest.TestCase):
         (self.out / "runs/R2/R2.log").write_text(item["evidence_excerpt"] + "\n")
         self.assertEqual(self.record(item)[0], [])
 
+    def test_clean_drc_summary_cannot_discover_an_unrelated_fault(self):
+        item = dict(self.item, evidence_excerpt="Total violations: 0", root_cause="missing wrapper configuration")
+        (self.out / "runs/R1/reports/drc.rpt").write_text("DRC Report\nTotal violations: 0\n")
+        self.assertEqual(self.record(item)[0], [])
+
     def test_model_evidence_id_expands_only_actual_prior_excerpt(self):
         catalog = agent.evidence_catalog(self.out / "runs/R1", self.out)
         evidence_id = next(key for key, value in catalog.items() if self.cited in value["excerpt"])
@@ -179,6 +184,43 @@ class AuditRegression(unittest.TestCase):
                 self.assertTrue(agent.unsupported_options(command))
             self.assertEqual(agent.unsupported_options('set_wrapper_cfg disable'), [])
             self.assertEqual(agent.unsupported_options('set_wrapper_cfg -style none -port functional_in'), [])
+
+    def test_unrequested_reset_is_rejected_before_tool_call(self):
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options("set_scan_signal -type reset -port reset", "Single-clock scan insertion"))
+            self.assertTrue(agent.unsupported_options("set_scan_signal -type reset -port reset_n", "没有复位端口，reset_n 不作为 reset"))
+
+    def test_associated_clock_fix_requires_actual_typed_pin_value(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Pin 'wrong/Q' defined in option '-associated_internal_clocks' does not exist.",
+                    located_object="wrong/Q", root_cause="wrong pin path", fix="Change associated_internal_clocks to latch/Q")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text("set_scan_signal -type clock -port clk -associated_internal_clocks latch/Q\nexit\n")
+        headers = ["Port", "PortProperty", "SignalType", "OffState", "AssociatedInternal", "Usage"]
+        report = run / "reports/rpt_scan_signal.audit.rpt"
+        report.write_text(''.join(f'{value:<28}' for value in headers) + '\n' +
+                          ''.join(f'{value:<28}' for value in ["clk", "pre_existing", "clock", "0", "wrong/Q", ""]) + '\n')
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        report.write_text(report.read_text().replace("wrong/Q", "latch/Q"))
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
+
+    def test_wrapper_disable_needs_actual_configuration_row(self):
+        item = dict(self.item, evidence_excerpt="W wrp_1 10 wrp_si1 wrp_so1", located_object="wrapper chain wrp_1",
+                    root_cause="unrequested wrapper", fix="Removed all set_wrapper_cfg enable commands")
+        (self.out / "runs/R1/reports/scan_chain.rpt").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        report = self.out / "runs/R2/reports/rpt_wrapper_cfg.audit.rpt"
+        report.write_text("WrapperConfigurationParameter Value\nenable Y\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][0]["verify"]["resolved"])
+        report.write_text("WrapperConfigurationParameter Value\nenable N\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
 
     def test_cell_filter_preflight_uses_real_properties_and_skips_pin_queries(self):
         (self.root / "tool_help.json").write_text(json.dumps({"__cell_properties": "ref_name cell string A,R\nis_sequential cell boolean A,R"}))
@@ -340,6 +382,14 @@ class AuditRegression(unittest.TestCase):
         self.assertIn(str(before), mapping[0]["dft_config"])
         self.assertEqual(mapping[0]["dofile_ref"], "L1")
 
+    def test_reset_level_normalization_follows_observed_input_paths(self):
+        hints = {"top": {"rst_ni": {"inactive_level": 1, "traced_targets": 10}}}
+        script = "present_design top\nset_scan_signal -type reset -port rst_ni -off_state 0\nexit\n"
+        self.assertIn("-off_state 1", agent.normalize_reset_levels(script, hints))
+        mapping = "set_scan_signal -type reset -port rst_ni -off_state 0"
+        self.assertIn("-off_state 1", agent.normalize_reset_levels(mapping, hints, script))
+        self.assertEqual(agent.normalize_reset_levels(script, {}), script)
+
     def generate_patch(self, responses, base="set_scan_cfg -chain_count 4\nexit\n", mapping=None):
         run = self.out / "runs/R2"
         (self.root / "task_spec.md").write_text("Configure a scan chain count.")
@@ -354,6 +404,10 @@ class AuditRegression(unittest.TestCase):
         dofile, meta = self.generate_patch([{"dofile_edits": [{"old": "exit\n", "new": "rpt_scan_cfg\nexit\n"}]}])
         self.assertEqual(dofile, "set_scan_cfg -chain_count 4\nrpt_scan_cfg\nexit\n")
         self.assertEqual(meta["requirement_mapping"][0]["dft_config"], "set_scan_cfg -chain_count 4")
+
+    def test_explicit_empty_patch_keeps_current_valid_script(self):
+        dofile, _ = self.generate_patch([{"dofile_edits": [], "summary": "Keep the current valid configuration"}])
+        self.assertEqual(dofile, "set_scan_cfg -chain_count 4\nexit\n")
 
     def test_changed_configuration_requires_updated_mapping(self):
         edit = {"dofile_edits": [{"old": "-chain_count 4", "new": "-chain_count 8"}]}
@@ -476,12 +530,12 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(result["returncode"], 0)
         self.assertIn("original reached its end", (self.out / "runs/R1/R1.log").read_text())
 
-    def run_main(self, task2=False, diagnosed=False, generation_seconds=17):
+    def run_main(self, task2=False, diagnosed=False, generation_seconds=17, task_spec="Generate a real post-scan netlist."):
         input_dir = self.root / "work/input/hidden_case_1/input"
         output_dir = self.root / "work/output/hidden_case_1"
         (input_dir / "netlist").mkdir(parents=True)
         (input_dir / "lib").mkdir()
-        (input_dir / "task_spec.md").write_text("Generate a real post-scan netlist.")
+        (input_dir / "task_spec.md").write_text(task_spec)
         (input_dir / "limitations.md").write_text("总时间 100 秒\n工具调用次数 2")
         (input_dir / "netlist/pre_scan.v").write_text("module top(); endmodule\n")
         (input_dir / "lib/stdcells.lib").write_text("cell(DFF) {}\n")
@@ -565,6 +619,16 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(issue["found"]["run_ref"], "R1")
         self.assertEqual(issue["attempts"][0]["fix"]["artifact_ref"], ["F1"])
         self.assertEqual(issue["attempts"][0]["verify"]["run_ref"], "R2")
+
+    def test_final_check_keeps_shift_register_evidence_requirement(self):
+        groups = [{"root": "top", "start_template": "sff", "end_template": "ff", "index_tuples": [[]],
+                   "length": 10, "scan_data_in_pin": "SI", "scan_data_out_pin": "Q"}]
+        with patch.object(agent, "shift_register_groups", return_value=groups), \
+             patch.object(agent, "configure_shift_segments", side_effect=lambda script, groups, spec: (script, [])):
+            result, decision, _, _, _ = self.run_main(task_spec="所有长移位寄存器均配置为 scan segment")
+        self.assertEqual(result, 2)
+        self.assertFalse(decision["tool_checks_passed"])
+        self.assertIn("input-derived shift-register", decision["summary"])
 
     def test_tool_is_not_started_when_generation_consumes_reserve(self):
         result, decision, captures, _, _ = self.run_main(generation_seconds=95)

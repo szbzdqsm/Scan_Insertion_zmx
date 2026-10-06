@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
-from netlist_repair import RepairRejected, edits_allowed, prepare_repair
-from netlist_structure import shift_register_context, shift_register_groups
-from report_validation import chain_problems, chain_rows, segment_problems
+from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerprint_paths, prepare_repair
+from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups
+from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, segment_problems
+from dofile_recipe import configure_shift_segments, normalize_unrequested_counts
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -286,6 +287,11 @@ def unsupported_options(dofile: str, task_spec: str | None = None) -> list[str]:
         if not re.match(r"\s*set_scan_signal\b", line):
             continue
         signal_type = re.search(r"-type\s+(\w+)", line)
+        if signal_type and signal_type.group(1) == "reset" and task_spec is not None:
+            if not re.search(r"复位|reset|rst", task_spec, re.I):
+                problems.append("Task does not request a reset signal; remove the invented reset declaration")
+            elif re.search(r"没有复位端口|不作为.{0,20}(?:reset|复位)|no reset port", task_spec, re.I):
+                problems.append("Task explicitly says no reset declaration is required; preserve ordinary functional inputs")
         port = re.search(r"-port\s+([A-Za-z_][\w]*)\b", line)
         if signal_type and port:
             key, kind = (design, port.group(1)), signal_type.group(1)
@@ -503,12 +509,12 @@ def append_audit_reports(dofile: str, run_dir: Path) -> str:
     if not cache.is_file():
         return dofile
     known = json.loads(cache.read_text())
-    commands = [name for name in ("rpt_scan_signal", "rpt_scan_cfg", "rpt_scan_drc_rule_handling")
+    commands = [name for name in ("rpt_scan_signal", "rpt_scan_cfg", "rpt_scan_drc_rule_handling", "rpt_wrapper_cfg")
                 if name in known]
     # Incremental repairs inherit the preceding script. Replace our own report
     # block so each round records its current state once, in its own directory.
     dofile = re.sub(r"(?m)^\n?# Agent audit reports from actual tool state\n"
-                    r"(?:rpt_scan_(?:signal|cfg|drc_rule_handling) > [^\n]+\.audit\.rpt\"?\n)+"
+                    r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling)|wrapper_cfg) > [^\n]+\.audit\.rpt\"?\n)+"
                     r"(?:# End agent audit reports\n)?", "", dofile)
     extra = "\n# Agent audit reports from actual tool state\n" + "\n".join(
         f'{name} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name in commands) + "\n# End agent audit reports\n"
@@ -619,10 +625,32 @@ def normalize_wrapper_roots(dofile: str, configuration: str | None = None) -> st
     return "\n".join(result) + "\n"
 
 
+def normalize_reset_levels(dofile: str, hints: dict[str, Any], configuration: str | None = None) -> str:
+    """Set reset inactivity from actual simple Liberty clear/preset paths."""
+    designs = re.findall(r"(?m)^\s*present_design\s+([\w$]+)\s*$", configuration or "")
+    current = designs[0] if len(set(designs)) == 1 else ""
+    result = []
+    for line in dofile.splitlines():
+        present = re.match(r"\s*present_design\s+([\w$]+)\s*$", line)
+        if present:
+            current = present.group(1)
+        if re.match(r"\s*set_scan_signal\b", line) and re.search(r"-type\s+reset\b", line):
+            port = re.search(r"-port\s+([A-Za-z_][\w$]*)\b", line)
+            hint = hints.get(current, {}).get(port.group(1)) if port else None
+            if hint:
+                level = str(hint["inactive_level"])
+                if re.search(r"-off_state\s+[01]\b", line):
+                    line = re.sub(r"(-off_state\s+)[01]\b", lambda match: match.group(1) + level, line)
+                elif "-off_state" not in line:
+                    line = line.rstrip() + " -off_state " + level
+        result.append(line)
+    return "\n".join(result) + "\n"
+
+
 def apply_dofile_edits(base: str, edits: Any) -> str:
     """Validate unique, disjoint spans against the same original round, then apply."""
-    if not isinstance(edits, list) or not 1 <= len(edits) <= 12:
-        raise ValueError("dofile_edits must contain 1 to 12 localized replacements")
+    if not isinstance(edits, list) or not 0 <= len(edits) <= 12:
+        raise ValueError("dofile_edits must contain 0 to 12 localized replacements")
     replacements = []
     for edit in edits:
         if not isinstance(edit, dict) or not isinstance(edit.get("old"), str) or not isinstance(edit.get("new"), str):
@@ -735,7 +763,9 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     input_dir: Path, run_dir: Path, deadline: float | None = None,
                     base_dofile: str | None = None,
                     previous_mapping: list[dict[str, Any]] | None = None,
-                    catalog: dict[str, dict[str, str]] | None = None) -> tuple[str, dict[str, Any]]:
+                    catalog: dict[str, dict[str, str]] | None = None,
+                    segments: list[dict[str, Any]] | None = None,
+                    control_hints: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
@@ -745,6 +775,8 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
     if catalog:
         context += "\n# Exact evidence catalog from the preceding actual tool run\n" + json.dumps(catalog, ensure_ascii=False)
         (run_dir / "llm_evidence_catalog.json").write_text(json.dumps(catalog, ensure_ascii=False, indent=2))
+    if control_hints:
+        context += "\n# Reset inactive levels traced from actual Liberty clear/preset functions and input connections\n" + json.dumps(control_hints, ensure_ascii=False)
     spec = read_text(input_dir / "task_spec.md", 60000)
     netlist_rule = (("Task 1 strictly forbids modifying Pre-scan input netlists. Return no netlist_edits."
                      if task == "task1" else "This case strictly forbids modifying Pre-scan input netlists. Return no netlist_edits.")
@@ -763,6 +795,12 @@ Configure indexed scan data port names with set_scan_cfg -si_port_format and -so
 Return exactly one compact JSON object with keys: dofile (complete Tcl script as a string), summary (one short sentence), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_id or evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Use concise scripts with few comments and brief diagnosis fields; execution time is limited. Task 1 requires a nonempty mapping of key requirements; dft_config must contain literal Tcl statements copied from your returned Dofile, never descriptions or invented placeholders for collections. Prefer evidence_id such as E1 from the supplied actual evidence catalog; the runtime inserts its exact prior-run excerpt. Otherwise evidence_excerpt must be an exact short contiguous excerpt copied from the supplied PREVIOUS run's tool log or report. Never combine fragments, omit text inside a line, or cite the task specification as tool evidence. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it. Only declare reset ports explicitly identified as resets by the task; functional data ports must retain their role. Wrapper shift and capture controls should use separate newly created ports, unless the task explicitly requires reusing existing ones.
 The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Load multiple netlists together in one load_netlist file-list command with explicit -top when needed; separate load_netlist calls can change the scan engine's analyzed top. Use property names from the supplied actual cell property table, and get_property/get_attribute (not the nonexistent get_attr). For a user-defined dedicated wrapper, -interface is a list of semantic_role actual_module_port polarity triples; semantic roles are shift_clk, capture_en, shift_en, cti, cto, cfi, cfo. Read the provided module port declarations. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
     user = f"{mode}\n\n{context}\n\nReturn the JSON object now."
+    if segments:
+        system += ("\nThe runtime compiles ALL supplied actual shift-register candidates into set_scan_segment "
+                   "commands and preserves their actual scan-enable pin connections. You may omit your own segment "
+                   "commands and focus on clock, scan, wrapper and output settings. Keep ordinary top-level "
+                   "examine_scan_drc/examine_scan_chain before insertion, as the recipe is inserted before them. "
+                   "Any segment commands you do provide must be separate statements or pure segment loops.")
     if base_dofile is not None:
         system += ("\nFor this repair, prefer dofile_edits: an array of at most 12 objects with old and new literal "
                    "Tcl spans copied exactly from the CURRENT Dofile. Each old span must occur once; provide enough "
@@ -783,6 +821,8 @@ The actual read-only input directory is {input_dir}. The current run directory a
         raw = ask(client, system, user, request_log=run_dir / log_name)
         try:
             result = json_from_response(raw)
+            if not isinstance(result.get("issue_resolutions", []), list):
+                raise ValueError("issue_resolutions must be an array of evidence-backed issue objects")
             for issue in result.get("issue_resolutions", []):
                 if isinstance(issue, dict) and issue.get("evidence_id"):
                     evidence = (catalog or {}).get(str(issue["evidence_id"]))
@@ -791,7 +831,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
                     issue["evidence_excerpt"] = evidence["excerpt"]
             # Normalize this spelling without changing the proposed Tcl or inventing a repair.
             dofile = result.get("dofile", result.get("dfile"))
-            if result.get("dofile_edits") and base_dofile is not None:
+            if "dofile_edits" in result and base_dofile is not None:
                 dofile = apply_dofile_edits(base_dofile, result["dofile_edits"])
             if "requirement_mapping" not in result and previous_mapping:
                 result["requirement_mapping"] = [dict(item) for item in previous_mapping]
@@ -799,16 +839,36 @@ The actual read-only input directory is {input_dir}. The current run directory a
                 raise ValueError("LLM JSON is missing a non-empty dofile")
             adapted = normalize_wrapper_roots(normalize_scan_port_formats(
                 normalize_load_file_lists(normalize_report_redirection(dofile))))
+            adapted = normalize_reset_levels(adapted, control_hints or {})
+            adapted, segment_references = configure_shift_segments(adapted, segments or [], spec)
             if adapted.strip() != dofile.strip():
                 (run_dir / "llm_normalization.json").write_text(json.dumps({
-                    "kind": "official_command_argument_adapters", "original_dofile": dofile,
+                    "kind": "documented_api_and_input_derived_recipes", "original_dofile": dofile,
                     "executed_dofile": adapted}, ensure_ascii=False, indent=2))
                 dofile = adapted
+            if segment_references:
+                mappings = result.get("requirement_mapping", [])
+                if not isinstance(mappings, list):
+                    raise ValueError("requirement_mapping must be an array")
+                if task == "task1" and not mappings:
+                    raise ValueError("Task 1 still needs model-provided mappings for its other key requirements")
+                recipe_requirement = "All actual input-derived long shift registers remain indivisible scan segments"
+                mappings = [item for item in mappings if not isinstance(item, dict) or item.get("requirement") != recipe_requirement]
+                for item in mappings:
+                    if isinstance(item, dict) and isinstance(item.get("dft_config"), str):
+                        item["dft_config"] = normalize_unrequested_counts(item["dft_config"], spec)
+                    if isinstance(item, dict) and "set_scan_segment" in str(item.get("dft_config", "")):
+                        item["dft_config"] = "; ".join(segment_references)
+                mappings.append({"requirement": recipe_requirement,
+                                 "dft_config": "; ".join(segment_references)})
+                result["requirement_mapping"] = mappings
+                (run_dir / "llm_shift_register_recipe.json").write_text(json.dumps({"input_groups": segments,
+                    "actual_commands": segment_references}, ensure_ascii=False, indent=2))
             for item in result.get("requirement_mapping", []):
                 if isinstance(item, dict) and isinstance(item.get("dft_config"), str):
                     clauses = re.split(r";\s*(?=[A-Za-z_]+\b)", item["dft_config"])
                     item["dft_config"] = "; ".join(normalize_wrapper_roots(
-                        normalize_scan_port_formats(normalize_load_file_lists(clause)), dofile).strip() for clause in clauses)
+                        normalize_reset_levels(normalize_scan_port_formats(normalize_load_file_lists(clause)), control_hints or {}, dofile), dofile).strip() for clause in clauses)
             problems = unsupported_options(dofile, spec)
             if task == "task1":
                 mappings = result.get("requirement_mapping")
@@ -1045,14 +1105,22 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
                     value = int(cells[col])
                     max_length_value = max(max_length_value or 0, value)
         if max_length_value is not None:
-            lengths = ([int(row["Length"]) for row in actual_chains] if actual_chains else
+            exempt = ctl_overlength_exceptions(actual_chains, report_files, task_spec, log_path, max_length_value) if actual_chains else set()
+            lengths = ([int(row["Length"]) for row in actual_chains if row["Chain"] not in exempt] if actual_chains else
                        [int(value) for value in re.findall(r"(?im)^\s*(?:I\s*)?\d+\s+(\d+)\s+\S+\s+\S+", report_text)])
             if not actual_chains:
                 lengths.extend(int(value) for value in re.findall(r"Scan chain\s+['\"]?\w+['\"]?[^\n]*?includes\s+(\d+)\s+cells", log, re.I))
             if not lengths:
                 problems.append(f"Could not verify scan-chain maximum length {max_length_value} from reports")
             elif max_length_value is not None and max(lengths) > max_length_value:
-                problems.append(f"Scan-chain length {max(lengths)} exceeds the specified maximum {max_length_value}")
+                bad_rows = [row for row in actual_chains if row["Chain"] not in exempt and int(row["Length"]) > max_length_value]
+                if bad_rows:
+                    for row in bad_rows[:3]:
+                        role = "Wrapper" if row["Chain"].startswith("W") else "Internal scan"
+                        problems.append(f"{role} chain {row['Chain']} length {row['Length']} exceeds maximum {max_length_value}; "
+                                        f"actual evidence {row['source']}:L{row['line']}. Check that chain's own configuration.")
+                else:
+                    problems.append(f"Scan-chain length {max(lengths)} exceeds the specified maximum {max_length_value}")
 
     if re.search(r"DRC.{0,40}(?:报告|report|零|无|清零|zero|no\s+violation)|(?:零|无|清零).{0,30}DRC", task_spec, re.I):
         drc_reports = [p for p in report_files if "drc" in p.name.lower() or "violation" in p.name.lower()]
@@ -1114,12 +1182,22 @@ def evidence_catalog(run_dir: Path, output_dir: Path, maximum: int = 24) -> dict
     files = run_evidence_files(run_dir)
     files.sort(key=lambda path: (path.suffix != ".log", path.stat().st_size))
     for path in files:
+        if path.suffix == ".log" or path.stat().st_size > 5000:
+            continue
+        text = read_text(path, 5001).strip()
+        if not re.search(r"Chain\s+Length\s+Input|Name\s+SegmentProperty\s+Length|WrapperConfigurationParameter|ScanConfigurationParameter", text):
+            continue
+        catalog[f"E{len(catalog)+1}"] = {"source": path.relative_to(output_dir).as_posix(),
+                                       "locator": f"L1-L{len(text.splitlines())}", "excerpt": text}
+        if len(catalog) >= maximum:
+            return catalog
+    for path in files:
         stat = path.stat()
         for window in evidence_windows(str(path), stat.st_mtime_ns, stat.st_size):
             for number, line in window:
                 if "CMD-0034" in line or line.lstrip().startswith("#"):
                     continue
-                category = re.search(r"DFTR[-_]?(?:\d+|TIE[01])|\[(?:ERROR|FATAL)\]|Total violations|^\s*[IW]\s+\d+\s+\d+", line, re.I)
+                category = re.search(r"DFTR[-_]?(?:\d+|TIE[01])|\[(?:ERROR|FATAL)\]|^\s*[IW]\s+\S+\s+\d+", line, re.I)
                 if not category or line in seen or counts.get(category.group(), 0) >= 2:
                     continue
                 seen.add(line)
@@ -1220,6 +1298,9 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         if not isinstance(item, dict):
             continue
         cited = str(item.get("evidence_excerpt", item.get("excerpt", ""))).strip()
+        if re.fullmatch(r"Total violations:\s*0", cited, re.I):
+            # A clean DRC summary cannot discover an unrelated configuration fault.
+            continue
         evidence = locate_evidence(files, output_dir, cited)
         if not evidence:
             continue
@@ -1278,13 +1359,18 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                     return {"source": path.relative_to(output_dir).as_posix(),
                             "locator": f"L{first}" if first == last else f"L{first}-L{last}",
                             "excerpt": "\n".join(lines[first-1:last])}
-    if "set_scan_signal" in subject:
+    if "set_scan_signal" in subject or "associated_internal_clocks" in subject:
         for command in logical_lines:
             if not re.match(r"\s*set_scan_signal\b", command):
                 continue
-            options = dict(re.findall(r"-([a-z_]+)\s+([\w$]+)", command))
+            words = literal_tcl_words(command)
+            options = {key.removeprefix("-"): value.strip('"{}') for key, value in zip(words[1::2], words[2::2])}
             port, kind = options.get("port", ""), options.get("type", "")
-            if not port or not kind or not re.search(r"(?<![\w$])" + re.escape(port) + r"(?![\w$])", subject):
+            association = options.get("associated_internal_clocks", "")
+            targeted = bool(re.search(r"(?<![\w$])" + re.escape(port) + r"(?![\w$])", subject))
+            if association and "associated_internal_clocks" in subject and association in subject:
+                targeted = True
+            if not port or not kind or not targeted:
                 continue
             for path in files:
                 if "signal" not in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
@@ -1300,11 +1386,21 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                             if row.get("Port") != port or row.get("SignalType", "").split("(")[0] != kind:
                                 continue
                             if any(key in options and row.get(column) != options[key]
-                                   for key, column in (("off_state", "OffState"), ("usage", "Usage"))):
+                                   for key, column in (("off_state", "OffState"), ("usage", "Usage"),
+                                                       ("associated_internal_clocks", "AssociatedInternal"))):
                                 continue
                             return {"source": path.relative_to(output_dir).as_posix(),
                                     "locator": f"L{number}", "excerpt": line.strip()}
-    if "set_scan_cfg" in subject and re.search(r"\[ERROR\]|unknown (?:option|argument)", issue["found"]["excerpt"], re.I):
+    if "wrapper" in subject.lower() and re.search(r"remove|disabl|删除|移除|禁用", fix, re.I):
+        if not re.search(r"(?m)^\s*set_wrapper_cfg\s+enable\b", dofile):
+            for path in files:
+                if "wrapper_cfg" in path.name.lower():
+                    with path.open(encoding="utf-8", errors="replace") as stream:
+                        for number, line in enumerate(stream, 1):
+                            if re.fullmatch(r"\s*enable\s+N\s*", line):
+                                return {"source": path.relative_to(output_dir).as_posix(),
+                                        "locator": f"L{number}", "excerpt": line.strip()}
+    if "set_scan_cfg" in subject:
         mentioned = set(re.findall(r"-([a-z_]+)", diagnosis.get("located_object", "") + " " + fix))
         for command in logical_lines:
             if not re.match(r"\s*set_scan_cfg\b", command):
@@ -1328,6 +1424,22 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
     """Accept conservative, issue-specific positive evidence from a real rerun."""
     found = issue["found"]["excerpt"]
     diagnosis = issue["diagnosis"]
+    if "Failed to retrieve the design" in found or re.search(r"Nothing matched for ['\"]design['\"]", found):
+        for path in files:
+            if path.suffix != ".log":
+                continue
+            script = read_text(path.parent / "deliverables" / f"{path.parent.name}.dofile", 100000)
+            top = re.search(r"(?m)^\s*present_design\s+([\w$]+)\s*$", script)
+            if top:
+                for report in files:
+                    if report.suffix.lower() in {".rpt", ".report", ".txt"}:
+                        with report.open(encoding="utf-8", errors="replace") as stream:
+                            for number, line in enumerate(stream, 1):
+                                if re.fullmatch(r"\s*Design:\s*" + re.escape(top.group(1)) + r"\s*", line):
+                                    return {"source": report.relative_to(output_dir).as_posix(),
+                                            "locator": f"L{number}", "excerpt": line.strip()}
+                                if number >= 20:
+                                    break
     if re.search(r"Cannot execute command 'examine_scan_drc' after executing 'insert_dft_logic'", found):
         for path in files:
             if path.suffix != ".log":
@@ -1479,6 +1591,7 @@ def main() -> int:
     error_message = None
     start = time.monotonic()
     final_run_dir: Path | None = None
+    integrity_problems: list[str] = []
     try:
         if not input_dir.is_dir():
             raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
@@ -1502,6 +1615,7 @@ def main() -> int:
         generation_error = ""
         validation_problems: list[str] = []
         static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "")
+        control_hints = reset_polarity_hints(netlists, libs)
         expected_segments = (shift_register_groups(netlists, libraries=libs) if
                              re.search(r"所有.{0,20}移位寄存器|all.{0,20}shift.{0,20}register", task_spec, re.I) else [])
         for index in range(1, max_calls + 1):
@@ -1541,6 +1655,12 @@ def main() -> int:
                 context += f"\n# EQY-proven current netlist directory\n{active_netlist_root}\n"
             if validation_problems:
                 context += "\n# Independent output-validator findings from previous round\n" + "\n".join(validation_problems)
+            pending = [issue for issue in issue_records if not issue.get("attempts", [{}])[-1].get("verify", {}).get("resolved")]
+            if pending:
+                context += ("\n# Existing audit records awaiting positive verification\n" +
+                            json.dumps(pending, ensure_ascii=False)[:8000] +
+                            "\nPreserve settings that already passed tool checks. Do not invent a new problem from a clean DRC summary. "
+                            "Add only the actual reports needed for positive verification, or correct a diagnosis using its existing real discovery evidence.\n")
             if task == "task2" and index == 1 and original is not None:
                 # R1 is a faithful diagnostic run of the supplied Dofile. Preserve the original as evidence.
                 dofile, meta = original, {"summary": "Run the supplied original Dofile to gather diagnostic evidence.", "requirement_mapping": [], "issue_resolutions": []}
@@ -1561,7 +1681,8 @@ def main() -> int:
                                                  input_dir, run_dir, start + timeout_total - finalize_reserve - 1,
                                                  base_dofile=generation_base if run_records else None,
                                                  previous_mapping=generation_mapping,
-                                                 catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir) if run_records else None)
+                                                 catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir) if run_records else None,
+                                                 segments=expected_segments, control_hints=control_hints)
                     if meta.get("netlist_edits"):
                         edits = meta["netlist_edits"]
                         if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
@@ -1617,7 +1738,17 @@ def main() -> int:
                 netlist_change_ids.append(change["change_id"])
                 changes.append(change)
             final_dofile = dofile
+            snapshot = {}
+            if active_netlist_root != input_dir / "netlist":
+                protected = list(active_netlists.values())
+                protected.extend(path for path in (output_dir / "lec").rglob("*")
+                                 if path.is_file() and path.name in {"check.eqy", "eqy.log", "aggregate.log", "PASS"})
+                snapshot = fingerprint_paths(protected)
+                (run_dir / "llm_protected_repair_fingerprints.json").write_text(json.dumps(snapshot, indent=2))
             remaining = timeout_total - (time.monotonic() - start)
+            if remaining <= finalize_reserve + 1:
+                generation_error = f"Insufficient time after fingerprinting before {rid}"
+                break
             per_run_timeout = max(1, min(900, int(remaining - finalize_reserve)))
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path,
                               abort_on_error=not (task == "task2" and index == 1))
@@ -1632,6 +1763,15 @@ def main() -> int:
             previous = dofile
             final_run_dir = run_dir
             ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments)
+            modified = changed_paths(snapshot)
+            if modified:
+                integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
+                record["repair_integrity_passed"] = False
+                (run_dir / "repair_integrity_failure.json").write_text(json.dumps({"modified_paths": modified}, indent=2))
+                ok = False
+                problems.extend(integrity_problems)
+            elif snapshot:
+                record["repair_integrity_passed"] = True
             validation_problems = problems
             if meta.get("requirement_mapping"):
                 requirement_mapping = []
@@ -1643,6 +1783,9 @@ def main() -> int:
             record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id,
                                netlist_change_ids)
             verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok)
+            validation_problems = problems + issue_audit_problems(task, issue_records, changes)
+            if integrity_problems:
+                break
             unresolved = any(issue.get("found", {}).get("verified") and
                              not (issue.get("attempts") and issue["attempts"][-1].get("verify", {}).get("resolved"))
                              for issue in issue_records)
@@ -1664,7 +1807,11 @@ def main() -> int:
         # Copy actual tool-created products only.
         copy_tree_contents(final_run_dir / "reports", reports)
         copy_tree_contents(final_run_dir / "deliverables", deliverables)
-        tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile, run_records[-1]["exit_status"])
+        tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile,
+                                                         run_records[-1]["exit_status"], expected_segments)
+        if integrity_problems:
+            tool_checks_passed = False
+            final_problems.extend(integrity_problems)
         audit_problems = issue_audit_problems(task, issue_records, changes)
         audit_complete = not audit_problems
         passed = tool_checks_passed and audit_complete
@@ -1683,7 +1830,8 @@ def main() -> int:
             "issue_resolutions": issue_records,
             "tool_runs": [{"tool_call_id": r["run_id"], "log_file": r["log_file"],
                            "exit_status": r["exit_status"], "returncode": r.get("returncode"),
-                           "elapsed_seconds": r.get("elapsed_seconds"), "artifacts": r.get("artifacts", [])}
+                           "elapsed_seconds": r.get("elapsed_seconds"), "artifacts": r.get("artifacts", []),
+                           **({"repair_integrity_passed": r["repair_integrity_passed"]} if "repair_integrity_passed" in r else {})}
                           for r in run_records],
             "file_changes": changes,
             "netlist_repair_attempts": repair_attempts,

@@ -8,6 +8,7 @@
 4. 固定 EQY 配置用原始输入作 gold、候选作 gate，导入功能 Liberty 模型并检查层级。分别证明任务顶层和每个被编辑模块，覆盖未被当前顶层引用的辅助模块。证明不接受模型提供的假设，不使用 `read_liberty -lib` 的黑盒模型。
 5. 所有证明均实际退出码 0 且存在 EQY PASS 标记，才把候选路径提供给后续 ScanInsertion。保存完整日志、配置、实际 Verilog diff 和 F 编号；`lec_ref` 指向实际日志拼接的 `aggregate.log`，另保留各项 `lec_refs`。
 6. FAIL、UNPROVEN、ERROR 或超时均保留现场并拒绝候选。此版本遇到拒绝会保留最后实际工具轮次及失败原因；尚未实现拒绝后连续生成多个网表修复方案。
+7. 候选和实际证明文件在 ScanInsertion 前后核对 SHA-256 和链接目标，记录在 `runs/Rn/llm_protected_repair_fingerprints.json`。发现改变即阻断本轮通过；原始工具退出状态仍按实际保存。这是前后完整性检查，不是额外的操作系统写保护。
 
 ## 验证范围与限制
 

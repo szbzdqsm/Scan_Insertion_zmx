@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,31 @@ from typing import Any
 
 class RepairRejected(RuntimeError):
     pass
+
+
+def fingerprint_paths(paths: list[Path]) -> dict[str, dict[str, str]]:
+    """Bind the retained candidate and proof artifacts to their exact bytes."""
+    result = {}
+    for path in sorted(set(paths)):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        result[str(path)] = {"resolved": str(path.resolve()), "sha256": digest.hexdigest()}
+    return result
+
+
+def changed_paths(snapshot: dict[str, dict[str, str]]) -> list[str]:
+    changes = []
+    for name, before in snapshot.items():
+        try:
+            after = fingerprint_paths([Path(name)])[name]
+        except OSError:
+            changes.append(name)
+            continue
+        if before != after:
+            changes.append(name)
+    return changes
 
 
 def edits_allowed(task: str, spec: str) -> bool:
@@ -97,6 +123,8 @@ def containing_module(path: Path, excerpt: str) -> str:
                     raise RepairRejected("Every changed span must belong to a concrete module")
                 return module
             buffer = buffer[-max(1, len(excerpt)-1):]
+            if re.match(r"\s*endmodule\b", line):
+                module = ""
     raise RepairRejected("Cannot locate the changed module for proof coverage")
 
 

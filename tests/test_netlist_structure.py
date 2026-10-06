@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-from netlist_structure import shift_register_context  # noqa: E402
+from netlist_structure import reset_polarity_hints, shift_register_context  # noqa: E402
 
 
 class StructureTests(unittest.TestCase):
@@ -52,6 +52,19 @@ class StructureTests(unittest.TestCase):
                          "sky130_fd_sc_hd__dfxtp_1 second (.D(start), .CLK(clk), .Q(q));\n"
                          "sky130_fd_sc_hd__dfxtp_1 third (.D(start), .CLK(clk), .Q(other));\nendmodule\n")
         self.assertEqual(json.loads(shift_register_context([source], minimum=2).split("\n", 1)[1]), [])
+
+    def test_reset_inactive_level_comes_from_function_and_inversion(self):
+        library = self.root / "cells.lib"
+        library.write_text('cell (sky130_fd_sc_hd__dfrtp_1) {\nclear : "(!RESET_B)";\n}\n')
+        source = self.root / "input.v"
+        common = ("module child(input clk,rb,d,output q);\n"
+                  "sky130_fd_sc_hd__dfrtp_1 ff (.CLK(clk), .D(d), .RESET_B(rb), .Q(q));\nendmodule\n")
+        source.write_text(common + "module top(input clk,rst,d,output q);\nchild u (.clk(clk),.rb(rst),.d(d),.q(q));\nendmodule\n")
+        self.assertEqual(reset_polarity_hints([source], [library])["top"]["rst"]["inactive_level"], 1)
+        source.write_text(common + "module top(input clk,rst,d,output q);\n"
+                         "sky130_fd_sc_hd__clkinv_1 inv (.A(rst), .Y(rb));\n"
+                         "child u (.clk(clk),.rb(rb),.d(d),.q(q));\nendmodule\n")
+        self.assertEqual(reset_polarity_hints([source], [library])["top"]["rst"]["inactive_level"], 0)
 
 
 if __name__ == "__main__":

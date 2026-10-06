@@ -99,6 +99,36 @@ def chain_problems(rows: list[dict[str, Any]], spec: str) -> list[str]:
     return problems
 
 
+def ctl_overlength_exceptions(rows: list[dict[str, Any]], paths: list[Path], spec: str,
+                              log: Path, maximum: int) -> set[str]:
+    """Accept only explicitly permitted, reported indivisible CTL wrapper atoms."""
+    permission = any("SCAN-4902" in line and "wrapper" in line.lower() and
+                     re.search(r"可忽略|允许|ignore", line, re.I) and
+                     not re.search(r"不允许|不得|不可忽略|not allowed", line, re.I) for line in spec.splitlines())
+    if not permission:
+        return set()
+    warning_partitions = set()
+    with log.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if "[WARNING]" in line and "SCAN-4902" in line:
+                match = re.search(r"Partition:\s*(\S+)\(Wrapper\)", line)
+                if match:
+                    warning_partitions.add(match.group(1))
+    segments = []
+    for path in paths:
+        if "segment" in path.name.lower():
+            segments.extend(row for row in report_rows(path, {"SegmentProperty", "Length", "ChainName"})
+                            if row["SegmentProperty"] == "inferred_from_ctl" and row["Length"].isdigit())
+    allowed = set()
+    for row in rows:
+        if not row["Chain"].startswith("W") or row["Partition"] not in warning_partitions:
+            continue
+        name = row["Chain"].split()[-1]
+        if any(segment["ChainName"] == name and int(segment["Length"]) == int(row["Length"]) > maximum for segment in segments):
+            allowed.add(row["Chain"])
+    return allowed
+
+
 def segment_problems(paths: list[Path], expected: list[dict[str, Any]]) -> list[str]:
     if not expected:
         return []

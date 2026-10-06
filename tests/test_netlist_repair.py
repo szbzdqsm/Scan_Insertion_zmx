@@ -70,6 +70,26 @@ class RepairTests(unittest.TestCase):
         self.assertIn("select -assert-none A:blackbox", config)
         self.assertNotIn("assume", config)
 
+    def test_candidate_and_proof_changes_are_detected(self):
+        log = self.root / "eqy.log"
+        log.write_text("actual fixture log\n")
+        snapshot = repair.fingerprint_paths([self.source, log])
+        self.assertEqual(repair.changed_paths(snapshot), [])
+        log.write_text("changed fixture log\n")
+        self.assertEqual(repair.changed_paths(snapshot), [str(log)])
+        self.source.unlink()
+        self.assertIn(str(self.source), repair.changed_paths(snapshot))
+
+    def test_symlink_target_change_is_detected_even_with_identical_bytes(self):
+        other = self.root / "identical.v"
+        other.write_bytes(self.source.read_bytes())
+        link = self.root / "candidate.v"
+        link.symlink_to(self.source)
+        snapshot = repair.fingerprint_paths([link])
+        link.unlink()
+        link.symlink_to(other)
+        self.assertEqual(repair.changed_paths(snapshot), [str(link)])
+
 
 if __name__ == "__main__":
     unittest.main()

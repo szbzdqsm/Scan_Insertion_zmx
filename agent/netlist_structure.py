@@ -13,7 +13,8 @@ def normalized_net(value: str) -> str:
 
 
 def shift_register_groups(paths: list[Path], minimum: int = 10,
-                          libraries: list[Path] | None = None) -> list[dict[str, Any]]:
+                          libraries: list[Path] | None = None,
+                          reset_hints: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Find unbranched Q-to-D chains starting with actual scan FFs within a module."""
     if sum(path.stat().st_size for path in paths) > 64 * 1024 * 1024:
         return []
@@ -21,6 +22,8 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
     aliases: dict[str, dict[str, str]] = defaultdict(dict)
     clock_inversions: dict[str, dict[str, str]] = defaultdict(dict)
     library_pins: dict[str, set[str]] = defaultdict(set)
+    library_resets: dict[str, dict[str, int]] = defaultdict(dict)
+    input_ports: dict[str, set[str]] = defaultdict(set)
     for library in libraries or []:
         kind = ""
         with library.open(encoding="utf-8", errors="replace") as stream:
@@ -31,6 +34,12 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
                 pin = re.match(r'\s*pin\s*\(\s*"?([^"\s)]+)', line)
                 if pin and "__sdf" in kind:
                     library_pins[kind].add(pin.group(1))
+                reset = re.match(r'\s*(?:clear|preset)\s*:\s*"([^"\n]+)"', line)
+                if reset:
+                    expression = re.sub(r"[()\s]", "", reset.group(1))
+                    simple = re.fullmatch(r"(!?)([A-Za-z_][\w$]*)", expression)
+                    if simple:
+                        library_resets[kind][simple.group(2)] = 1 if simple.group(1) else 0
     current = ""
     pending: tuple[str, str, str] | None = None
     for path in paths:
@@ -43,13 +52,16 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
                     modules[current]
                 if not current:
                     continue
+                for declaration in re.finditer(r"\binput\s+([^;)]*)", line):
+                    words = re.findall(r"[A-Za-z_][\w$]*", re.split(r"\b(?:output|inout)\b", declaration.group(1))[0])
+                    input_ports[current].update(word for word in words if word not in {"input", "wire", "reg", "logic", "signed", "unsigned", "tri"})
                 assignment = re.match(r"\s*assign\s+(\\?[^\s=]+)\s*=\s*(\\?[^;\s]+)\s*;", line)
                 if assignment:
                     aliases[current][normalized_net(assignment.group(1))] = normalized_net(assignment.group(2))
                 if pending is None:
                     cell = re.match(r"\s*([\w$]+)\s+(\\\S+|[\w$\[\].]+)\s*\(", line)
                     if cell and cell.group(1) != "module" and (not cell.group(1).startswith("sky130_fd_sc_") or
-                            any(marker in cell.group(1) for marker in ("__df", "__sdf", "__buf_", "__clkbuf_", "__inv_"))):
+                            any(marker in cell.group(1) for marker in ("__df", "__sdf", "__buf_", "__clkbuf_", "__inv_", "__clkinv_"))):
                         pending = (cell.group(1), cell.group(2).removeprefix("\\"), line)
                 else:
                     pending = (pending[0], pending[1], pending[2] + line)
@@ -59,7 +71,7 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
                                 re.findall(r"\.([\w$]+)\s*\(\s*([^()]*)\)", text))
                     if any(marker in kind for marker in ("__buf_", "__clkbuf_")) and "X" in pins and "A" in pins:
                         aliases[current][pins["X"]] = pins["A"]
-                    elif "__inv_" in kind and "Y" in pins and "A" in pins:
+                    elif any(marker in kind for marker in ("__inv_", "__clkinv_")) and "Y" in pins and "A" in pins:
                         clock_inversions[current][pins["Y"]] = pins["A"]
                     else:
                         modules[current].append({"kind": kind, "instance": instance, "pins": pins})
@@ -111,6 +123,23 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
             net = inverted_clocks[net]
             parity = not parity
         return net, parity
+    if reset_hints is not None:
+        for root, cells in flattened.items():
+            levels: dict[str, set[int]] = defaultdict(set)
+            targets: dict[str, list[str]] = defaultdict(list)
+            for cell in cells:
+                for pin, inactive in library_resets[cell["kind"]].items():
+                    if pin not in cell["pins"]:
+                        continue
+                    driver, inverted = clock(cell["pins"][pin])
+                    name = driver.removeprefix(root + "::")
+                    if name not in input_ports[root]:
+                        continue
+                    levels[name].add(inactive ^ int(inverted))
+                    targets[name].append(cell["instance"] + "/" + pin)
+            reset_hints[root] = {name: {"inactive_level": next(iter(values)), "traced_targets": len(targets[name]),
+                                      "example_pins": targets[name][:3]}
+                                 for name, values in levels.items() if len(values) == 1}
     found = []
     for name, cells in flattened.items():
         sequential = [cell for cell in cells if "D" in cell["pins"] and "Q" in cell["pins"]
@@ -183,3 +212,9 @@ def shift_register_context(paths: list[Path], minimum: int = 10, limit: int = 16
             "Templates include concrete hierarchy and correlated indices; preserve existing scan enables and verify with the tool. "
             "This scan does not cover branched paths, concatenated/sliced bus bindings or arbitrary HDL.\n" +
             json.dumps(hints, ensure_ascii=False, indent=2))[:limit]
+
+
+def reset_polarity_hints(paths: list[Path], libraries: list[Path]) -> dict[str, Any]:
+    hints: dict[str, Any] = {}
+    shift_register_groups(paths, libraries=libraries, reset_hints=hints)
+    return {root: values for root, values in hints.items() if values}

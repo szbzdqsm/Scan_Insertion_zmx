@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-from report_validation import chain_problems, chain_rows, segment_problems  # noqa: E402
+from report_validation import chain_problems, chain_rows, ctl_overlength_exceptions, segment_problems  # noqa: E402
 
 
 def table(headers, rows, width=28):
@@ -71,6 +71,21 @@ class ReportValidation(unittest.TestCase):
         path.write_text(table(["Name", "Length", "SiPin", "SoPin"], [["seg0", "10", "u/r[0]/SI", "u/t[0]/Q"],
                                                                     ["seg1", "10", "u/r[1]/SI", "u/t[1]/Q"]]))
         self.assertEqual(segment_problems([path], groups), [])
+
+    def test_ctl_overlength_needs_permission_warning_and_same_indivisible_atom(self):
+        rows = chain_rows([self.report([["W wrp_1", "128", "wsi1", "wso1", "wse", "clk", "P"],
+                                       ["W wrp_2", "140", "wsi2", "wso2", "wse", "clk", "P"]])])
+        segment = self.root / "scan_segment.rpt"
+        segment.write_text(table(["Name", "SegmentProperty", "Length", "ChainName"],
+                                 [["ip/wrp", "inferred_from_ctl", "128", "wrp_1"], ["ip/wrp2", "inferred_from_ctl", "128", "wrp_2"]]))
+        log = self.root / "R1.log"
+        log.write_text("[WARNING] [SCAN-4902] max_length cannot be satisfied (Partition: P(Wrapper)).\n")
+        permission = "CTL 段不可拆分，wrapper 长度可超过上限，SCAN-4902 警告可忽略"
+        self.assertEqual(ctl_overlength_exceptions(rows, [segment], permission, log, 100), {"W wrp_1"})
+        self.assertEqual(ctl_overlength_exceptions(rows, [segment], "wrapper 上限 100", log, 100), set())
+        self.assertEqual(ctl_overlength_exceptions(rows, [], permission, log, 100), set())
+        log.write_text("no actual warning\n")
+        self.assertEqual(ctl_overlength_exceptions(rows, [segment], permission, log, 100), set())
 
 
 if __name__ == "__main__":
