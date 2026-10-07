@@ -714,6 +714,27 @@ class AuditRegression(unittest.TestCase):
                         root_cause="Missing -off_state and -usage parameters", fix="Declare off_state 0 and usage all")
             self.assertEqual(self.record(item)[0], [])
 
+    def test_data_port_format_fix_has_actual_chain_port_evidence(self):
+        headers = ["Chain", "Length", "Input", "Output", "Partition"]
+        def table(si, so):
+            return "Design: top\n" + ''.join(f'{v:<26}' for v in headers) + '\n' + ''.join(
+                f'{v:<26}' for v in ["I 1", "49", si, so, "Default_Partition"]) + '\n'
+        old = self.out / "runs/R1/reports/scan_chain.rpt"
+        old.write_text(table("old_si1", "old_so1"))
+        row = old.read_text().splitlines()[2].strip()
+        item = dict(self.item, evidence_excerpt=row, located_object="old_si1/old_so1 ports",
+                    root_cause="Wrong scan data port naming", fix="Set -si_port_format scan_si_%d -so_port_format scan_so_%d")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"; (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text('present_design top\nset_scan_cfg -si_port_format scan_si_%d -so_port_format scan_so_%d\ninsert_dft_logic\n')
+        report = run / "reports/scan_chain.rpt"
+        report.write_text(table("scan_si_1", "old_so1"))
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+        report.write_text(table("scan_si_1", "scan_so_1"))
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][-1]["verify"]["resolved"])
+
     def test_artifacts_include_direct_tool_outputs_and_exclude_rejected_proposals(self):
         run = self.out / "runs/R2"
         (run / "deliverables").mkdir()
@@ -727,6 +748,19 @@ class AuditRegression(unittest.TestCase):
         produced = {p.relative_to(run).as_posix() for p in agent.collect_tool_outputs(run, "R2")}
         self.assertEqual(produced, {"deliverables/post_scan.v", "reports/scan_signal.rpt"})
         self.assertFalse((run / "deliverables/rejected_proposals").exists())
+
+    def test_task_listed_drc_is_requested_from_the_native_tool_once_per_round(self):
+        (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_signal": "", "rpt_scan_drc_violation": ""}))
+        spec = "| drc.rpt | DRC report |\n| scan_drc_rule_handling.rpt | DRC rules and levels |"
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            first = agent.append_audit_reports("examine_scan_drc\ninsert_dft_logic\nexit\n", self.out / "runs/R1", spec)
+            second = agent.append_audit_reports(first, self.out / "runs/R2", spec)
+            repeated = agent.append_audit_reports(second, self.out / "runs/R2", spec)
+        self.assertEqual(second, repeated)
+        self.assertEqual(second.count('rpt_scan_drc_violation >'), 1)
+        self.assertIn(str(self.out / "runs/R2/reports/drc.rpt"), second)
+        self.assertNotIn(str(self.out / "runs/R1"), second)
+        self.assertNotIn('scan_drc_rule_handling.rpt', second)
 
     def test_config_option_fix_requires_actual_report_value(self):
         item = dict(self.item, evidence_excerpt="[ERROR] set_scan_cfg execution failed",

@@ -22,7 +22,7 @@ from openai import OpenAI
 from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerprint_paths, prepare_repair
 from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups, source_instance_map
 from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
-from report_validation import report_rows as typed_report_rows
+from report_validation import report_rows as typed_report_rows, _full_insertion_designs
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
 from floating_inputs import floating_clock_outputs
 from clock_latch_context import clock_latch_context, clock_latch_hints
@@ -551,7 +551,7 @@ def netlist_diagnostic_context(active: dict[Path, Path], diagnostic: str, limit:
     return "".join(result)[:limit]
 
 
-def append_audit_reports(dofile: str, run_dir: Path) -> str:
+def append_audit_reports(dofile: str, run_dir: Path, task_spec: str = "") -> str:
     """Request real configuration evidence; never change the supplied Task 2 R1 script."""
     cache = Path(__file__).with_name("tool_help.json")
     if not cache.is_file():
@@ -564,6 +564,9 @@ def append_audit_reports(dofile: str, run_dir: Path) -> str:
     dofile = re.sub(r"(?m)^\n?# Agent audit reports from actual tool state\n"
                     r"(?:rpt_(?:scan_(?:signal|cfg|drc_rule_handling|element)|wrapper_(?:cfg|implementation)|pseudo_pi)(?: -type all)? > [^\n]+\.audit\.rpt\"?\n)+"
                     r"(?:# End agent audit reports\n)?", "", dofile)
+    dofile = re.sub(r"(?m)^\n?# Agent task-listed DRC reports\n"
+                    r'(?:rpt_scan_drc_violation > "[^"\n]+"\n)+'
+                    r"# End agent task-listed DRC reports\n", "", dofile)
     reports = [(name, "") for name in commands]
     if "rpt_scan_element" in known and re.search(r"\bset_scan_element\b", dofile):
         reports.append(("rpt_scan_element", " -type all"))
@@ -571,6 +574,17 @@ def append_audit_reports(dofile: str, run_dir: Path) -> str:
         reports.append(("rpt_wrapper_implementation", ""))
     extra = "\n# Agent audit reports from actual tool state\n" + "\n".join(
         f'{name}{options} > "{run_dir / "reports" / (name + ".audit.rpt")}"' for name, options in reports) + "\n# End agent audit reports\n"
+    required_drc = set()
+    if "rpt_scan_drc_violation" in known:
+        for line in task_spec.splitlines():
+            if not re.search(r"\bDRC\b|DRC.{0,10}(?:报告|检查)|违例报告", line, re.I):
+                continue
+            if re.search(r"rule.handling|规则|等级|SpecifiedLevel", line, re.I):
+                continue
+            required_drc.update(re.findall(r"(?<![\w./])([\w.-]+\.rpt)(?![\w./])", line, re.I))
+    if required_drc:
+        extra += "\n# Agent task-listed DRC reports\n" + "\n".join(
+            f'rpt_scan_drc_violation > "{run_dir / "reports" / name}"' for name in sorted(required_drc)) + "\n# End agent task-listed DRC reports\n"
     if not reports:
         return dofile
     exits = list(re.finditer(r"(?m)^\s*exit\s*$", dofile))
@@ -1078,7 +1092,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
                         elif not config_reference(dofile, str(item.get("dft_config", ""))):
                             problems.append(f"requirement_mapping[{index}] has no actual Tcl match: {str(item.get('dft_config', ''))[:500]}. Copy actual commands/options; omit prose suffixes and collection placeholders.")
             if not problems:
-                return append_audit_reports(strip_fence(dofile), run_dir), result
+                return append_audit_reports(strip_fence(dofile), run_dir, spec), result
         except ValueError as error:
             problems = [str(error)]
         (run_dir / "llm_validation.json").write_text(json.dumps({"problems": problems}, indent=2))
@@ -1759,6 +1773,43 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                     re.search(r"(?<![\w$])" + re.escape(origin_port.group(1)) + r"(?![\w$])", subject)):
                 subject += " " + failed_command
     logical_lines = dofile.replace("\\\n", " ").splitlines()
+    if (re.search(r"-(?:si|so)_port_format\b", fix) and locator and origin.is_file() and
+            not source.is_absolute() and _is_inside(origin, (output_dir / "runs" / run_ref).resolve()) and
+            source.suffix.lower() in {".rpt", ".report", ".txt"}):
+        first, last = int(locator.group(1)), int(locator.group(2) or locator.group(1))
+        old_rows = [row for row in typed_report_rows(origin, {"Chain", "Input", "Output", "Partition"})
+                    if first <= row["line"] <= last]
+        formats = set()
+        for command in logical_lines:
+            words = literal_tcl_words(command.strip())
+            if words and words[0] == "set_scan_cfg" and len(words[1:]) % 2 == 0:
+                options = {key: value.strip('"{}') for key, value in zip(words[1::2], words[2::2])}
+                pair = (options.get("-si_port_format", ""), options.get("-so_port_format", ""))
+                if all(value.count("%d") == 1 and re.fullmatch(r"[A-Za-z_][\w]*%d[\w]*", value) for value in pair):
+                    formats.add(pair)
+        designs = _full_insertion_designs(dofile)
+        if len(formats) == len(designs) == 1 and old_rows:
+            pair = next(iter(formats)); design = next(iter(designs))
+            patterns = [re.escape(value).replace("%d", r"\d+") for value in pair]
+            partitions = {row["Partition"] for row in old_rows}
+            was_wrong = any(not re.fullmatch(pattern, row[column]) for row in old_rows
+                            for column, pattern in zip(("Input", "Output"), patterns))
+            if was_wrong:
+                for path in files:
+                    if "chain" not in path.name.lower() or "cell" in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
+                        continue
+                    if not re.search(r"(?m)^\s*Design:\s*" + re.escape(design) + r"\s*$", read_text(path, 2000)):
+                        continue
+                    rows = [row for row in typed_report_rows(path, {"Chain", "Length", "Input", "Output", "Partition"})
+                            if row["Partition"] in partitions and row["Length"].isdigit() and int(row["Length"]) > 0]
+                    if {row["Partition"] for row in rows} != partitions or any(
+                            not re.fullmatch(pattern, row[column]) for row in rows
+                            for column, pattern in zip(("Input", "Output"), patterns)):
+                        continue
+                    first, last = min(row["line"] for row in rows), max(row["line"] for row in rows)
+                    lines = path.read_text(errors="replace").splitlines()
+                    return {"source": path.relative_to(output_dir).as_posix(), "locator": f"L{first}-L{last}",
+                            "excerpt": "\n".join(lines[first - 1:last])}
     for command in logical_lines:
         if not re.match(r"\s*set_wrapper_cfg\b", command):
             continue

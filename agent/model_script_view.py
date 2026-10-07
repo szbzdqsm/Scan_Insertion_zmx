@@ -9,6 +9,7 @@ def model_owned_script(script: str) -> str:
         ("# Agent recipe from actual input shift-register connections", "# End agent shift-register recipe"),
         ("# Agent literal floating-clock inputs", "# End agent floating-clock inputs"),
         ("# Agent audit reports from actual tool state", "# End agent audit reports"),
+        ("# Agent task-listed DRC reports", "# End agent task-listed DRC reports"),
     ):
         script = re.sub(r"(?ms)^" + re.escape(start) + r"\n.*?^" + re.escape(end) + r"(?:\n|$)", "", script)
     return script
