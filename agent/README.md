@@ -2,6 +2,8 @@
 
 ## Latest status (2026-10-07)
 
+Performance follow-up: the optimized source/report parsers passed 297 regression checks and Ruff. A v40 three-case live rerun passed 3/3, and all saved v39 artifacts still pass. The controlled parser benchmarks improved; complete-case times remain variable and one large rerun was slower. See [PERFORMANCE.md](../PERFORMANCE.md). The latest complete live Public batch remains v39 11/11.
+
 The fixed v39 image completed all 11 Public cases with the real `deepseek-v4-pro` model and ScanInsertion tool: 11/11 passed the current artifact and audit checks within each case limit. The source passed 290 regression checks and Ruff. See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for remaining semantic validation boundaries and [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for exact measured results. Hidden cases remain unverified; earlier Golden replay records below are historical tool checks.
 
 The runtime now uses build-time official command help, bounded structural context with actual Liberty pin names, command preflight, report redirection normalization, live tool logs, process-group timeouts, and indexed audit evidence. Task 1 mappings must refer to literal executed Tcl. A bounded private Pre-scan editing/EQY workflow is implemented and has passed small real proofs, including sky130 cells; see [NETLIST_REPAIR.md](NETLIST_REPAIR.md) for its restrictions. Some ICGs still lack usable functional models, and complete Public and semantic validation remain unfinished. Do not upload this development version for evaluation.

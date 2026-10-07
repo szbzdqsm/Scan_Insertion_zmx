@@ -14,6 +14,12 @@ _COVERAGE_FIELDS = (
     "Scan Chain Cell Bit Count", "Wrapper Chain Cell Bit Count",
     "Shared Wrapper Cell Bit Count", "Dedicated Wrapper Cell Bit Count",
 )
+_DESIGN_HEADER = re.compile(r"\s*Design:\s*(\S+)\s*")
+_INSERTION_HEADER = re.compile(r"\s*NO\.?\s+Item\s+Quantity\s*", re.I)
+_COVERAGE_ITEM = re.compile(
+    r"\s*\d+\s+(" + "|".join(re.escape(name) for name in _COVERAGE_FIELDS) + r")\s{2,}(\S+)\s*"
+)
+_REPORT_WORD = re.compile(r"\S+")
 
 
 def _full_insertion_designs(dofile: str) -> set[str]:
@@ -62,7 +68,7 @@ def _insertion_summary_blocks(path: Path) -> Iterator[dict[str, Any]]:
     active = False
     with path.open(encoding="utf-8", errors="replace") as stream:
         for number, line in enumerate(stream, 1):
-            design = re.fullmatch(r"\s*Design:\s*(\S+)\s*", line)
+            design = _DESIGN_HEADER.fullmatch(line) if "Design:" in line else None
             if design:
                 if active:
                     yield current
@@ -70,13 +76,13 @@ def _insertion_summary_blocks(path: Path) -> Iterator[dict[str, Any]]:
                            "values": {}, "conflicts": set(), "invalid": set()}
                 active = False
                 continue
-            if re.fullmatch(r"\s*NO\.?\s+Item\s+Quantity\s*", line, re.I):
+            if _INSERTION_HEADER.fullmatch(line):
                 active = True
                 continue
             if not active:
                 continue
-            item = re.fullmatch(r"\s*\d+\s+(.+?)\s{2,}(\S+)\s*", line)
-            if not item or item.group(1) not in _COVERAGE_FIELDS:
+            item = _COVERAGE_ITEM.fullmatch(line)
+            if not item:
                 continue
             name, quantity = item.groups()
             if quantity != "-" and not quantity.isdecimal():
@@ -144,18 +150,24 @@ def coverage_problems(paths: list[Path], dofile: str) -> list[str]:
 
 
 def report_rows(path: Path, required: set[str]) -> Iterator[dict[str, Any]]:
+    # A header must contain every required token. Most report lines contain no
+    # header token at all; only candidates need tokenization and layout changes.
+    # Empty requirements retain the original behavior (every line is a header).
+    marker = max(required, key=len, default="")
     columns = []
+    source = str(path)
     with path.open(encoding="utf-8", errors="replace") as stream:
         for number, line in enumerate(stream, 1):
-            names = [(match.group(), match.start()) for match in re.finditer(r"\S+", line)]
-            if required <= {name for name, _ in names}:
-                columns = names
-                continue
+            if marker in line:
+                names = [(match.group(), match.start()) for match in _REPORT_WORD.finditer(line)]
+                if required <= {name for name, _ in names}:
+                    columns = [(name, slice(start, names[index + 1][1] if index + 1 < len(names) else None))
+                               for index, (name, start) in enumerate(names)]
+                    continue
             if not columns or not line.strip() or line.lstrip().startswith(("-", "Design:")):
                 continue
-            row = {name: line[start:columns[index+1][1] if index+1 < len(columns) else None].strip()
-                   for index, (name, start) in enumerate(columns)}
-            row.update(source=str(path), line=number)
+            row = {name: line[span].strip() for name, span in columns}
+            row.update(source=source, line=number)
             yield row
 
 

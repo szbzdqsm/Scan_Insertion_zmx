@@ -10,6 +10,21 @@ from typing import Any
 _IDENTIFIER = r"[A-Za-z_$][\w$]*"
 _NET = re.compile(rf"{_IDENTIFIER}(?:\[\d+\])?\Z")
 _CELL = re.compile(r"\s*([\w$]+)\s+(\\\S+|[\w$\[\].]+)\s*\(")
+_MODULE = re.compile(r"\s*module\s+([\w$]+)")
+_ENDMODULE = re.compile(r"\s*endmodule\b")
+_SMALL_NAME = re.compile(r"clk|clock|gate|buf", re.I)
+_DECLARATIONS = tuple((direction, re.compile(rf"\b{direction}\s+([^;)]*)"))
+                      for direction in ("input", "output"))
+_PORT_DIRECTIONS = re.compile(r"\b(?:input|output|inout)\b")
+_IDENTIFIERS = re.compile(_IDENTIFIER)
+_BUS_RANGE = re.compile(r"\[[^]]*\]")
+_ASSIGN = re.compile(r"\s*assign\s+(\S+)\s*=\s*(\S+)\s*;\s*")
+_PIN_BINDINGS = re.compile(r"\.([\w$]+)\s*\(([^()]*)\)")
+_LIB_CELL = re.compile(r'\s*cell\s*\(\s*"?([^"\s)]+)')
+_LIB_PIN = re.compile(r'\s*pin\s*\(\s*"?([^"\s)]+)')
+_LIB_LATCH = re.compile(r'\s*latch\s*\(\s*"?([^",\s)]+)')
+_LIB_PIN_PROPERTY = re.compile(r'\s*(direction|function)\s*:\s*"([^"\n]+)"')
+_LIB_LATCH_PROPERTY = re.compile(r'\s*(enable|data_in)\s*:\s*"([^"\n]+)"')
 _RESERVED = {"input", "output", "inout", "wire", "reg", "logic", "signed", "unsigned", "tri"}
 
 
@@ -19,6 +34,11 @@ def _scalar(value: str) -> str | None:
 
 
 def _source_line(raw: str, blocked: bool) -> tuple[str, bool]:
+    # Most gate-netlist lines contain no block comment. Keep the stateful path
+    # for every line within a comment and every possible new comment opener.
+    if not blocked and "/*" not in raw:
+        comment = raw.find("//")
+        return (raw if comment < 0 else raw[:comment]), False
     parts = []
     while raw:
         if blocked:
@@ -52,28 +72,28 @@ def _library_shapes(paths: list[Path]) -> dict[str, dict[str, Any]]:
     for path in paths:
         with path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
-                cell = re.match(r'\s*cell\s*\(\s*"?([^"\s)]+)', line)
+                cell = _LIB_CELL.match(line)
                 if cell:
                     current = {"name": cell.group(1), "pins": {}, "latches": []}
                     depth = 0
                 if current is None:
                     continue
                 depth += line.count("{") - line.count("}")
-                found_pin = re.match(r'\s*pin\s*\(\s*"?([^"\s)]+)', line)
+                found_pin = _LIB_PIN.match(line)
                 if found_pin:
                     pin = found_pin.group(1)
                     pin_depth = depth
                     current["pins"][pin] = {}
-                latch = re.match(r'\s*latch\s*\(\s*"?([^",\s)]+)', line)
+                latch = _LIB_LATCH.match(line)
                 if latch:
                     current["latches"].append({"state": latch.group(1)})
                     latch_depth = depth
                 if pin:
-                    prop = re.match(r'\s*(direction|function)\s*:\s*"([^"\n]+)"', line)
+                    prop = _LIB_PIN_PROPERTY.match(line)
                     if prop:
                         current["pins"][pin][prop.group(1)] = prop.group(2)
                 if latch_depth:
-                    prop = re.match(r'\s*(enable|data_in)\s*:\s*"([^"\n]+)"', line)
+                    prop = _LIB_LATCH_PROPERTY.match(line)
                     if prop:
                         current["latches"][-1][prop.group(1)] = prop.group(2)
                 if depth < pin_depth:
@@ -114,7 +134,8 @@ def _modules(paths: list[Path], library: dict[str, Any], maximum_cells: int = 32
                 if not blocked and raw.lstrip().startswith("//"):
                     continue
                 line, blocked = _source_line(raw, blocked)
-                module = re.match(r"\s*module\s+([\w$]+)", line)
+                stripped = line.lstrip()
+                module = _MODULE.match(line) if stripped.startswith("module") else None
                 if module:
                     name = module.group(1)
                     if name in names or len(names) >= 100000:
@@ -125,7 +146,7 @@ def _modules(paths: list[Path], library: dict[str, Any], maximum_cells: int = 32
                         pending = None
                         discarding = False
                         continue
-                    small = bool(re.search(r"clk|clock|gate|buf", name, re.I))
+                    small = bool(_SMALL_NAME.search(name))
                     current = {"name": name, "inputs": set(), "outputs": set(), "aliases": {},
                                "hierarchy": [], "children": set(), "cells": [], "ambiguous": False,
                                "small": small, "detailed": selected is not None or small}
@@ -137,27 +158,32 @@ def _modules(paths: list[Path], library: dict[str, Any], maximum_cells: int = 32
                 if current is None:
                     continue
                 if not current["detailed"]:
+                    # A named-pin continuation cannot begin a module, child
+                    # instance or endmodule; no statement is accumulated here.
+                    if stripped.startswith("."):
+                        continue
                     found = _CELL.match(line)
                     if found and found.group(1) != "module" and found.group(1) not in library and not found.group(1).startswith("sky130_fd_sc_"):
                         current["children"].add(found.group(1))
-                    if line.lstrip().startswith("endmodule"):
+                    if stripped.startswith("endmodule"):
                         current = None
                     continue
                 if discarding:
                     if ";" in line:
                         discarding = False
                     continue
-                if pending is None and line.lstrip().startswith("."):
+                if pending is None and stripped.startswith("."):
                     continue
-                for direction in ("input", "output"):
-                    for declaration in re.finditer(rf"\b{direction}\s+([^;)]*)", line):
-                        text = re.split(r"\b(?:input|output|inout)\b", declaration.group(1))[0]
-                        ports = re.findall(_IDENTIFIER, re.sub(r"\[[^]]*\]", "", text))
+                for direction, declarations in _DECLARATIONS:
+                    matches = declarations.finditer(line) if direction in line else ()
+                    for declaration in matches:
+                        text = _PORT_DIRECTIONS.split(declaration.group(1))[0]
+                        ports = _IDENTIFIERS.findall(_BUS_RANGE.sub("", text))
                         current[direction + "s"].update(port for port in ports if port not in _RESERVED)
                     if len(current[direction + "s"]) > 512:
                         current["ambiguous"] = True
                         current[direction + "s"].clear()
-                alias = re.fullmatch(r"\s*assign\s+(\S+)\s*=\s*(\S+)\s*;\s*", line)
+                alias = _ASSIGN.fullmatch(line) if stripped.startswith("assign") else None
                 if alias and len(current["aliases"]) < 512:
                     left, right = (_scalar(part) for part in alias.groups())
                     if left and right:
@@ -182,7 +208,7 @@ def _modules(paths: list[Path], library: dict[str, Any], maximum_cells: int = 32
                     pending = None
                     discarding = ";" not in line
                 if pending is not None and ";" in line:
-                    pairs = re.findall(r"\.([\w$]+)\s*\(([^()]*)\)", pending.pop("literal"))
+                    pairs = _PIN_BINDINGS.findall(pending.pop("literal"))
                     if not pairs or len({pin for pin, _ in pairs}) != len(pairs):
                         current["ambiguous"] = True
                     pending["pins"] = {pin: value for pin, raw_value in pairs if (value := _scalar(raw_value))}
@@ -209,7 +235,7 @@ def _modules(paths: list[Path], library: dict[str, Any], maximum_cells: int = 32
                                 current.clear()
                                 current.update(name=name, children=children, small=False, detailed=False)
                     pending = None
-                if re.match(r"\s*endmodule\b", line):
+                if _ENDMODULE.match(line):
                     if selected is None and not _patterns(current, library):
                         name, children = current["name"], current["children"]
                         current.clear()

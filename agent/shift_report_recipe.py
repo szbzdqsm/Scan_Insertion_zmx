@@ -16,6 +16,12 @@ from clock_association_recipe import (
 )
 
 
+_DESIGN_HEADER = re.compile(r"\s*Design\s*:\s*(\S+)\s*")
+_REPORT_WORD = re.compile(r"\S+")
+_SHIFT_ID = re.compile(r"\d+/\d+")
+_SHIFT_GROUP = re.compile(r"\s*ShiftReg(\d+)\s+\(s\)(?:\s|$)")
+
+
 def requested_shift_reports(spec: str) -> set[str]:
     """Infer filenames from explicit output/report roles, never a case identity."""
     reports = set()
@@ -142,29 +148,34 @@ def configure(script: str, spec: str, words_for: Callable[[str], list[str]]) -> 
 
 def _members(path: Path) -> tuple[bool, set[tuple[str, str, str]]]:
     """Stream actual typed membership tables, preserving each Design scope."""
-    columns = []
+    columns = {}
     design = ""
     typed = False
     members = set()
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
-            found = re.fullmatch(r"\s*Design\s*:\s*(\S+)\s*", line)
+            found = _DESIGN_HEADER.fullmatch(line) if "Design" in line else None
             if found:
                 design = found.group(1)
-                columns = []
+                columns = {}
                 continue
-            headers = [(match.group(), match.start()) for match in re.finditer(r"\S+", line)]
-            if {"InstanceName", "ShiftRegID/CellNo"} <= {name for name, _ in headers}:
-                columns = headers
-                typed = True
-                continue
+            if "ShiftRegID/CellNo" in line:
+                headers = [(match.group(), match.start()) for match in _REPORT_WORD.finditer(line)]
+                if {"InstanceName", "ShiftRegID/CellNo"} <= {name for name, _ in headers}:
+                    # Only these two columns define membership. Duplicate names
+                    # keep their final column, just as the original row dict did.
+                    columns = {name: slice(start, headers[index + 1][1] if index + 1 < len(headers) else None)
+                               for index, (name, start) in enumerate(headers)
+                               if name in {"InstanceName", "ShiftRegID/CellNo"}}
+                    typed = True
+                    continue
             if not columns or not line.strip() or line.lstrip().startswith("-"):
                 continue
-            row = {name: line[start:columns[index + 1][1] if index + 1 < len(columns) else None].strip()
-                   for index, (name, start) in enumerate(columns)}
-            identity = row["ShiftRegID/CellNo"]
-            if design and row["InstanceName"] and re.fullmatch(r"\d+/\d+", identity):
-                members.add((design, row["InstanceName"], identity))
+            identity = line[columns["ShiftRegID/CellNo"]].strip()
+            if design and _SHIFT_ID.fullmatch(identity):
+                instance = line[columns["InstanceName"]].strip()
+                if instance:
+                    members.add((design, instance, identity))
     return typed, members
 
 
@@ -198,10 +209,10 @@ def natural_shift_report_problems(paths: list[Path], spec: str) -> list[str]:
                         latest_groups.clear()
                         design = ""
                         continue
-                    found = re.fullmatch(r"\s*Design\s*:\s*(\S+)\s*", line)
+                    found = _DESIGN_HEADER.fullmatch(line) if "Design" in line else None
                     if found:
                         design = found.group(1)
-                    group = re.match(r"\s*ShiftReg(\d+)\s+\(s\)(?:\s|$)", line)
+                    group = _SHIFT_GROUP.match(line) if "ShiftReg" in line else None
                     if group and design:
                         latest_groups.add((design, group.group(1)))
             identified.update(latest_groups)

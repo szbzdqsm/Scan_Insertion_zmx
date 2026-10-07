@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems  # noqa: E402
+from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, report_rows, segment_problems  # noqa: E402
 
 
 def table(headers, rows, width=28):
@@ -149,6 +149,33 @@ class ReportValidation(unittest.TestCase):
         actual = chain_rows([self.report(rows)])
         self.assertEqual(len(actual), 600)
         self.assertEqual(actual[-1]["Length"], "301")
+
+    def test_header_transitions_preserve_every_row_and_original_line_number(self):
+        path = self.report([["I 1", "10", "Input_suffix", "Output_suffix", "se", "clk", "Partition_suffix"]])
+        second = table(["Partition", "Output", "Chain", "Input", "Length"],
+                       [["Q", "so_2", "I 2", "si_2", "20"]]).replace("Design: top", "Design: second")
+        with path.open("a") as stream:
+            stream.write(second)
+            stream.write("".join(f"{value:<28}" for value in ["Q", "Output", "I 3", "Input", "30"]) + "\n")
+        rows = list(report_rows(path, {"Chain", "Length", "Input", "Output", "Partition"}))
+        self.assertEqual([row["line"] for row in rows], [4, 8, 9])
+        self.assertEqual([row["Chain"] for row in rows], ["I 1", "I 2", "I 3"])
+        self.assertEqual(rows[0]["Partition"], "Partition_suffix")
+        self.assertEqual(rows[1]["Partition"], "Q")
+        self.assertEqual(rows[2]["Input"], "Input")
+        self.assertEqual({row["source"] for row in rows}, {str(path)})
+
+    def test_duplicate_header_keeps_last_column_and_incomplete_header_keeps_layout(self):
+        path = self.root / "duplicate.rpt"
+        path.write_text(table(["Chain", "Length", "Input", "Output", "Partition", "Length"],
+                              [["I 1", "10", "si", "so", "P", "20"],
+                               ["Chain", "Length", "Input", "Output", "missing", "30"],
+                               ["I 2", "40", "si_2", "so_2", "Q", "50"]]))
+        rows = list(report_rows(path, {"Chain", "Length", "Input", "Output", "Partition"}))
+        self.assertEqual([row["Length"] for row in rows], ["20", "30", "50"])
+        self.assertEqual([row["line"] for row in rows], [4, 5, 6])
+        self.assertEqual(rows[1]["Partition"], "missing")
+        self.assertEqual(list(report_rows(path, set())), [])
 
     def test_duplicate_report_does_not_double_count_channels(self):
         path = self.report([["I 1", "10", "si_1", "so_1", "se", "clk", "P"]])

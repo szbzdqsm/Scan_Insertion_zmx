@@ -8,6 +8,8 @@
 
 ## 最新接手状态（2026-10-07）
 
+性能续接：仅优化 clock_latch_context/report_validation/shift_report_recipe 的逐行解析，297 项回归与 Ruff、v40 代表用例 3/3、原 v39 保存现场复核 11/11 通过；完整全批仍以 v39 为准。新旧时钟候选 JSON、扫描单元行和 ShiftReg 集合一致；实际整体时间未稳定缩短，详见仓库根 PERFORMANCE.md。旧 Public 日志又清理 219 份/1.55 GiB，当前成功及关键失败现场保留，逐文件清单位于 outputs/log-cleanup-20261007-performance.json。
+
 最终更新：固定 v39 镜像全部 Public **11/11** 通过当前真实模型/工具验收，290 项回归与 Ruff 通过；实际现场在 `outputs/public-live-20261007T043627790503Z/`。默认 `scan-agent-dev:local` 已指向该镜像。复跑不使用 Golden/预设答案，Task 2 原始 R1 保持字节一致。完整语义、全程硬截止及 Hidden 等边界见要求核对；未上传评测平台。
 
 以下保留此前开发过程，旧“正在运行”和旧测试数量以最终记录为准。

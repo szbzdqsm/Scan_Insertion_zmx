@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-from clock_latch_context import clock_latch_context, clock_latch_hints  # noqa: E402
+from clock_latch_context import (  # noqa: E402
+    _library_shapes, _modules, _source_line, clock_latch_context, clock_latch_hints,
+)
 
 
 LIBRARY = '''library (fixture) {
@@ -154,6 +156,47 @@ class ClockLatchContextTests(unittest.TestCase):
         hints = self.hints()
         self.assertEqual(len(hints), 1)
         self.assertEqual(hints[0]["root"], "top")
+
+    def test_source_line_fast_path_preserves_comment_state(self):
+        cases = [
+            ("\tLAT cell(.D(clock));\n", False, ("\tLAT cell(.D(clock));\n", False)),
+            ("  // module fake(); /*\n", False, ("  ", False)),
+            ("module top(); /* unfinished\n", False, ("module top(); ", True)),
+            ("module fake(); // still inside\n", True, ("", True)),
+            ("*/ LAT cell(/* pin comment */ .D(clock)); // ignored\n", True,
+             (" LAT cell( .D(clock)); ", False)),
+            ("/* one */module top();/* two */endmodule\n", False,
+             ("module top();endmodule\n", False)),
+            ("*/ // /* not reopened\n", True, (" ", False)),
+        ]
+        for raw, blocked, expected in cases:
+            with self.subTest(raw=raw, blocked=blocked):
+                self.assertEqual(_source_line(raw, blocked), expected)
+
+    def test_unselected_module_comments_keep_exact_source_line_numbers(self):
+        prefix = '''module unrelated(input data,output result);
+BUF pass_data(
+  .A(data),
+  .X(result));
+/*
+module hiddenClockBuffer(input I,CE,output O);
+*/
+endmodule
+'''
+        self.source.write_text(prefix + SOURCE)
+        hints = self.hints()
+        self.assertEqual(len(hints), 1)
+        hint = hints[0]
+        prefix_lines = len(prefix.splitlines())
+        self.assertEqual(hint["literal_cells"][0]["line"], prefix_lines + 3)
+        self.assertEqual(hint["literal_cells"][1]["line"], prefix_lines + 4)
+        self.assertEqual(hint["module_instance_connections"]["line"], prefix_lines + 7)
+
+    def test_selected_pass_still_rejects_duplicate_unselected_modules(self):
+        self.source.write_text(SOURCE + "module unrelated();\nendmodule\n" * 2)
+        modules = _modules([self.source], _library_shapes([self.lib]),
+                           selected={"ClockBuffer", "manager", "top"})
+        self.assertEqual(modules, {})
 
     def test_streams_more_than_64_mib_without_reading_whole_input(self):
         with self.source.open("a") as stream:

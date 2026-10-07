@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 from scan_agent import literal_tcl_words
-from shift_report_recipe import configure, natural_shift_report_problems, requested_shift_reports
+from shift_report_recipe import _members, configure, natural_shift_report_problems, requested_shift_reports
 
 
 class ShiftReportRecipe(unittest.TestCase):
@@ -101,6 +101,30 @@ class ShiftReportRecipe(unittest.TestCase):
             log.write_text("No ShiftReg groups identified\n")
             report.write_text(self.table([]))
             self.assertEqual(natural_shift_report_problems([report, log], self.spec), [])
+
+    def test_membership_header_changes_and_design_reset_keep_exact_scopes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "mixed.rpt"
+            content = self.table([("core/first", "7/0"), ("core/not_member", "-/-")], chain=True)
+            content += "  Design  : second\n"
+            content += "".join(f"{name:<30}" for name in ["ShiftRegID/CellNo", "Extra", "InstanceName"]) + "\n"
+            content += "".join(f"{value:<30}" for value in ["9/1", "unrelated", "other/reg"]) + "\n"
+            content += "Design: third\n"
+            content += "".join(f"{value:<30}" for value in ["11/0", "unrelated", "must/not/leak"]) + "\n"
+            report.write_text(content)
+            self.assertEqual(_members(report), (True, {("chip", "core/first", "7/0"), ("second", "other/reg", "9/1")}))
+
+    def test_duplicate_membership_columns_use_last_value_and_exact_header_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "duplicate.rpt"
+            headers = ["InstanceName", "InstanceName", "ShiftRegID/CellNo"]
+            content = "Design: chip\n" + "".join(f"{name:<30}" for name in headers) + "\n"
+            content += "".join(f"{value:<30}" for value in ["old/path", "correct/path", "7/0"]) + "\n"
+            # Header substrings in data are not complete typed header tokens.
+            content += "".join(f"{value:<30}" for value in ["InstanceName_suffix", "kept/path", "ShiftRegID/CellNo_suffix"]) + "\n"
+            content += "".join(f"{value:<30}" for value in ["old/path", "correct/next", "7/1"]) + "\n"
+            report.write_text(content)
+            self.assertEqual(_members(report), (True, {("chip", "correct/path", "7/0"), ("chip", "correct/next", "7/1")}))
 
 
 if __name__ == "__main__":
