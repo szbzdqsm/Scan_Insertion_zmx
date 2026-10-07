@@ -1177,6 +1177,30 @@ class AuditRegression(unittest.TestCase):
         self.assertGreater((output_dir / "runs/R1/R1.log").stat().st_size, 100000)
         self.assertEqual((output_dir / "runs/R1/R1.log").read_bytes(), (output_dir / "final_results/final.log").read_bytes())
 
+    def test_main_reuses_completed_validation_and_single_structural_scan(self):
+        with patch.object(agent, "check_output", wraps=agent.check_output) as checks, \
+             patch.object(agent, "shift_register_groups", wraps=agent.shift_register_groups) as scans:
+            result, decision, _, _, _ = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(scans.call_count, 1)
+        self.assertEqual(checks.call_count, 1)
+        self.assertEqual(decision["performance"]["validation_cache"]["hits"], 1)
+        self.assertIn("source_structure", decision["performance"]["stages_seconds"])
+
+    def test_main_final_check_revalidates_a_changed_report(self):
+        original = agent.record_issue_fixes
+        def late_change(*args, **kwargs):
+            original(*args, **kwargs)
+            base = args[3]
+            (base / "runs/R1/reports/scan_chain.rpt").write_text("[ERROR] report changed after first check\n")
+        with patch.object(agent, "record_issue_fixes", side_effect=late_change), \
+             patch.object(agent, "check_output", wraps=agent.check_output) as checks:
+            result, decision, _, _, _ = self.run_main()
+        self.assertEqual(result, 2)
+        self.assertFalse(decision["tool_checks_passed"])
+        self.assertEqual(checks.call_count, 2)
+        self.assertGreaterEqual(decision["performance"]["validation_cache"]["invalidations"], 1)
+
     def test_successful_tool_with_empty_task2_diagnosis_is_audit_incomplete(self):
         result, decision, _, _, _ = self.run_main(task2=True)
         self.assertEqual(result, 2)

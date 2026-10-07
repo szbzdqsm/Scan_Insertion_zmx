@@ -20,3 +20,5 @@
 !mode_control_context.py
 !insertion_evidence.py
 !shift_report_recipe.py
+!artifact_operations.py
+!help_selection.py

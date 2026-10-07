@@ -142,6 +142,17 @@ def configure_floating_inputs(script: str, inputs: dict[str, list[str]]) -> tupl
     inserted = False
     for chunk in tcl_chunks(script):
         stripped = chunk.lstrip()
+        normalized = re.sub(r"\\\r?\n[ \t]*", " ", stripped).strip()
+        if re.match(r"set_scan_signal\b", normalized) and re.search(r"(?:^|\s)-type\s+clock(?:\s|$)", normalized):
+            # The recipe owns these literal clocks. Earlier model declarations
+            # would address a pin before add_pseudo_pi, or redeclare it.
+            managed_port = any(re.search(r"(?:^|\s)-port\s+(?:\{" + re.escape(pin) + r"\}|\"" +
+                                         re.escape(pin) + r"\"|" + re.escape(pin) + r")(?=\s|;|$)", normalized)
+                               for pin in pins)
+            if managed_port:
+                if ";" in normalized or "\n" in normalized:
+                    raise ValueError("Keep runtime-owned floating clock declarations in separate statements")
+                continue
         if not stripped.startswith("#") and re.search(r"\badd_pseudo_pi\b", chunk):
             command = re.match(r"([A-Za-z_]+)\b", stripped)
             names = set(re.findall(r"(?m)^\s*([a-z_]+)\b", chunk))

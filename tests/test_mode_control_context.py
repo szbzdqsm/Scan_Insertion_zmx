@@ -156,6 +156,44 @@ endmodule
         self.assertEqual([candidate["port"] for candidate in hints[0]["mode_candidates"]],
                          [candidate["port"] for candidate in self.hints[0]["mode_candidates"]])
 
+    def test_block_comment_state_survives_slash_free_lines_and_adjacent_tokens(self):
+        self.netlist.write_text("/* begin block\nmodule fake(input test_mode);\nendmodule\n*/\n" +
+                                self.source.replace("input scan_mode;", "input /* scalar */ scan_mode;"))
+        hints = mode_control_hints([self.netlist])
+        self.assertEqual([hint["root"] for hint in hints], ["chip"])
+        self.assertEqual(hints[0]["input_ports"], self.hints[0]["input_ports"])
+        self.assertTrue(hints[0]["source_ports_complete"])
+
+    def test_keyword_substrings_and_pin_continuations_do_not_invent_roots(self):
+        self.netlist.write_text(self.source.replace("child core (.test_mode(scan_mode));", """wire module_status, endmodule_status;
+child core (
+.test_mode(scan_mode)
+);
+"""))
+        hints = mode_control_hints([self.netlist])
+        self.assertEqual([hint["root"] for hint in hints], ["chip"])
+        self.assertTrue(hints[0]["source_ports_complete"])
+        self.assertEqual(hints[0]["input_ports"], self.hints[0]["input_ports"])
+
+    def test_multiline_parameterized_instance_keeps_hierarchy_ambiguous(self):
+        self.netlist.write_text(self.source.replace("child core (.test_mode(scan_mode));", """child # (
+.WIDTH(1)
+) core (.test_mode(scan_mode));"""))
+        hints = mode_control_hints([self.netlist])
+        self.assertTrue(hints)
+        self.assertTrue(all(not hint["source_ports_complete"] for hint in hints))
+
+    def test_complete_candidate_metadata_keeps_actual_declaration_lines(self):
+        self.netlist.write_text("// heading\nmodule top(input scan_mode,\n input mbist_mode);\nendmodule\n")
+        hints = mode_control_hints([self.netlist])
+        self.assertEqual(hints[0]["source"], str(self.netlist))
+        self.assertEqual(hints[0]["line"], 2)
+        self.assertEqual(hints[0]["mode_candidates"], [
+            {"port": "mbist_mode", "role": "mbist", "active_level": 1, "confidence": "literal_scalar_name",
+             "direction": "input", "scalar": True, "source": str(self.netlist), "line": 2},
+            {"port": "scan_mode", "role": "scan_test", "active_level": 1, "confidence": "literal_scalar_name",
+             "direction": "input", "scalar": True, "source": str(self.netlist), "line": 2}])
+
     def test_duplicate_and_parameterized_sources_fail_closed(self):
         self.netlist.write_text(self.source + self.source)
         self.assertEqual(mode_control_hints([self.netlist]), [])

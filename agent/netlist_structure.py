@@ -207,10 +207,11 @@ def shift_register_groups(paths: list[Path], minimum: int = 10,
 
 
 def shift_register_context(paths: list[Path], minimum: int = 10, limit: int = 16000,
-                           libraries: list[Path] | None = None) -> str:
+                           libraries: list[Path] | None = None,
+                           *, hints: list[dict[str, Any]] | None = None) -> str:
     if sum(path.stat().st_size for path in paths) > 64 * 1024 * 1024:
         return "Shift-register structural scan omitted for inputs larger than 64 MiB; use real tool evidence."
-    hints = shift_register_groups(paths, minimum=minimum, libraries=libraries)
+    hints = shift_register_groups(paths, minimum=minimum, libraries=libraries) if hints is None else hints
     return ("Best-effort unbranched shift-register candidates from actual input connections. "
             "Templates include concrete hierarchy and correlated indices; preserve existing scan enables and verify with the tool. "
             "This scan does not cover branched paths, concatenated/sliced bus bindings or arbitrary HDL.\n" +

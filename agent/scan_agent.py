@@ -20,7 +20,7 @@ from typing import Any
 
 from openai import OpenAI
 from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerprint_paths, prepare_repair
-from netlist_structure import reset_polarity_hints, shift_register_context, shift_register_groups, source_instance_map
+from netlist_structure import shift_register_context, shift_register_groups
 from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
 from report_validation import report_rows as typed_report_rows, _full_insertion_designs
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
@@ -37,10 +37,26 @@ from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_styl
 from contest_rules import QA_READ_DATE, QA_URL, qa_context, qa_residual_codes
 from drc_validation import drc_summaries, excluded_scan_cells, redirected_drc_codes, residual_positive_evidence, rule_codes, summary_permitted
 from scan_exclusion_evidence import exclusion_command_evidence
+from artifact_operations import RunValidationCache, independent_copy
+from help_selection import render_selected_help
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
 MANUAL = Path("/opt/dftexp_scan/doc/Scan_User_Manual.pdf")
+_SUMMARY_MODULE = re.compile(r"\s*module\s+([\w$]+)")
+_SUMMARY_DIRECTION = re.compile(r"\s*(?:input|output|inout)\b")
+_SUMMARY_CONTROL = re.compile(r"clk|clock|rst|reset|test|scan|mode|mbist|jtag", re.I)
+_SUMMARY_INSTANCE = re.compile(r"\s*([\w$]+)\s+(\\[^\s]+|[\w$]+)\s*\(")
+_SUMMARY_END = re.compile(r"\s*endmodule\b")
+_SUMMARY_WORDS = re.compile(r"[\w$]+")
+
+
+def timed_call(stages: dict[str, float], name: str, function, *args, **kwargs):
+    started = time.monotonic()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        stages[name] = stages.get(name, 0.0) + time.monotonic() - started
 
 
 def read_text(path: Path, limit: int = 30000) -> str:
@@ -111,7 +127,7 @@ def netlist_summary(paths: list[Path], query: str = "") -> str:
         try:
             with p.open("r", encoding="utf-8", errors="replace") as f:
                 for i, line in enumerate(f):
-                    m = re.match(r"\s*module\s+([\w$]+)", line)
+                    m = _SUMMARY_MODULE.match(line)
                     if m:
                         current_module = m.group(1)
                         module_names.add(current_module)
@@ -120,18 +136,17 @@ def netlist_summary(paths: list[Path], query: str = "") -> str:
                     if special_remaining:
                         special_instances[-1]["literal"] += line
                         special_remaining = 0 if ";" in line else special_remaining - 1
-                    if current_module and re.match(r"\s*(?:input|output|inout)\b", line):
-                        if re.search(r"clk|clock|rst|reset|test|scan|mode|mbist|jtag", line, re.I):
+                    if current_module and _SUMMARY_DIRECTION.match(line):
+                        if _SUMMARY_CONTROL.search(line):
                             entries = control_ports.setdefault(current_module, [])
                             if len(entries) < 24:
                                 entries.append(line.strip()[:240])
                         if len(ports) < 160:
-                            ports.extend(re.findall(r"[\w$]+", line))
-                    c = re.match(r"\s*([\w$]+)\s+(?:\\[^\s]+|[\w$]+)\s*\(", line)
+                            ports.extend(_SUMMARY_WORDS.findall(line))
+                    c = _SUMMARY_INSTANCE.match(line)
                     if c and c.group(1) != "module" and current_module and len(special_instances) < 12:
-                        inst = re.match(r"\s*[\w$]+\s+(\\[^\s]+|[\w$]+)\s*\(", line)
-                        if inst and inst.group(1).removeprefix("\\") in mentioned:
-                            special_instances.append({"module": current_module, "instance": inst.group(1),
+                        if c.group(2).removeprefix("\\") in mentioned:
+                            special_instances.append({"module": current_module, "instance": c.group(2),
                                                       "source": f"{p}:L{i+1}", "literal": line})
                             special_remaining = 0 if ";" in line else 8
                     if c and any(term in c.group(1).lower() for term in ("df", "dl", "latch", "clk", "clock")):
@@ -141,10 +156,9 @@ def netlist_summary(paths: list[Path], query: str = "") -> str:
                         cells[kind] = cells.get(kind, 0) + 1
                     if c and current_module and not c.group(1).startswith("sky130_fd_sc_"):
                         entries = hierarchy.setdefault(current_module, [])
-                        instance = re.match(r"\s*[\w$]+\s+(\\[^\s]+|[\w$]+)\s*\(", line)
-                        if instance and len(entries) < 64:
-                            entries.append((instance.group(1), c.group(1)))
-                    if re.match(r"\s*endmodule\b", line):
+                        if len(entries) < 64:
+                            entries.append((c.group(2), c.group(1)))
+                    if _SUMMARY_END.match(line):
                         current_module = ""
         except OSError as e:
             out.append(f"Could not scan file: {e}")
@@ -221,37 +235,15 @@ def manual_context(query: str, max_chars: int = 12000) -> str:
     return "\n\n".join(selected) or text[:max_chars]
 
 
-def command_syntax(query: str, max_chars: int = 30000) -> str:
+def command_syntax(query: str, max_chars: int = 30000, *, current: str = "", original: str = "",
+                   diagnostics: str = "") -> str:
     path = Path(__file__).with_name("tool_help.json")
     if not path.is_file():
         return "No build-time command syntax cache; consult the manual excerpts."
     syntax = json.loads(path.read_text())
-    names = ["__cell_properties", "load_lib", "load_netlist", "present_design", "set_scan_signal", "set_scan_cfg",
-             "set_scan_cell_mapping", "set_scan_element", "set_dft_clock_gating_cfg", "insert_dft_logic",
-             "examine_scan_drc", "examine_scan_chain", "set_scan_drc_cfg", "dump_netlist", "dump_ctl",
-             "dump_def", "rpt_scan_chain", "rpt_scan_chain_cell", "rpt_scan_element", "rpt_scan_cfg",
-             "rpt_scan_signal", "rpt_scan_drc_violation", "rpt_insertion_info", "get_cells",
-             "get_pins", "get_ports", "get_nets", "get_obj_insts", "get_attribute", "get_property",
-             "list_properties", "rpt_property", "foreach_in_collection", "sizeof_collection"]
-    if re.search(r"悬空|浮空|伪|pseudo", query, re.I):
-        names = ["add_pseudo_pi", "rpt_pseudo_pi"] + names
-    if re.search(r"partition|分区", query, re.I):
-        names = ["add_scan_partition", "set_current_scan_partition", "rpt_scan_partition"] + names
-    if re.search(r"wrapper|CTL|黑盒", query, re.I):
-        names = ["load_ctl", "set_wrapper_cfg", "add_dedicated_wrapper_cell_type", "rpt_dedicated_wrapper_cell_type",
-                 "rpt_wrapper_cfg", "rpt_wrapper_implementation"] + names
-    if re.search(r"移位寄存器|segment", query, re.I):
-        names = ["rpt_shift_register", "set_scan_segment", "rpt_scan_segment"] + names
-    if re.search(r"忽略|允许|无需处理", query):
-        names = ["set_scan_drc_rule_handling", "rpt_scan_drc_rule_handling"] + names
-    chunks = []
-    size = 0
-    for name in dict.fromkeys(names):
-        text = syntax.get(name, "")
-        if text and size + len(text) <= max_chars:
-            chunks.append(text)
-            size += len(text)
-    return "\n\n".join(chunks)
+    # max_chars is retained for call compatibility; selected required help is
+    # always complete rather than silently losing entries at a character limit.
+    return render_selected_help(syntax, query, current, original, diagnostics)[0]
 
 
 def allowed_drc_codes(spec: str) -> set[str]:
@@ -498,23 +490,61 @@ def get_task_artifacts(input_dir: Path) -> tuple[str, str, list[Path], list[Path
 
 
 def liberty_summary(path: Path) -> str:
-    """Read actual sequential/clock cell pins without sending timing tables to the model."""
+    """Read pins and literal gate-control facts, without guessing control polarity."""
     names = []
     pin_map: dict[str, list[str]] = {}
     current = ""
+    current_pin = ""
+    gate_facts: list[dict[str, Any]] = []
+    facts: list[dict[str, Any]] = []
+    is_gate = False
+    table_lines = 0
+    cell_pattern = re.compile(r'\s*cell\s*\(\s*"?([^"\s)]+)')
+    pin_pattern = re.compile(r'\s*pin\s*\(\s*"?([^"\s)]+)')
+
+    def finish_cell() -> None:
+        if is_gate and facts and len(gate_facts) < 8:
+            candidate = {"cell": current, "source": str(path), "literal_facts": list(facts)}
+            if len(json.dumps([*gate_facts, candidate])) <= 5000:
+                gate_facts.append(candidate)
+
     with path.open(encoding="utf-8", errors="replace") as stream:
-        for line in stream:
-            cell = re.match(r'\s*cell\s*\(\s*"?([^"\s)]+)', line)
+        for number, line in enumerate(stream, 1):
+            cell = cell_pattern.match(line)
             if cell:
+                finish_cell()
                 current = cell.group(1)
+                current_pin, facts, is_gate, table_lines = "", [], False, 0
                 names.append(current)
                 if re.search(r"df|sdf|latch|clk|dl", current, re.I) and len(pin_map) < 128:
                     pin_map[current] = []
-            pin = re.match(r'\s*pin\s*\(\s*"?([^"\s)]+)', line)
+            pin = pin_pattern.match(line)
+            if pin:
+                current_pin = pin.group(1)
             if pin and current in pin_map and len(pin_map[current]) < 24:
                 pin_map[current].append(pin.group(1))
+            marker = "clock_gate_" in line or "clock_gating_integrated_cell" in line
+            if marker and not line.lstrip().startswith(("//", "/*", "*")):
+                is_gate = True
+            state_header = bool(re.match(r"\s*statetable\s*\(", line))
+            if state_header:
+                table_lines = 12
+            elif table_lines and line.strip() == "}":
+                table_lines = 0
+            # Keep complete short source lines; no synthesized truth table or level.
+            if (marker or state_header or table_lines and re.match(r'\s*(?:table\s*:|["\'LHXN01-])', line)):
+                literal = line.rstrip("\r\n")
+                if len(literal) <= 1200 and len(facts) < 16:
+                    facts.append({"line": number, "pin": "" if state_header or table_lines else current_pin,
+                                  "text": literal})
+            if table_lines:
+                table_lines -= 1
+        finish_cell()
     pins = dict(sorted(pin_map.items(), key=lambda item: ("sdf" not in item[0], item[0]))[:80])
     return (f"{path.name}: {len(names)} cells; sample={', '.join(names[:30])}\n"
+            + ("Actual Liberty clock-gate control evidence (source lines; infer polarity only when supported): "
+               + json.dumps(gate_facts) + "\n" if gate_facts else "")
+            +
             "Actual sequential/clock cell pin names (scan cells first): " + json.dumps(pins))[:8000]
 
 
@@ -838,11 +868,12 @@ def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
 
 
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
-                    clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None) -> str:
+                    clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None,
+                    structural_groups: list[dict] | None = None, include_command_help: bool = True) -> str:
     lib_names = [str(p) for p in libs]
     lib_summary = [liberty_summary(p) for p in libs]
-    shift_summary = shift_register_context(netlists, libraries=libs) if re.search(r"移位寄存器|scan\s+segment", task_spec, re.I) else "Not requested"
-    return f"""# Natural-language task specification
+    shift_summary = shift_register_context(netlists, libraries=libs, hints=structural_groups) if re.search(r"移位寄存器|scan\s+segment", task_spec, re.I) else "Not requested"
+    context = f"""# Natural-language task specification
 {task_spec}
 
 # Runtime limits
@@ -872,10 +903,11 @@ Liberty files: {lib_names}
 # ScanInsertion manual excerpts (authoritative syntax reference)
 {manual_context(task_spec)}
 
-# Command syntax from this installed tool's built-in verbose help
-{command_syntax(task_spec)}
-
-# Current Dofile
+"""
+    if include_command_help:
+        context += "\n# Command syntax from this installed tool's built-in verbose help\n" + command_syntax(task_spec, current=dofile, diagnostics=log)
+    if dofile or log or reports:
+        context += f"""\n# Current Dofile
 {dofile}
 
 # Most recent tool log / diagnostics
@@ -884,6 +916,7 @@ Liberty files: {lib_names}
 # Most recent tool reports
 {reports[-18000:] if reports else '(no reports captured yet)'}
 """
+    return context
 
 
 def call_for_dofile(client: OpenAI, task: str, context: str, original: str | None,
@@ -900,11 +933,27 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     known_reset_ports: set[str] | None = None,
                     reset_inference_evidenced: bool = False,
                     clock_candidates: list[dict] | None = None,
-                    mode_hints: list[dict] | None = None) -> tuple[str, dict[str, Any]]:
+                    mode_hints: list[dict] | None = None,
+                    diagnostics: str = "") -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
-        context += "\n# Original Dofile (diagnostic baseline; patch the CURRENT Dofile)\n" + original
+        if base_dofile is not None and original.strip() == base_dofile.strip():
+            context += "\n# The displayed CURRENT Dofile is the supplied original diagnostic baseline.\n"
+        else:
+            context += "\n# Original Dofile (diagnostic baseline; patch the CURRENT Dofile)\n" + original
+    syntax_path = Path(__file__).with_name("tool_help.json")
+    syntax = {}
+    help_text = ""
+    actual_diagnostics = diagnostics
+    if syntax_path.is_file():
+        syntax = json.loads(syntax_path.read_text())
+        actual_diagnostics = diagnostics + "\n" + "\n".join(
+            str(value.get("excerpt", "")) for value in (catalog or {}).values() if isinstance(value, dict))
+        help_text, help_metadata = render_selected_help(syntax, read_text(input_dir / "task_spec.md", 60000),
+                                                       base_dofile or "", original or "", actual_diagnostics)
+        context += "\n# Complete installed help for task roles and actual commands\n" + help_text
+        (run_dir / "llm_help_selection.json").write_text(json.dumps(help_metadata, ensure_ascii=False, indent=2))
     if previous_mapping:
         context += "\n# Previous requirement mapping (may be inherited if unchanged)\n" + json.dumps(previous_mapping, ensure_ascii=False)
     if catalog:
@@ -933,6 +982,7 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
     system = f"""You are an expert operator of the ScanInsertion tool `dftexp_scan` for the contest.
 Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts, this tool's built-in help and evidence from existing Dofiles. Built-in help determines valid command options; do not use options from another EDA product. Correct every earlier ERROR before retrying. Use the actual Liberty pin names, never guess SE/SI/CLK. Choose the requested top module from root-module evidence, rather than an internal module whose name appears first. For reset signals, -off_state is the INACTIVE level: active-low reset means -off_state 1; active-high reset means -off_state 0. get_cells/get_pins return tool collections; use foreach_in_collection to iterate them. Declare wrapper control signals with set_scan_signal before referring to them in set_wrapper_cfg. Complete examine_scan_drc/examine_scan_chain before insert_dft_logic; do not call examine_scan_chain after insertion. For a clock passed through a latch, use the documented associated_internal_clocks option and exclude that latch from scan elements as required. Group repeated diagnostics by concrete root cause, rather than one issue per cell. Keep each diagnosis and summary short. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
 For a gated scan partition, its scan_enable usually needs usage all so it controls both scan FFs and that partition's clock gates; usage scan alone does not connect gating control. Use a separate clock_gating signal only when the task specifies one. Clock off_state can be 0 or 1; when a latch passes a clock through its D pin, diagnose the source off level with DRC and associated_internal_clocks before proposing a netlist edit. Declare each clock port once, including associated_internal_clocks on that same set_scan_signal command; a second declaration fails instead of updating it. Use the actual parent module and instance from source excerpts, not an assumed hierarchy. To select a hierarchical subtree, filter full_name using the actual path and optional leading hierarchy prefix. Check sizeof_collection before applying a command that requires a nonempty instance list; a missing required object must remain unresolved. Use the derived shift-register endpoint/index hints where supplied, and use brace quoting/format for array pin paths so Tcl does not interpret numeric brackets as commands.
+For scan_enable, -off_state is the INACTIVE/capture level; scan shifting uses the complementary level. Determine it from actual scan-cell and clock-gate functions/state tables and hookup polarity. A faulty original Dofile is not proof of the correct value. When DFTR9/DFTR17 remain with usage all, check whether the shift level opens the actual clock gate before changing lockups, chain lengths or latch clock associations. Never assume every library has active-high scan enable.
 Configure indexed scan data port names with set_scan_cfg -si_port_format and -so_port_format, not set_scan_signal -port containing %d. DRC rules DFTR1-6 and DFTR8-16 accept only Error/Warning. If the task allows a residual warning, leave it as Warning and retain actual evidence; do not request Ignore. When an instance path/pattern is specified, use full_name rather than ref_name (which is a cell type). Hierarchical positional query patterns may not match; use get_cells -hier -filter with full_name, e.g. {{full_name =~ */core/* && full_name !~ *keep_reg* && is_sequential == true}}, substituting actual source paths. If separate uninstantiated wrapper modules must remain available, load all netlist roots without -top, then use present_design to select the real scan top. Apply shift-register templates to ALL supplied index tuples, using concise Tcl loops rather than configuring only index zero. Global wrapper disable is set_wrapper_cfg disable, never -style none without an actual -port list. When the task does not request wrappers, remove spurious wrapper settings inherited from a faulty original script.
 Return exactly one compact JSON object with keys: dofile (complete Tcl script as a string), summary (one short sentence), requirement_mapping (array of objects with requirement and dft_config), and issue_resolutions (array; each item has issue_id, phenomenon, evidence_id or evidence_excerpt, located_object, diagnosis, root_cause, violated_requirement, fix, and optional verification). Use concise scripts with few comments and brief diagnosis fields; execution time is limited. Task 1 requires a nonempty mapping of key requirements; dft_config must contain literal Tcl statements copied from your returned Dofile, never descriptions or invented placeholders for collections. Prefer evidence_id such as E1 from the supplied actual evidence catalog; the runtime inserts its exact prior-run excerpt. Otherwise evidence_excerpt must be an exact short contiguous excerpt copied from the supplied PREVIOUS run's tool log or report. Never combine fragments, omit text inside a line, or cite the task specification as tool evidence. Describe a concrete object and root cause; use an empty array when no issue is directly evidenced. For verification you may provide an object with source (a report filename or relative report path) and expected_excerpt (a specific positive tool report value or completion message expected after the fix). This is a verification plan, not a claim that verification already occurred. Do not use disappearance of a diagnostic as positive evidence. Do not claim a requirement is met unless the script configures it. Declare reset ports named by the task or supported by actual FF set/clear connections, Liberty functions and uncontrolled-reset diagnostics. A generic task may leave these names implicit. Never classify functional data as reset based on its name alone; explicit task prohibitions take precedence. Wrapper shift and capture controls should use separate newly created ports, unless the task explicitly requires reusing existing ones.
 The actual read-only input directory is {input_dir}. The current run directory and tool working directory are {run_dir}. Use the supplied absolute input file paths. Load multiple netlists together in one load_netlist file-list command with explicit -top when needed; separate load_netlist calls can change the scan engine's analyzed top. Use property names from the supplied actual cell property table, and get_property/get_attribute (not the nonexistent get_attr). For a user-defined dedicated wrapper, -interface is a list of semantic_role actual_module_port polarity triples; semantic roles are shift_clk, capture_en, shift_en, cti, cto, cfi, cfo. Read the provided module port declarations. Write reports under {run_dir / 'reports'} and deliverables under {run_dir / 'deliverables'}, or use paths relative to the current working directory. Add `exit` at the end. No markdown fences."""
@@ -1098,6 +1148,14 @@ The actual read-only input directory is {input_dir}. The current run directory a
         (run_dir / "llm_validation.json").write_text(json.dumps({"problems": problems}, indent=2))
         user += "\n# Your previous proposed JSON\n" + raw + "\n# Preflight errors (no tool call made)\n" + "\n".join(problems)
         user += "\nReturn corrected JSON with key dofile and valid options from the supplied built-in help."
+        if syntax:
+            expanded, expanded_metadata = render_selected_help(syntax, spec, raw, original or "",
+                actual_diagnostics + "\n" + "\n".join(problems))
+            if expanded != help_text:
+                user = user.replace("# Complete installed help for task roles and actual commands\n" + help_text,
+                                    "# Complete installed help for task roles and actual commands\n" + expanded, 1)
+                help_text = expanded
+                (run_dir / "llm_help_selection.json").write_text(json.dumps(expanded_metadata, ensure_ascii=False, indent=2))
         if any("Dofile edit" in problem for problem in problems):
             user += ("\nYour localized replacement could not be applied. For this correction return the complete editable "
                      "Dofile in the dofile string and OMIT dofile_edits. Preserve the valid configuration; "
@@ -1160,7 +1218,7 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             if not target.exists():
-                shutil.copy2(source, target)
+                independent_copy(source, target)
             copied.append(target)
         except OSError:
             continue
@@ -1229,9 +1287,10 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
         status = "aborted" if error == "timeout" else "error" if error or code != 0 else "completed"
     elapsed = time.monotonic() - started
     # Collect only actual tool outputs. Preserve subdirectories and never fabricate reports.
+    collection_started = time.monotonic()
     output_files = collect_tool_outputs(run_dir, run_id)
     return {"run_id": run_id, "status": status, "returncode": code, "error": error,
-            "elapsed_seconds": round(elapsed, 3), "log_path": log_path,
+            "elapsed_seconds": round(elapsed, 3), "collection_seconds": round(time.monotonic() - collection_started, 3), "log_path": log_path,
             "artifacts": [p.relative_to(run_dir).as_posix() for p in output_files]}
 
 
@@ -1409,7 +1468,7 @@ def copy_tree_contents(source: Path, target: Path) -> None:
         dest = target / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists():
-            shutil.copy2(p, dest)
+            independent_copy(p, dest)
 
 
 def write_diff(out: Path, old: str, new: str, old_name: str, new_name: str) -> str:
@@ -2179,6 +2238,7 @@ def issue_audit_problems(task: str, issues: list[dict[str, Any]], changes: list[
 
 
 def main() -> int:
+    start = time.monotonic()
     parser = argparse.ArgumentParser()
     parser.add_argument("-input", "--input", required=True)
     parser.add_argument("-output", "--output", required=True)
@@ -2191,6 +2251,12 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     runs_root = output_dir / "runs"
     runs_root.mkdir(exist_ok=True)
+    # Stable parent directories let metadata validation distinguish unchanged
+    # evidence from modifications while final products remain independent copies.
+    for directory in ("final_results", "final_results/reports", "final_results/deliverables"):
+        (output_dir / directory).mkdir(exist_ok=True)
+    validation_cache = RunValidationCache()
+    performance_stages: dict[str, float] = {}
     run_records: list[dict[str, Any]] = []
     changes: list[dict[str, Any]] = []
     issue_records: list[dict[str, Any]] = []
@@ -2201,7 +2267,6 @@ def main() -> int:
     final_dofile = ""
     task = "task1"
     error_message = None
-    start = time.monotonic()
     final_run_dir: Path | None = None
     integrity_problems: list[str] = []
     try:
@@ -2209,7 +2274,7 @@ def main() -> int:
             raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
         if not os.environ.get("SCANINSERTION_LICENSE_SERVER"):
             raise RuntimeError("SCANINSERTION_LICENSE_SERVER is required")
-        task, task_spec, netlists, libs, original_path = get_task_artifacts(input_dir)
+        task, task_spec, netlists, libs, original_path = timed_call(performance_stages, "input_discovery", get_task_artifacts, input_dir)
         active_netlists = {path: path for path in netlists}
         active_netlist_root = input_dir / "netlist"
         limits = read_text(input_dir / "limitations.md", 8000)
@@ -2224,17 +2289,21 @@ def main() -> int:
         last_log = ""
         generation_error = ""
         validation_problems: list[str] = []
-        clock_candidates = (clock_latch_hints(netlists, libs) if re.search(r"ICG|门控|缓冲|latch|闩锁", task_spec, re.I) else [])
-        mode_hints = mode_control_hints(netlists) if requested_constant_modes(task_spec) else []
-        static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "",
-                                         clock_candidates=clock_candidates, mode_hints=mode_hints)
-        control_hints = reset_polarity_hints(netlists, libs)
+        clock_candidates = (timed_call(performance_stages, "source_clock", clock_latch_hints, netlists, libs) if re.search(r"ICG|门控|缓冲|latch|闩锁", task_spec, re.I) else [])
+        mode_hints = timed_call(performance_stages, "source_modes", mode_control_hints, netlists) if requested_constant_modes(task_spec) else []
+        reset_hints: dict[str, Any] = {}
+        instances: dict[str, Any] = {}
+        structural_groups = timed_call(performance_stages, "source_structure", shift_register_groups, netlists, libraries=libs, reset_hints=reset_hints,
+            instance_map=instances if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else None)
+        control_hints = {root: values for root, values in reset_hints.items() if values}
+        static_context = timed_call(performance_stages, "static_context", context_for_run, input_dir, task_spec, limits, netlists, libs, "",
+                                         clock_candidates=clock_candidates, mode_hints=mode_hints,
+                                         structural_groups=structural_groups, include_command_help=False)
         known_reset_ports = set(control_hints)
         reset_inference_evidenced = False
-        instances = source_instance_map(netlists) if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else {}
-        floating = (floating_clock_outputs(netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
+        floating = (timed_call(performance_stages, "source_floating", floating_clock_outputs, netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
                     re.search(r"伪|pseudo", task_spec, re.I) and re.search(r"时钟|clock", task_spec, re.I) else {})
-        expected_segments = (shift_register_groups(netlists, libraries=libs) if
+        expected_segments = (structural_groups if
                              re.search(r"所有.{0,20}移位寄存器|all.{0,20}shift.{0,20}register", task_spec, re.I) else [])
         for index in itertools.count(1):
             if max_calls is not None and index > max_calls:
@@ -2307,7 +2376,7 @@ def main() -> int:
                             break
                         request_client = client.with_options(
                             timeout=model_request_timeout(remaining - finalize_reserve - 1), max_retries=0)
-                        dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
+                        dofile, meta = timed_call(performance_stages, "model_and_candidate", call_for_dofile, request_client, task, context, original if task == "task2" else None,
                                                      input_dir, run_dir, start + timeout_total - finalize_reserve - 1,
                                                      base_dofile=generation_base if run_records else None,
                                                      previous_mapping=generation_mapping,
@@ -2317,7 +2386,8 @@ def main() -> int:
                                                      previous_unallowed_codes=previous_unallowed_codes,
                                                      known_reset_ports=known_reset_ports,
                                                      reset_inference_evidenced=reset_inference_evidenced,
-                                                     clock_candidates=clock_candidates, mode_hints=mode_hints)
+                                                     clock_candidates=clock_candidates, mode_hints=mode_hints,
+                                                     diagnostics=last_log + "\n" + previous_reports)
                         previous_netlist_root = active_netlist_root
                         if meta.get("netlist_edits"):
                             edits = meta["netlist_edits"]
@@ -2405,7 +2475,7 @@ def main() -> int:
                 generation_error = f"Insufficient time after fingerprinting before {rid}"
                 break
             per_run_timeout = max(1, int(remaining - finalize_reserve))
-            result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path,
+            result = timed_call(performance_stages, "eda_and_collection", tool_run, dofile, run_dir, rid, per_run_timeout, execution_path,
                               abort_on_error=not (task == "task2" and index == 1),
                                allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
             changes.extend(pending_changes)
@@ -2428,7 +2498,11 @@ def main() -> int:
             last_log = diagnostic_excerpt(run_dir / f"{rid}.log")
             previous = dofile
             final_run_dir = run_dir
-            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates, mode_hints)
+            expected_checks = {"task": task, "segments": expected_segments, "floating": floating,
+                               "clock_candidates": clock_candidates, "mode_hints": mode_hints}
+            ok, problems = timed_call(performance_stages, "round_validation", validation_cache.validate, run_dir,
+                lambda: check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates, mode_hints),
+                dofile=dofile, task_spec=task_spec, status=result["status"], expected=expected_checks, tool_finished=True)
             modified = changed_paths(snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
@@ -2463,17 +2537,20 @@ def main() -> int:
         final_run_dir = runs_root / run_records[-1]["run_id"]
         final_results = output_dir / "final_results"
         final_results.mkdir(exist_ok=True)
-        shutil.copy2(final_run_dir / f"{run_records[-1]['run_id']}.log", final_results / "final.log")
+        timed_call(performance_stages, "final_copy", independent_copy, final_run_dir / f"{run_records[-1]['run_id']}.log", final_results / "final.log")
         deliverables = final_results / "deliverables"
         reports = final_results / "reports"
         deliverables.mkdir(exist_ok=True)
         reports.mkdir(exist_ok=True)
         (deliverables / "final.dofile").write_text(final_dofile, encoding="utf-8")
         # Copy actual tool-created products only.
-        copy_tree_contents(final_run_dir / "reports", reports)
-        copy_tree_contents(final_run_dir / "deliverables", deliverables)
-        tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile,
-                                                         run_records[-1]["exit_status"], expected_segments, floating, clock_candidates, mode_hints)
+        timed_call(performance_stages, "final_copy", copy_tree_contents, final_run_dir / "reports", reports)
+        timed_call(performance_stages, "final_copy", copy_tree_contents, final_run_dir / "deliverables", deliverables)
+        tool_checks_passed, final_problems = timed_call(performance_stages, "final_validation", validation_cache.validate, final_run_dir,
+            lambda: check_output(final_run_dir, task_spec, task, final_dofile,
+                                run_records[-1]["exit_status"], expected_segments, floating, clock_candidates, mode_hints),
+            dofile=final_dofile, task_spec=task_spec, status=run_records[-1]["exit_status"],
+            expected=expected_checks, tool_finished=True)
         if integrity_problems:
             tool_checks_passed = False
             final_problems.extend(integrity_problems)
@@ -2498,12 +2575,16 @@ def main() -> int:
             "issue_resolutions": issue_records,
             "tool_runs": [{"tool_call_id": r["run_id"], "log_file": r["log_file"],
                            "exit_status": r["exit_status"], "returncode": r.get("returncode"),
-                           "elapsed_seconds": r.get("elapsed_seconds"), "artifacts": r.get("artifacts", []),
+                           "elapsed_seconds": r.get("elapsed_seconds"), "collection_seconds": r.get("collection_seconds", 0),
+                           "artifacts": r.get("artifacts", []),
                            **({"repair_integrity_passed": r["repair_integrity_passed"]} if "repair_integrity_passed" in r else {})}
                           for r in run_records],
             "file_changes": changes,
             "netlist_repair_attempts": repair_attempts,
             "generation_rejections": generation_rejections,
+            "performance": {"validation_cache": dict(validation_cache.stats),
+                            "stages_seconds": {name: round(value, 6) for name, value in performance_stages.items()},
+                            "elapsed_before_serialization": round(time.monotonic() - start, 6)},
         }
         (output_dir / "decision_log.json").write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"status": "completed" if passed else "incomplete", "task": task,

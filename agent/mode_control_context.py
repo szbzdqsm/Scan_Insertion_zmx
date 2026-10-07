@@ -17,12 +17,22 @@ from clock_association_recipe import _chunks, _literal, _readonly_word, _safe_no
 _IDENTIFIER = r"[A-Za-z_$][\w$]*"
 _MODULE = re.compile(rf"^\s*module\s+({_IDENTIFIER})\b")
 _INSTANCE = re.compile(rf"^\s*({_IDENTIFIER})\s+(?:\\\S+|{_IDENTIFIER})\s*\(")
+_PARAMETERIZED_INSTANCE = re.compile(rf"^\s*{_IDENTIFIER}\s*#\s*\(")
+_DECLARATION_START = re.compile(r"^\s*(?:input|output|inout)\b")
+_HEADER_DIRECTION = re.compile(r"\b(?:input|output|inout)\b")
+_ENDMODULE = re.compile(r"\bendmodule\b")
+_WIDTH = re.compile(r"\[(\d+)\s*:\s*(\d+)\]\s*")
+_PORT_IDENTIFIER = re.compile(_IDENTIFIER)
 _DIRECTION = re.compile(r"^(input|output|inout)\s+", re.I)
 _TYPES = re.compile(r"^(?:(?:wire|reg|logic|tri|signed|unsigned)\s+)+")
 _MODE_NAME = re.compile(r"^(scan_mode|test_mode|mbist_mode|mbist_en|mbist_enable)(?:_(n|b|l))?(?:_(i|in))?$", re.I)
 
 
 def _uncomment(raw: str, blocked: bool) -> tuple[str, bool]:
+    # Most flattened-netlist lines contain neither kind of comment. Keep the
+    # full state machine for slash-bearing lines and open block comments.
+    if not blocked and "/" not in raw:
+        return raw, False
     parts = []
     while raw:
         if blocked:
@@ -54,12 +64,12 @@ def _declarations(text: str, source: str, line: int) -> tuple[dict[str, dict], b
             entry = entry[found.end():].strip()
             entry = _TYPES.sub("", entry).strip()
             if entry.startswith("["):
-                width = re.match(r"\[(\d+)\s*:\s*(\d+)\]\s*", entry)
+                width = _WIDTH.match(entry)
                 if not width:
                     return {}, False
                 scalar = width.group(1) == width.group(2)
                 entry = entry[width.end():].strip()
-        if not direction or not re.fullmatch(_IDENTIFIER, entry):
+        if not direction or not _PORT_IDENTIFIER.fullmatch(entry):
             return {}, False
         if entry in ports:
             return {}, False
@@ -86,9 +96,10 @@ def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
         with path.open(encoding="utf-8", errors="replace") as stream:
             for number, raw in enumerate(stream, 1):
                 line, blocked = _uncomment(raw, blocked)
-                if not line.strip():
+                line = line.strip()
+                if not line:
                     continue
-                found = _MODULE.match(line)
+                found = _MODULE.match(line) if line.startswith("module") else None
                 if found:
                     name = found.group(1)
                     if name in modules or len(modules) >= 100000:
@@ -100,7 +111,7 @@ def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
                     declaration = ""
                     header_pending = True
                 elif current is not None and header_pending:
-                    header += " " + line.strip()
+                    header += " " + line
                 if current is None:
                     continue
                 if header_pending:
@@ -118,14 +129,14 @@ def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
                             current["source_ports_complete"] = False
                             continue
                         body = body[1:-1].strip()
-                        if re.search(r"\b(?:input|output|inout)\b", body):
+                        if _HEADER_DIRECTION.search(body):
                             ports, complete = _declarations(body, str(path), current["line"])
                             current["ports"].update(ports)
                             current["header_ports"].update(ports)
                             current["source_ports_complete"] &= complete
                         else:
                             names = [word.strip() for word in body.split(",")]
-                            if all(re.fullmatch(_IDENTIFIER, word) for word in names) and len(set(names)) == len(names):
+                            if all(_PORT_IDENTIFIER.fullmatch(word) for word in names) and len(set(names)) == len(names):
                                 current["header_ports"].update(names)
                             else:
                                 current["source_ports_complete"] = False
@@ -133,9 +144,9 @@ def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
                         # is harmless because the next module resets the scope.
                         continue
                 if declaration:
-                    declaration += " " + line.strip()
-                elif re.match(r"^\s*(?:input|output|inout)\b", line):
-                    declaration, declaration_line = line.strip(), number
+                    declaration += " " + line
+                elif line.startswith(("input", "output", "inout")) and _DECLARATION_START.match(line):
+                    declaration, declaration_line = line, number
                 if declaration:
                     if len(declaration) > 65536:
                         current["source_ports_complete"] = False
@@ -148,15 +159,17 @@ def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
                         current["source_ports_complete"] &= complete
                         declaration = ""
                 else:
-                    instance = _INSTANCE.match(line)
+                    # Pin continuations cannot match either instance pattern;
+                    # no parentheses means neither pattern could match.
+                    instance = _INSTANCE.match(line) if "(" in line and not line.startswith(".") else None
                     if instance and instance.group(1) not in {"module", "assign", "input", "output", "inout"}:
                         child_types.add(instance.group(1))
-                    if re.match(rf"^\s*{_IDENTIFIER}\s*#\s*\(", line):
+                    if "#" in line and _PARAMETERIZED_INSTANCE.match(line):
                         hierarchy_ambiguous = True
                 if len(current["ports"]) > 4096:
                     current["source_ports_complete"] = False
                     current["ports"].clear()
-                if re.search(r"\bendmodule\b", line):
+                if "endmodule" in line and _ENDMODULE.search(line):
                     if declaration:
                         current["source_ports_complete"] = False
                     current = None

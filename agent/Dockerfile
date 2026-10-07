@@ -27,6 +27,8 @@ COPY clock_association_recipe.py /submission/clock_association_recipe.py
 COPY mode_control_context.py /submission/mode_control_context.py
 COPY insertion_evidence.py /submission/insertion_evidence.py
 COPY shift_report_recipe.py /submission/shift_report_recipe.py
+COPY artifact_operations.py /submission/artifact_operations.py
+COPY help_selection.py /submission/help_selection.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system
