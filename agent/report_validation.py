@@ -34,12 +34,15 @@ def _full_insertion_designs(dofile: str) -> set[str]:
         name = name.group(1)
         if name == "load_ctl":
             return set()
-        if re.search(r";\s*(?:load_ctl|present_design|insert_dft_logic)\b", command):
+        if re.search(r";\s*(?:load_ctl|load_netlist|present_design|insert_dft_logic)\b", command):
             return set()
         # Compound/dynamic invocation is outside this deliberately narrow check.
-        if name in {"present_design", "insert_dft_logic"} and ";" in command:
+        if name in {"load_netlist", "present_design", "insert_dft_logic"} and ";" in command:
             return set()
-        if name == "present_design":
+        if name == "load_netlist":
+            tops = re.findall(r'(?:^|\s)-top\s+(?:\{([\w$]+)\}|"([\w$]+)"|([\w$]+))(?=\s|$)', command)
+            design = next((item for item in tops[0] if item), "") if len(tops) == 1 else ""
+        elif name == "present_design":
             match = re.fullmatch(r'present_design\s+(?:\{([\w$]+)\}|"([\w$]+)"|([\w$]+))', command)
             design = next((item for item in match.groups() if item), "") if match else ""
         elif name == "insert_dft_logic" and design:
@@ -48,7 +51,7 @@ def _full_insertion_designs(dofile: str) -> set[str]:
         elif name == "exit":
             break
         elif name in {"if", "foreach", "for", "while", "proc", "eval", "source", "uplevel"}:
-            if re.search(r"\b(?:load_ctl|present_design|insert_dft_logic)\b", command):
+            if re.search(r"\b(?:load_ctl|load_netlist|present_design|insert_dft_logic)\b", command):
                 return set()
     return full
 

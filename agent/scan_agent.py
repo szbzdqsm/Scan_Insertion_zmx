@@ -27,6 +27,9 @@ from dofile_recipe import configure_floating_inputs, configure_shift_segments, n
 from floating_inputs import floating_clock_outputs
 from clock_latch_context import clock_latch_context, clock_latch_hints
 from clock_association_recipe import clock_association_problems, configure_clock_associations
+from mode_control_context import mode_control_context, mode_control_hints, mode_control_problems, requested_constant_modes
+from mode_control_context import mode_control_report_problems
+from insertion_evidence import insertion_replacement_evidence
 from model_script_view import model_owned_script
 from drc_retry_preflight import unchanged_control_retry_problems
 from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets
@@ -727,13 +730,15 @@ def apply_dofile_edits(base: str, edits: Any) -> str:
     if not isinstance(edits, list) or not 0 <= len(edits) <= 12:
         raise ValueError("dofile_edits must contain 0 to 12 localized replacements")
     replacements = []
-    for edit in edits:
+    for edit_index, edit in enumerate(edits, 1):
         if not isinstance(edit, dict) or not isinstance(edit.get("old"), str) or not isinstance(edit.get("new"), str):
             raise ValueError("Each Dofile edit needs literal old/new Tcl strings")
         old, new = edit["old"], edit["new"]
         position = base.find(old)
         if not old or max(len(old), len(new)) > 20000 or position < 0 or base.find(old, position + 1) >= 0:
-            raise ValueError("Dofile edit old span must be nonempty, unique and no larger than 20000 characters")
+            reason = "not found in the current editable script" if position < 0 else "empty, repeated or too large"
+            raise ValueError(f"Dofile edit {edit_index} old span must be nonempty, unique and no larger than 20000 characters ({reason}). "
+                             "Copy a unique span from the displayed CURRENT Dofile, or return the complete dofile without dofile_edits.")
         replacements.append((position, position + len(old), new))
     replacements.sort()
     if any(end > start for (_, end, _), (start, _, _) in zip(replacements, replacements[1:])):
@@ -812,7 +817,7 @@ def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
 
 
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
-                    clock_candidates: list[dict] | None = None) -> str:
+                    clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None) -> str:
     lib_names = [str(p) for p in libs]
     lib_summary = [liberty_summary(p) for p in libs]
     shift_summary = shift_register_context(netlists, libraries=libs) if re.search(r"移位寄存器|scan\s+segment", task_spec, re.I) else "Not requested"
@@ -839,6 +844,9 @@ Liberty files: {lib_names}
 
 # Literal clock-buffer and enable-latch connections (structural candidates, not proof)
 {clock_latch_context(netlists, libs, hints=clock_candidates) if re.search(r'ICG|门控|缓冲|latch|闩锁', task_spec, re.I) else 'Not requested'}
+
+# Real top-level mode inputs and task-conditioned constant settings
+{mode_control_context(netlists, task_spec, hints=mode_hints) if requested_constant_modes(task_spec) else 'Not requested'}
 
 # ScanInsertion manual excerpts (authoritative syntax reference)
 {manual_context(task_spec)}
@@ -870,7 +878,8 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     previous_unallowed_codes: set[str] | None = None,
                     known_reset_ports: set[str] | None = None,
                     reset_inference_evidenced: bool = False,
-                    clock_candidates: list[dict] | None = None) -> tuple[str, dict[str, Any]]:
+                    clock_candidates: list[dict] | None = None,
+                    mode_hints: list[dict] | None = None) -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
@@ -914,6 +923,14 @@ The actual read-only input directory is {input_dir}. The current run directory a
                "effective value already satisfies the task. A gated-clock CE latch stores enable data: "
                "its Q is not a clock merely because the downstream clock is inactive. Associate a source "
                "clock only with a demonstrated derived clock output or clock pin, using actual hierarchy.")
+    if mode_hints:
+        system += ("\nUse the supplied real top-level mode-port declarations and task-conditioned constants. "
+                   "Do not invent test_mode when only scan_mode exists. A scan_enable declaration is distinct "
+                   "from locking an existing scan/test mode input. If replacing a nonexistent control port, "
+                   "describe the actual replacement set_scan_signal command in the same issue's fix, so its "
+                   "SignalType and ConstantValue can be verified in the real signal report. "
+                   "Prefer Dofile mode and reset configuration before structural edits. A zero replacement "
+                   "count requires actual subsequent insertion and chain evidence, not just a control declaration.")
     if segments:
         system += ("\nThe runtime compiles ALL supplied actual shift-register candidates into set_scan_segment "
                    "commands and preserves their actual scan-enable pin connections. You may omit your own segment "
@@ -1023,6 +1040,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
             problems = unsupported_options(dofile, spec, known_reset_ports=set(control_hints or {}) | (known_reset_ports or set()),
                                            permit_reset_inference=reset_inference_evidenced or
                                            bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
+            problems.extend(mode_control_problems(dofile, spec, mode_hints or [], literal_tcl_words))
             if previous_actual_dofile is not None:
                 problems.extend(unchanged_control_retry_problems(
                     previous_actual_dofile, dofile, previous_unallowed_codes or set(),
@@ -1044,6 +1062,10 @@ The actual read-only input directory is {input_dir}. The current run directory a
         (run_dir / "llm_validation.json").write_text(json.dumps({"problems": problems}, indent=2))
         user += "\n# Your previous proposed JSON\n" + raw + "\n# Preflight errors (no tool call made)\n" + "\n".join(problems)
         user += "\nReturn corrected JSON with key dofile and valid options from the supplied built-in help."
+        if any("Dofile edit" in problem for problem in problems):
+            user += ("\nYour localized replacement could not be applied. For this correction return the complete editable "
+                     "Dofile in the dofile string and OMIT dofile_edits. Preserve the valid configuration; "
+                     "runtime-owned recipes and reports will be restored separately.")
     raise ValueError("LLM Dofile failed command preflight: " + "; ".join(problems))
 
 
@@ -1176,7 +1198,8 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
 def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: str,
                  expected_segments: list[dict[str, Any]] | None = None,
                  expected_floating: dict[str, list[str]] | None = None,
-                 clock_candidates: list[dict] | None = None) -> tuple[bool, list[str]]:
+                 clock_candidates: list[dict] | None = None,
+                 mode_hints: list[dict] | None = None) -> tuple[bool, list[str]]:
     problems: list[str] = []
     log_path = run_dir / f"{run_dir.name}.log"
     log = read_text(log_path, 100000)
@@ -1213,6 +1236,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     problems.extend(coverage_problems(report_files, dofile))
     problems.extend(wrapper_problems(report_files, task_spec))
     problems.extend(clock_association_problems(report_files, dofile, clock_candidates or [], task_spec, literal_tcl_words))
+    problems.extend(mode_control_report_problems(report_files, dofile, task_spec, mode_hints or [], literal_tcl_words))
     report_text = "\n".join(read_text(p, 50000) for p in report_files)
     actual_chains = chain_rows(report_files)
     problems.extend(chain_problems(actual_chains, task_spec))
@@ -1655,6 +1679,9 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
 def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir: Path,
                            dofile: str) -> dict[str, str] | None:
     """Bind the executed literal configuration to typed rows from the real tool."""
+    if re.search(r"\[INFO\]\s+\[\s*SCAN-7600\]\s+There were 0 'D' flip-flops", issue.get("found", {}).get("excerpt", "")):
+        # A declaration alone cannot prove that zero replacement was repaired.
+        return None
     exclusion = exclusion_command_evidence(issue, files, output_dir, dofile, literal_tcl_words)
     if exclusion:
         return exclusion
@@ -1865,6 +1892,7 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                                 continue
                             if any(key in options and row.get(column) != options[key]
                                    for key, column in (("off_state", "OffState"), ("usage", "Usage"),
+                                                       ("constant_value", "ConstantValue"),
                                                        ("associated_internal_clocks", "AssociatedInternal"))):
                                 continue
                             return {"source": path.relative_to(output_dir).as_posix(),
@@ -2034,8 +2062,10 @@ def verify_issue_fixes(issues: list[dict[str, Any]], verification_plans: dict[st
         verify = attempts[-1]["verify"]
         if verify["resolved"]:
             continue
-        evidence = positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir,
-                                          permitted_drc)
+        zero_replacement = bool(re.search(r"\[INFO\]\s+\[\s*SCAN-7600\]\s+There were 0 'D' flip-flops", issue["found"]["excerpt"]))
+        evidence = (insertion_replacement_evidence(issue, files, output_dir, dofile, literal_tcl_words)
+                    if zero_replacement else
+                    positive_issue_evidence(issue, verification_plans.get(issue["issue_id"], {}), files, output_dir, permitted_drc))
         if not evidence:
             evidence = configuration_evidence(issue, files, output_dir, dofile)
         if evidence:
@@ -2079,6 +2109,7 @@ def main() -> int:
     issue_records: list[dict[str, Any]] = []
     verification_plans: dict[str, dict[str, Any]] = {}
     repair_attempts: list[dict[str, Any]] = []
+    generation_rejections: list[dict[str, Any]] = []
     requirement_mapping: list[dict[str, Any]] = []
     final_dofile = ""
     task = "task1"
@@ -2107,7 +2138,9 @@ def main() -> int:
         generation_error = ""
         validation_problems: list[str] = []
         clock_candidates = (clock_latch_hints(netlists, libs) if re.search(r"ICG|门控|缓冲|latch|闩锁", task_spec, re.I) else [])
-        static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "", clock_candidates=clock_candidates)
+        mode_hints = mode_control_hints(netlists) if requested_constant_modes(task_spec) else []
+        static_context = context_for_run(input_dir, task_spec, limits, netlists, libs, "",
+                                         clock_candidates=clock_candidates, mode_hints=mode_hints)
         control_hints = reset_polarity_hints(netlists, libs)
         known_reset_ports = set(control_hints)
         reset_inference_evidenced = False
@@ -2175,58 +2208,81 @@ def main() -> int:
                 (script_root / "original.dofile").write_text(original, encoding="utf-8")
                 execution_path = script_root / "original.dofile"
             else:
-                try:
-                    if client is None:
-                        client = get_client()
-                    remaining = timeout_total - (time.monotonic() - start)
-                    if remaining <= finalize_reserve + 1:
-                        generation_error = f"Insufficient time for Dofile generation before {rid}; finalization reserve retained"
+                admitted = False
+                for proposal_index in range(3):
+                    repair_tag = rid if proposal_index == 0 else f"{rid}_proposal{proposal_index + 1}"
+                    try:
+                        if client is None:
+                            client = get_client()
+                        remaining = timeout_total - (time.monotonic() - start)
+                        if remaining <= finalize_reserve + 1:
+                            generation_error = f"Insufficient time for Dofile generation before {rid}; finalization reserve retained"
+                            break
+                        request_client = client.with_options(
+                            timeout=model_request_timeout(remaining - finalize_reserve - 1), max_retries=0)
+                        dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
+                                                     input_dir, run_dir, start + timeout_total - finalize_reserve - 1,
+                                                     base_dofile=generation_base if run_records else None,
+                                                     previous_mapping=generation_mapping,
+                                                     catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir, task_spec=task_spec) if run_records else None,
+                                                     segments=expected_segments, control_hints=control_hints, instances=instances, floating=floating,
+                                                     previous_actual_dofile=generation_actual_base if run_records else None,
+                                                     previous_unallowed_codes=previous_unallowed_codes,
+                                                     known_reset_ports=known_reset_ports,
+                                                     reset_inference_evidenced=reset_inference_evidenced,
+                                                     clock_candidates=clock_candidates, mode_hints=mode_hints)
+                        previous_netlist_root = active_netlist_root
+                        if meta.get("netlist_edits"):
+                            edits = meta["netlist_edits"]
+                            if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
+                                raise RepairRejected("netlist_edits must be an array of localized edit objects")
+                            prior_files = run_evidence_files(runs_root / run_records[-1]["run_id"]) if run_records else []
+                            if any(not locate_evidence(prior_files, output_dir, str(edit.get("evidence_excerpt", "")))
+                                   for edit in edits):
+                                raise RepairRejected("Netlist edit is missing exact preceding tool diagnostic evidence")
+                            active_netlists, netlist_changes = prepare_repair(
+                                task, task_spec, original or "", input_dir, netlists, active_netlists, libs,
+                                edits, output_dir, repair_tag, start + timeout_total - finalize_reserve - 1)
+                            active_netlist_root = output_dir / "netlist_versions" / repair_tag
+                            repair_attempts.append({"run_ref": rid, "admitted": True, "adopted": False,
+                                                    "lec_ref": f"lec/{repair_tag}/aggregate.log"})
+                        if active_netlist_root != input_dir / "netlist":
+                            dofile = dofile.replace(str(previous_netlist_root), str(active_netlist_root))
+                            dofile = dofile.replace(str(input_dir / "netlist"), str(active_netlist_root))
+                            if task == "task2":
+                                (script_root / "netlist").unlink()
+                                (script_root / "netlist").symlink_to(active_netlist_root, target_is_directory=True)
+                        admitted = True
+                        generation_error = ""
                         break
-                    request_client = client.with_options(
-                        timeout=model_request_timeout(remaining - finalize_reserve - 1), max_retries=0)
-                    dofile, meta = call_for_dofile(request_client, task, context, original if task == "task2" else None,
-                                                 input_dir, run_dir, start + timeout_total - finalize_reserve - 1,
-                                                 base_dofile=generation_base if run_records else None,
-                                                 previous_mapping=generation_mapping,
-                                                 catalog=evidence_catalog(runs_root / run_records[-1]["run_id"], output_dir, task_spec=task_spec) if run_records else None,
-                                                 segments=expected_segments, control_hints=control_hints, instances=instances, floating=floating,
-                                                 previous_actual_dofile=generation_actual_base if run_records else None,
-                                                 previous_unallowed_codes=previous_unallowed_codes,
-                                                 known_reset_ports=known_reset_ports,
-                                                 reset_inference_evidenced=reset_inference_evidenced,
-                                                 clock_candidates=clock_candidates)
-                    if meta.get("netlist_edits"):
-                        edits = meta["netlist_edits"]
-                        if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
-                            raise RepairRejected("netlist_edits must be an array of localized edit objects")
-                        prior_files = run_evidence_files(runs_root / run_records[-1]["run_id"]) if run_records else []
-                        if any(not locate_evidence(prior_files, output_dir, str(edit.get("evidence_excerpt", "")))
-                               for edit in edits):
-                            raise RepairRejected("Netlist edit is missing exact preceding tool diagnostic evidence")
-                        active_netlists, netlist_changes = prepare_repair(
-                            task, task_spec, original or "", input_dir, netlists, active_netlists, libs,
-                            edits, output_dir, rid, start + timeout_total - finalize_reserve - 1)
-                        active_netlist_root = output_dir / "netlist_versions" / rid
-                        repair_attempts.append({"run_ref": rid, "admitted": True, "adopted": False,
-                                                "lec_ref": f"lec/{rid}/aggregate.log"})
-                    if active_netlist_root != input_dir / "netlist":
-                        dofile = dofile.replace(str(input_dir / "netlist"), str(active_netlist_root))
-                        if task == "task2":
-                            (script_root / "netlist").unlink()
-                            (script_root / "netlist").symlink_to(active_netlist_root, target_is_directory=True)
-                except RepairRejected as e:
-                    generation_error = f"Netlist repair rejected before {rid}: {e}"
-                    repair_attempts.append({"run_ref": rid, "adopted": False, "reason": str(e),
-                                            "lec_ref": f"lec/{rid}/aggregate.log" if (output_dir / "lec" / rid / "aggregate.log").exists() else ""})
-                    (run_dir / "repair_rejection.json").write_text(json.dumps(repair_attempts[-1], ensure_ascii=False, indent=2))
-                    if run_records:
+                    except (RepairRejected, ValueError) as e:
+                        generation_error = f"Candidate rejected before {rid}: {type(e).__name__}: {e}"
+                        rejection = {"run_ref": rid, "proposal_index": proposal_index + 1,
+                                     "tool_called": False, "reason": str(e), "error_type": type(e).__name__}
+                        generation_rejections.append(rejection)
+                        rejected_dir = run_dir / "rejected_proposals" / f"P{proposal_index + 1}"
+                        rejected_dir.mkdir(parents=True, exist_ok=False)
+                        for artifact in run_dir.glob("llm_*"):
+                            if artifact.is_file():
+                                shutil.move(str(artifact), rejected_dir / artifact.name)
+                        (rejected_dir / "rejection.json").write_text(json.dumps(rejection, ensure_ascii=False, indent=2))
+                        if isinstance(e, RepairRejected):
+                            proof_log = f"lec/{repair_tag}/aggregate.log"
+                            repair_attempts.append({"run_ref": rid, "proposal_index": proposal_index + 1,
+                                                    "admitted": False, "adopted": False, "reason": str(e),
+                                                    "lec_ref": proof_log if (output_dir / proof_log).exists() else ""})
+                        context += ("\n# Rejected proposal; NO tool call and NO candidate adoption\n" + generation_error +
+                                    "\nThe displayed CURRENT Dofile and current netlists remain the authoritative base. "
+                                    "Correct the configuration using actual input ports and source paths. "
+                                    "For a failed Dofile span return a complete dofile without dofile_edits. "
+                                    "A netlist edit still needs exact diagnostics, a unique source span and a successful EQY proof.\n")
+                    except Exception as e:
+                        generation_error = f"LLM Dofile generation failed before {rid}: {type(e).__name__}: {e}"
+                        if not run_records:
+                            raise
                         break
-                    raise
-                except Exception as e:
-                    generation_error = f"LLM Dofile generation failed before R{index}: {type(e).__name__}: {e}"
-                    if run_records:
-                        break
-                    raise
+                if not admitted:
+                    break
                 execution_path = None
                 if task == "task2":
                     execution_path = script_root / f"{rid}.dofile"
@@ -2238,18 +2294,18 @@ def main() -> int:
                 break
             previous_run = run_records[-1]["run_id"] if run_records else ""
             change_id = ""
+            pending_changes = []
             if index > 1:
                 prior = run_records[-1]
                 diff_path = write_diff(output_dir, previous, dofile, prior["run_id"], rid)
                 change_id = f"F{len(changes)+1}"
-                changes.append({"change_id": change_id, "type": "dofile",
+                pending_changes.append({"change_id": change_id, "type": "dofile",
                                 "path": f"runs/{rid}/deliverables/{rid}.dofile", "diff_path": diff_path, "lec_ref": ""})
             netlist_change_ids = []
             for change in netlist_changes:
-                change["change_id"] = f"F{len(changes)+1}"
+                change["change_id"] = f"F{len(changes)+len(pending_changes)+1}"
                 netlist_change_ids.append(change["change_id"])
-                changes.append(change)
-            final_dofile = dofile
+                pending_changes.append(change)
             snapshot = {}
             if active_netlist_root != input_dir / "netlist":
                 protected = list(active_netlists.values())
@@ -2264,7 +2320,9 @@ def main() -> int:
             per_run_timeout = max(1, int(remaining - finalize_reserve))
             result = tool_run(dofile, run_dir, rid, per_run_timeout, execution_path,
                               abort_on_error=not (task == "task2" and index == 1),
-                              allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
+                               allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
+            changes.extend(pending_changes)
+            final_dofile = dofile
             if not (task == "task2" and index == 1):
                 for statement in dofile.replace("\\\n", " ").splitlines():
                     if re.match(r"\s*set_scan_signal\b", statement) and re.search(r"-type\s+reset\b", statement):
@@ -2283,7 +2341,7 @@ def main() -> int:
             last_log = diagnostic_excerpt(run_dir / f"{rid}.log")
             previous = dofile
             final_run_dir = run_dir
-            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates)
+            ok, problems = check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates, mode_hints)
             modified = changed_paths(snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
@@ -2328,7 +2386,7 @@ def main() -> int:
         copy_tree_contents(final_run_dir / "reports", reports)
         copy_tree_contents(final_run_dir / "deliverables", deliverables)
         tool_checks_passed, final_problems = check_output(final_run_dir, task_spec, task, final_dofile,
-                                                         run_records[-1]["exit_status"], expected_segments, floating, clock_candidates)
+                                                         run_records[-1]["exit_status"], expected_segments, floating, clock_candidates, mode_hints)
         if integrity_problems:
             tool_checks_passed = False
             final_problems.extend(integrity_problems)
@@ -2358,6 +2416,7 @@ def main() -> int:
                           for r in run_records],
             "file_changes": changes,
             "netlist_repair_attempts": repair_attempts,
+            "generation_rejections": generation_rejections,
         }
         (output_dir / "decision_log.json").write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"status": "completed" if passed else "incomplete", "task": task,
@@ -2372,7 +2431,8 @@ def main() -> int:
             (output_dir / "decision_log.json").write_text(json.dumps({"case_id": case_id_for(input_dir), "task": task,
                 "final_run": run_records[-1]["run_id"] if run_records else "", "summary": "Agent failed: " + error_message,
                 "requirement_mapping": requirement_mapping, "issue_resolutions": issue_records,
-                "tool_runs": run_records, "file_changes": changes}, ensure_ascii=False, indent=2), encoding="utf-8")
+                "tool_runs": run_records, "file_changes": changes,
+                "generation_rejections": generation_rejections}, ensure_ascii=False, indent=2), encoding="utf-8")
         return 1
 
 

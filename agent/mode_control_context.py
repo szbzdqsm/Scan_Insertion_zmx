@@ -1,0 +1,399 @@
+"""Conservative source-only mode-port hints and checks for literal Dofile settings.
+
+These checks neither edit a netlist nor prove scan semantics.  A setting is
+required only when the task explicitly requests a constant scan-test mode (or
+disabled MBIST), and one scalar input has the corresponding literal name.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+from typing import Callable, Any
+
+from clock_association_recipe import _chunks, _literal, _readonly_word, _safe_non_scope, _text, _TOOL_CONFIGURATION
+
+
+_IDENTIFIER = r"[A-Za-z_$][\w$]*"
+_MODULE = re.compile(rf"^\s*module\s+({_IDENTIFIER})\b")
+_INSTANCE = re.compile(rf"^\s*({_IDENTIFIER})\s+(?:\\\S+|{_IDENTIFIER})\s*\(")
+_DIRECTION = re.compile(r"^(input|output|inout)\s+", re.I)
+_TYPES = re.compile(r"^(?:(?:wire|reg|logic|tri|signed|unsigned)\s+)+")
+_MODE_NAME = re.compile(r"^(scan_mode|test_mode|mbist_mode|mbist_en|mbist_enable)(?:_(n|b|l))?(?:_(i|in))?$", re.I)
+
+
+def _uncomment(raw: str, blocked: bool) -> tuple[str, bool]:
+    parts = []
+    while raw:
+        if blocked:
+            end = raw.find("*/")
+            if end < 0:
+                break
+            raw, blocked = raw[end + 2:], False
+        comment, start = raw.find("//"), raw.find("/*")
+        if comment >= 0 and (start < 0 or comment < start):
+            parts.append(raw[:comment])
+            break
+        if start < 0:
+            parts.append(raw)
+            break
+        parts.append(raw[:start])
+        raw, blocked = raw[start + 2:], True
+    return "".join(parts), blocked
+
+
+def _declarations(text: str, source: str, line: int) -> tuple[dict[str, dict], bool]:
+    """Read simple ANSI entries or a single non-ANSI declaration, fail closed."""
+    ports: dict[str, dict] = {}
+    direction, scalar = "", True
+    for entry in text.strip().rstrip(";").split(","):
+        entry = entry.strip()
+        found = _DIRECTION.match(entry)
+        if found:
+            direction, scalar = found.group(1).lower(), True
+            entry = entry[found.end():].strip()
+            entry = _TYPES.sub("", entry).strip()
+            if entry.startswith("["):
+                width = re.match(r"\[(\d+)\s*:\s*(\d+)\]\s*", entry)
+                if not width:
+                    return {}, False
+                scalar = width.group(1) == width.group(2)
+                entry = entry[width.end():].strip()
+        if not direction or not re.fullmatch(_IDENTIFIER, entry):
+            return {}, False
+        if entry in ports:
+            return {}, False
+        ports[entry] = {"direction": direction, "scalar": scalar, "source": source, "line": line}
+    return ports, bool(ports)
+
+
+def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
+    """Stream input Verilog; retain only headers, declarations and module types.
+
+    Escaped/parameterized headers, duplicate modules, unparsed declarations,
+    oversized port lists, or uncertain hierarchy disable strict checks.
+    """
+    modules: dict[str, dict] = {}
+    child_types: set[str] = set()
+    hierarchy_ambiguous = False
+    for path in paths:
+        blocked = False
+        current: dict | None = None
+        header = ""
+        header_pending = False
+        declaration = ""
+        declaration_line = 0
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for number, raw in enumerate(stream, 1):
+                line, blocked = _uncomment(raw, blocked)
+                if not line.strip():
+                    continue
+                found = _MODULE.match(line)
+                if found:
+                    name = found.group(1)
+                    if name in modules or len(modules) >= 100000:
+                        return []
+                    current = {"root": name, "ports": {}, "header_ports": set(), "source_ports_complete": True,
+                               "source": str(path), "line": number}
+                    modules[name] = current
+                    header = line[found.end():].strip()
+                    declaration = ""
+                    header_pending = True
+                elif current is not None and header_pending:
+                    header += " " + line.strip()
+                if current is None:
+                    continue
+                if header_pending:
+                    if len(header) > 65536:
+                        current["source_ports_complete"] = False
+                        header_pending = False
+                    elif ";" not in header:
+                        continue
+                    else:
+                        header_pending = False
+                        body = header.split(";", 1)[0].strip()
+                        if not body or body == "()":
+                            continue
+                        if not (body.startswith("(") and body.endswith(")")):
+                            current["source_ports_complete"] = False
+                            continue
+                        body = body[1:-1].strip()
+                        if re.search(r"\b(?:input|output|inout)\b", body):
+                            ports, complete = _declarations(body, str(path), current["line"])
+                            current["ports"].update(ports)
+                            current["header_ports"].update(ports)
+                            current["source_ports_complete"] &= complete
+                        else:
+                            names = [word.strip() for word in body.split(",")]
+                            if all(re.fullmatch(_IDENTIFIER, word) for word in names) and len(set(names)) == len(names):
+                                current["header_ports"].update(names)
+                            else:
+                                current["source_ports_complete"] = False
+                        # The declaration is already parsed; same-line endmodule
+                        # is harmless because the next module resets the scope.
+                        continue
+                if declaration:
+                    declaration += " " + line.strip()
+                elif re.match(r"^\s*(?:input|output|inout)\b", line):
+                    declaration, declaration_line = line.strip(), number
+                if declaration:
+                    if len(declaration) > 65536:
+                        current["source_ports_complete"] = False
+                        declaration = ""
+                    elif ";" in declaration:
+                        ports, complete = _declarations(declaration.split(";", 1)[0], str(path), declaration_line)
+                        if current["ports"].keys() & ports.keys():
+                            current["source_ports_complete"] = False
+                        current["ports"].update(ports)
+                        current["source_ports_complete"] &= complete
+                        declaration = ""
+                else:
+                    instance = _INSTANCE.match(line)
+                    if instance and instance.group(1) not in {"module", "assign", "input", "output", "inout"}:
+                        child_types.add(instance.group(1))
+                    if re.match(rf"^\s*{_IDENTIFIER}\s*#\s*\(", line):
+                        hierarchy_ambiguous = True
+                if len(current["ports"]) > 4096:
+                    current["source_ports_complete"] = False
+                    current["ports"].clear()
+                if re.search(r"\bendmodule\b", line):
+                    if declaration:
+                        current["source_ports_complete"] = False
+                    current = None
+    result = []
+    for name in sorted(modules.keys() - child_types):
+        module = modules[name]
+        ports = module["ports"]
+        complete = module["source_ports_complete"] and not hierarchy_ambiguous and module["header_ports"] == ports.keys()
+        inputs = {port: detail for port, detail in ports.items() if detail["direction"] == "input"}
+        candidates = []
+        for port, detail in sorted(inputs.items()):
+            found = _MODE_NAME.fullmatch(port)
+            if found:
+                candidates.append({"port": port, "role": "mbist" if found.group(1).lower().startswith("mbist") else "scan_test",
+                                   "active_level": 0 if found.group(2) else 1,
+                                   "confidence": "literal_scalar_name" if detail["scalar"] else "vector_not_inferred",
+                                   **detail})
+        result.append({"root": name, "input_ports": sorted(inputs), "mode_candidates": candidates,
+                       "source_ports_complete": bool(complete), "source": module["source"], "line": module["line"]})
+    return result
+
+
+def requested_constant_modes(spec: str) -> set[str]:
+    """Recognize explicit constant requirements, never generic Scan Insertion."""
+    requested = set()
+    for sentence in re.split(r"[\n;；。]", spec):
+        constant = re.search(r"常量|\bconstants?\b|锁定|锁死|tie(?:d)?\s+(?:high|low|to)|held\s+(?:at|high|low)", sentence, re.I)
+        if not constant:
+            continue
+        negative_scan = re.search(r"不进入.{0,8}(?:扫描|scan)|不.{0,8}扫描测试|disable.{0,12}scan|not.{0,12}scan", sentence, re.I)
+        if not negative_scan and re.search(r"(?:进入|处于|使能).{0,12}扫描(?:测试)?模式|(?:enter|enable|in).{0,15}scan(?:[- ]test)?\s+mode", sentence, re.I):
+            requested.add("scan_test")
+        if re.search(r"不进入\s*MBIST|(?:禁用|禁止|关闭).{0,12}MBIST|(?:disable|no|not(?:\s+enter)?|without).{0,12}MBIST", sentence, re.I):
+            requested.add("mbist")
+    return requested
+
+
+def _expected(hint: dict, spec: str) -> dict[str, int]:
+    if not hint.get("source_ports_complete"):
+        return {}
+    wanted = requested_constant_modes(spec)
+    result = {}
+    for role in sorted(wanted):
+        candidates = [candidate for candidate in hint.get("mode_candidates", []) if candidate.get("role") == role]
+        if len(candidates) == 1 and candidates[0].get("confidence") == "literal_scalar_name":
+            candidate = candidates[0]
+            result[candidate["port"]] = candidate["active_level"] if role == "scan_test" else 1 - candidate["active_level"]
+    return result
+
+
+def mode_control_context(paths: list[Path], spec: str, *, hints: list[dict] | None = None, limit: int = 12000) -> str:
+    candidates = mode_control_hints(paths) if hints is None else hints
+    rows = [{**hint, "required_literal_constants": _expected(hint, spec)} for hint in candidates]
+    return ("Mode-port candidates from read-only input module declarations. Only scalar, uniquely named scan_mode/test_mode "
+            "and MBIST controls have literal polarity hints. Values are conditional on an explicit constant-mode task. "
+            "Do not invent test_mode when the input top instead has scan_mode; do not treat generic scan-enable, clocks, "
+            "resets or functional inputs as these mode constants. Missing/ambiguous names or unsupported HDL require actual "
+            "source/tool investigation. Configure required constants with set_scan_signal -type constant -port PORT "
+            "-constant_value 0/1. This is structural guidance, not a DRC or post-scan proof.\n" +
+            json.dumps(rows, ensure_ascii=False, indent=2))[:limit]
+
+
+def mode_control_problems(script: str, spec: str, hints: list[dict],
+                          words_for: Callable[[str], list[str]]) -> list[str]:
+    """Reject nonexistent or missing/wrong constant modes in simple literal Tcl.
+
+    Only reviewed output/directory guards and read-only queries are transparent.
+    Evaluated Tcl, unknown bodies, or dynamic relevant declarations disable this
+    narrow check. Literal continuations and command separators are supported.
+    """
+    if not requested_constant_modes(spec):
+        return []
+    roots = {hint.get("root"): hint for hint in hints if _expected(hint, spec)}
+    if not roots:
+        return []
+    design = ""
+    seen_roots: set[str] = set()
+    declared: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    nonexistent = []
+    try:
+        chunks = _chunks(script)
+    except ValueError:
+        return []
+    for chunk in chunks:
+        line = _text(chunk)
+        if not line or line.startswith("#"):
+            continue
+        words = words_for(line)
+        if not words:
+            return []
+        if _safe_non_scope(words, words_for):
+            continue
+        if words[0] not in _TOOL_CONFIGURATION or not all(_readonly_word(word, words_for) for word in words[1:]):
+            return []
+        if words[0] == "load_netlist":
+            design = ""
+            if "-top" in words:
+                if words.count("-top") != 1 or words.index("-top") + 1 >= len(words):
+                    return []
+                design = _literal(words[words.index("-top") + 1])
+                if not design:
+                    return []
+                if design in roots:
+                    seen_roots.add(design)
+        if words[0] == "present_design":
+            if len(words) != 2 or not (design := _literal(words[1])):
+                return []
+            if design in roots:
+                seen_roots.add(design)
+        if words[0] != "set_scan_signal" or design not in roots:
+            continue
+        if len(words[1:]) % 2:
+            return []
+        options = {key: _literal(value) for key, value in zip(words[1::2], words[2::2])}
+        if len(options) != len(words[1::2]):
+            return []
+        if any(value is None for value in options.values()):
+            return []
+        ports = options.get("-port", "").split()
+        if any(re.search(r"[$\[\]\\]", port) for port in ports):
+            return []
+        expected = _expected(roots[design], spec)
+        for port in ports:
+            if _MODE_NAME.fullmatch(port) and port not in roots[design].get("input_ports", []):
+                nonexistent.append(f"Mode control {port} is not a real input of {design}; use the input-source port declarations")
+            if port in expected:
+                if re.search(r"[$\[\]\\]", options.get("-type", "") + options.get("-constant_value", "")):
+                    return []
+                declared.setdefault((design, port), []).append((options.get("-type", ""), options.get("-constant_value", "")))
+    problems = nonexistent
+    for design in sorted(seen_roots):
+        for port, value in _expected(roots[design], spec).items():
+            settings = declared.get((design, port), [])
+            if settings != [("constant", str(value))]:
+                problems.append(f"Task requires the real input {design}/{port} locked as -type constant -constant_value {value}; "
+                                "the literal setting is missing, conflicting, or has the wrong type/value")
+    return list(dict.fromkeys(problems))
+
+
+def _mode_control_scope(script: str, spec: str, hints: list[dict],
+                        words_for: Callable[[str], list[str]]) -> tuple[str, dict[str, int]] | None:
+    """Identify one literal selected source root; unknown Tcl leaves it unverified."""
+    roots = {hint.get("root"): _expected(hint, spec) for hint in hints if _expected(hint, spec)}
+    if not roots:
+        return None
+    try:
+        chunks = _chunks(script)
+    except ValueError:
+        return None
+    design = ""
+    selected = set()
+    for chunk in chunks:
+        text = _text(chunk)
+        if not text or text.startswith("#"):
+            continue
+        words = words_for(text)
+        if not words:
+            return None
+        if _safe_non_scope(words, words_for):
+            continue
+        if words[0] not in _TOOL_CONFIGURATION or not all(_readonly_word(word, words_for) for word in words[1:]):
+            return None
+        if words[0] == "load_netlist":
+            design = ""
+            if "-top" in words:
+                if words.count("-top") != 1 or words.index("-top") + 1 >= len(words):
+                    return None
+                design = _literal(words[words.index("-top") + 1])
+                if not design:
+                    return None
+                selected.add(design)
+        if words[0] == "present_design":
+            if len(words) != 2 or not (design := _literal(words[1])):
+                return None
+            selected.add(design)
+        if words[0] == "set_scan_signal":
+            if len(words[1:]) % 2 or len(set(words[1::2])) != len(words[1::2]):
+                return None
+            if any(_literal(word) is None for word in words[2::2]):
+                return None
+        if words[0] == "exit":
+            break
+    return (design, roots[design]) if len(selected) == 1 and design in roots else None
+
+
+def mode_control_report_problems(paths: list[Path], script: str, spec: str, hints: list[dict],
+                                 words_for: Callable[[str], list[str]]) -> list[str]:
+    """Check actual typed signal rows for a statically identifiable source top.
+
+    Unknown/dynamic Tcl or ambiguous selected roots returns no findings and
+    leaves this semantic check unverified.  A known scope requires an actual
+    Design block, all three typed columns, and a matching constant value for
+    every uniquely inferred mode control.  Script text is never report proof.
+    """
+    scope = _mode_control_scope(script, spec, hints, words_for)
+    if scope is None:
+        return []
+    root, expected = scope
+    required = {"Port", "SignalType", "ConstantValue"}
+    seen = set()
+    problems = []
+    for path in paths:
+        if path.suffix.lower() != ".rpt" or not path.is_file():
+            continue
+        design = ""
+        columns: list[tuple[str, int]] = []
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for number, line in enumerate(stream, 1):
+                design_line = re.fullmatch(r"\s*Design:\s*(\S+)\s*", line)
+                if design_line:
+                    design = design_line.group(1)
+                    columns = []
+                    continue
+                names = [(match.group(), match.start()) for match in re.finditer(r"\S+", line)]
+                labels = {name for name, _ in names}
+                if "Port" in labels and ("SignalType" in labels or "ConstantValue" in labels or "signal" in path.name.lower()):
+                    columns = names
+                    if design == root and not required <= labels:
+                        problems.append(f"Actual signal report {path}:{number} (Design {root}) lacks typed mode columns: " +
+                                        ", ".join(sorted(required - labels)))
+                    continue
+                if design != root or not columns or not required <= {name for name, _ in columns}:
+                    continue
+                if not line.strip() or line.lstrip().startswith("-"):
+                    continue
+                row = {name: line[start:columns[index + 1][1] if index + 1 < len(columns) else None].strip()
+                       for index, (name, start) in enumerate(columns)}
+                port = row["Port"]
+                if port not in expected:
+                    continue
+                if row["SignalType"] != "constant" or row["ConstantValue"] != str(expected[port]):
+                    problems.append(f"Actual signal report {path}:{number} (Design {root}) reports {port} as "
+                                    f"SignalType={row['SignalType']!r}, ConstantValue={row['ConstantValue']!r}; "
+                                    f"task requires constant {expected[port]}")
+                else:
+                    seen.add(port)
+    for port in sorted(expected.keys() - seen):
+        problems.append(f"Actual signal reports do not prove Design {root} input {port} as constant {expected[port]} "
+                        "with Port/SignalType/ConstantValue columns")
+    return list(dict.fromkeys(problems))

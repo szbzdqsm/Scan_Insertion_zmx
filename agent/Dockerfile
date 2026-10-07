@@ -24,6 +24,8 @@ COPY model_script_view.py /submission/model_script_view.py
 COPY drc_retry_preflight.py /submission/drc_retry_preflight.py
 COPY wrapper_validation.py /submission/wrapper_validation.py
 COPY clock_association_recipe.py /submission/clock_association_recipe.py
+COPY mode_control_context.py /submission/mode_control_context.py
+COPY insertion_evidence.py /submission/insertion_evidence.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system

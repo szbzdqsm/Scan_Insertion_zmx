@@ -680,6 +680,25 @@ class AuditRegression(unittest.TestCase):
         self.assertTrue(issues[0]["attempts"][0]["verify"]["resolved"])
         self.assertEqual(issues[0]["attempts"][0]["verify"]["locator"], "L2")
 
+    def test_constant_mode_fix_requires_actual_constant_value(self):
+        item = dict(self.item, evidence_excerpt="[ERROR] Port 'test_mode' does not exist.",
+                    located_object="set_scan_signal -type constant -port test_mode",
+                    fix="Replace with set_scan_signal -type constant -port scan_mode -constant_value 1")
+        (self.out / "runs/R1/R1.log").write_text(item["evidence_excerpt"] + "\n")
+        issues, plans = self.record(item)
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text("set_scan_signal -type constant -port scan_mode -constant_value 1\n")
+        report = run / "reports/rpt_scan_signal.audit.rpt"
+        header = f"{'Port':16}{'PortProperty':18}{'SignalType':22}{'OffState':12}{'ConstantValue':16}\n"
+        for value in ("0", "N/A"):
+            report.write_text(header + f"{'scan_mode':16}{'pre_existing':18}{'constant':22}{'N/A':12}{value:16}\n")
+            agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+            self.assertFalse(issues[0]["attempts"][-1]["verify"]["resolved"])
+        report.write_text(header + f"{'scan_mode':16}{'pre_existing':18}{'constant':22}{'N/A':12}{'1':16}\n")
+        agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
+        self.assertTrue(issues[0]["attempts"][-1]["verify"]["resolved"])
+
     def test_config_option_fix_requires_actual_report_value(self):
         item = dict(self.item, evidence_excerpt="[ERROR] set_scan_cfg execution failed",
                     located_object="set_scan_cfg -mix_edges wrong", fix="set_scan_cfg -mix_edges true")
@@ -919,20 +938,25 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(allowed["status"], "completed")
         self.assertIn("reached end", (self.out / "runs/R1/R1.log").read_text())
 
-    def run_main(self, task2=False, diagnosed=False, generation_seconds=17, task_spec="Generate a real post-scan netlist."):
+    def run_main(self, task2=False, diagnosed=False, generation_seconds=17, task_spec="Generate a real post-scan netlist.",
+                 rejected_edit=False, tool_limit=2, netlist_repairs=False, fingerprint_seconds=0,
+                 failing_runs=None):
         input_dir = self.root / "work/input/hidden_case_1/input"
         output_dir = self.root / "work/output/hidden_case_1"
         (input_dir / "netlist").mkdir(parents=True)
         (input_dir / "lib").mkdir()
         (input_dir / "task_spec.md").write_text(task_spec)
-        (input_dir / "limitations.md").write_text("总时间 100 秒\n工具调用次数 2")
-        (input_dir / "netlist/pre_scan.v").write_text("module top(); endmodule\n")
+        (input_dir / "limitations.md").write_text(f"总时间 100 秒\n工具调用次数 {tool_limit}")
+        (input_dir / "netlist/pre_scan.v").write_text("module top(); wire original; endmodule\n" if netlist_repairs else
+                                                     "module top(); endmodule\n")
         (input_dir / "lib/stdcells.lib").write_text("cell(DFF) {}\n")
         if task2:
             (input_dir / "original.dofile").write_text("bad original\n")
         clock = types.SimpleNamespace(now=0)
-        captures = {"calls": [], "requests": []}
+        captures = {"calls": [], "requests": [], "scripts": [], "repair_inputs": [], "fingerprints": []}
         item = self.item
+        original_prepare = agent.prepare_repair
+        original_fingerprint = agent.fingerprint_paths
 
         class Client:
             def with_options(self, **kwargs):
@@ -947,11 +971,24 @@ class AuditRegression(unittest.TestCase):
                         clock.now += generation_seconds
                         response = {"dofile": "exit\n", "requirement_mapping": [{"requirement": "Finish script", "dft_config": "exit"}],
                                     "issue_resolutions": [item] if diagnosed else []}
+                        if rejected_edit and len(captures["requests"]) == 1:
+                            response["netlist_edits"] = [{"file": str(input_dir / "netlist/pre_scan.v"),
+                                "old": "not present in the real source", "new": "module top(); endmodule",
+                                "reason": "A model-proposed structural change", "evidence_excerpt": item["evidence_excerpt"]}]
+                        if netlist_repairs:
+                            proposal = len(captures["requests"])
+                            response["dofile"] = (f"load_netlist {input_dir / 'netlist/pre_scan.v'} -top top\nexit\n"
+                                                  if proposal == 1 else captures["scripts"][-1])
+                            response["netlist_edits"] = [{"file": str(input_dir / "netlist/pre_scan.v"),
+                                "old": "wire original;" if proposal == 1 else f"wire repaired_{proposal - 1};",
+                                "new": f"wire repaired_{proposal};", "reason": "Synthetic fixture repair",
+                                "evidence_excerpt": item["evidence_excerpt"]}]
                         return types.SimpleNamespace(choices=[types.SimpleNamespace(
                             message=types.SimpleNamespace(content=json.dumps(response)))])
 
         def tool(dofile, run_dir, run_id, timeout, execution_path, abort_on_error=True, allowed_drc=None):
             captures["calls"].append(timeout)
+            captures["scripts"].append(dofile)
             delivery = run_dir / "deliverables"
             reports = run_dir / "reports"
             delivery.mkdir(exist_ok=True)
@@ -959,7 +996,7 @@ class AuditRegression(unittest.TestCase):
             (delivery / f"{run_id}.dofile").write_text(dofile)
             (delivery / "post_scan.v").write_text("module scanned(); endmodule\n")
             (reports / "scan_chain.rpt").write_text("Number of chains: 1\n")
-            bad = task2 and run_id == "R1"
+            bad = run_id in failing_runs if failing_runs is not None else task2 and run_id == "R1"
             (reports / "drc.rpt").write_text(item["evidence_excerpt"] + "\n" if bad else "Total violations: 0\n")
             log_path = run_dir / f"{run_id}.log"
             log_path.write_text("test fixture log\n" * 6000)
@@ -968,15 +1005,100 @@ class AuditRegression(unittest.TestCase):
                     "returncode": 1 if bad else 0, "error": None, "elapsed_seconds": 2,
                     "log_path": log_path, "artifacts": ["deliverables/post_scan.v"]}
 
+        def prepare(task, task_spec, original_dofile, input_root, originals, active, libs, edits, output_root, run_id, deadline):
+            if not netlist_repairs:
+                return original_prepare(task, task_spec, original_dofile, input_root, originals, active,
+                                        libs, edits, output_root, run_id, deadline)
+            # These are synthetic admitted-proof fixtures. No EQY or EDA process is started.
+            captures["repair_inputs"].append(dict(active))
+            source = originals[0]
+            candidate = output_root / "netlist_versions" / run_id / source.name
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(active[source].read_text().replace(edits[0]["old"], edits[0]["new"]))
+            proof = output_root / "lec" / run_id / "aggregate.log"
+            proof.parent.mkdir(parents=True)
+            proof.write_text("Synthetic admitted EQY proof fixture\n")
+            diff = output_root / "diffs" / f"netlist_{run_id}_fixture.diff"
+            diff.parent.mkdir(exist_ok=True)
+            diff.write_text("Synthetic retained candidate diff fixture\n")
+            return {source: candidate}, [{"type": "netlist", "path": candidate.relative_to(output_root).as_posix(),
+                                          "diff_path": diff.relative_to(output_root).as_posix(),
+                                          "lec_ref": proof.relative_to(output_root).as_posix()}]
+
+        def fingerprint(paths):
+            captures["fingerprints"].append(list(paths))
+            clock.now += fingerprint_seconds
+            return original_fingerprint(paths)
+
         with patch.object(agent, "time", types.SimpleNamespace(monotonic=lambda: clock.now)), \
              patch.object(agent, "get_client", return_value=Client()), \
              patch.object(agent, "manual_context", return_value="manual fixture"), \
              patch.object(agent, "tool_run", side_effect=tool), \
+             patch.object(agent, "prepare_repair", side_effect=prepare), \
+             patch.object(agent, "fingerprint_paths", side_effect=fingerprint), \
              patch.dict(agent.os.environ, {"SCANINSERTION_LICENSE_SERVER": "test"}, clear=True), \
              patch.object(sys, "argv", ["scan_agent.py", "-input", str(input_dir), "-output", str(output_dir)]):
             result = agent.main()
         decision = json.loads((output_dir / "decision_log.json").read_text())
         return result, decision, captures, input_dir, output_dir
+
+    def test_admitted_candidate_without_tool_time_keeps_last_actual_final_script_and_changes(self):
+        result, decision, captures, input_dir, output_dir = self.run_main(
+            task2=True, diagnosed=True, netlist_repairs=True, fingerprint_seconds=73)
+        self.assertEqual(result, 2)
+        self.assertEqual([record["tool_call_id"] for record in decision["tool_runs"]], ["R1"])
+        self.assertEqual(decision["final_run"], "R1")
+        self.assertEqual(len(captures["calls"]), 1)
+        self.assertEqual(len(captures["fingerprints"]), 1)
+        self.assertEqual(decision["file_changes"], [])
+        attempt = decision["netlist_repair_attempts"][0]
+        self.assertTrue(attempt["admitted"])
+        self.assertFalse(attempt["adopted"])
+        self.assertTrue((output_dir / attempt["lec_ref"]).is_file())
+        self.assertTrue((output_dir / "netlist_versions/R2/pre_scan.v").is_file())
+        self.assertIn("Insufficient time after fingerprinting before R2", decision["summary"])
+        self.assertEqual((output_dir / "final_results/deliverables/final.dofile").read_text(),
+                         (output_dir / "runs/R1/deliverables/R1.dofile").read_text())
+        self.assertEqual((output_dir / "final_results/final.log").read_bytes(),
+                         (output_dir / "runs/R1/R1.log").read_bytes())
+        self.assertFalse((output_dir / "runs/R2/deliverables/R2.dofile").exists())
+        self.assertEqual((input_dir / "netlist/pre_scan.v").read_text(), "module top(); wire original; endmodule\n")
+
+    def test_consecutive_repairs_rebind_inherited_absolute_path_to_current_proven_candidate(self):
+        result, decision, captures, input_dir, output_dir = self.run_main(
+            task2=True, diagnosed=True, netlist_repairs=True, tool_limit=3, failing_runs={"R1", "R2"})
+        self.assertEqual(result, 0)
+        self.assertEqual([record["tool_call_id"] for record in decision["tool_runs"]], ["R1", "R2", "R3"])
+        first_candidate = output_dir / "netlist_versions/R2/pre_scan.v"
+        current_candidate = output_dir / "netlist_versions/R3/pre_scan.v"
+        self.assertIn(str(first_candidate), captures["scripts"][1])
+        # The second response inherits the R2 absolute path; runtime must replace it.
+        inherited = json.loads((output_dir / "runs/R3/llm_response.json").read_text())["content"]
+        self.assertIn(str(first_candidate), json.loads(inherited)["dofile"])
+        self.assertIn(str(current_candidate), captures["scripts"][2])
+        self.assertNotIn(str(first_candidate), captures["scripts"][2])
+        original = input_dir / "netlist/pre_scan.v"
+        self.assertEqual(captures["repair_inputs"][1][original], first_candidate)
+        self.assertEqual((output_dir / "runs/R3/input/netlist").resolve(), current_candidate.parent)
+        self.assertIn(current_candidate, captures["fingerprints"][-1])
+        self.assertEqual(current_candidate.read_text(), "module top(); wire repaired_2; endmodule\n")
+        self.assertEqual((output_dir / "final_results/deliverables/final.dofile").read_text(), captures["scripts"][2])
+        self.assertEqual(decision["final_run"], "R3")
+        self.assertTrue(all(attempt["adopted"] for attempt in decision["netlist_repair_attempts"]))
+
+    def test_rejected_candidate_is_retained_and_followed_by_a_real_configuration_retry(self):
+        result, decision, captures, input_dir, output_dir = self.run_main(task2=True, diagnosed=True, rejected_edit=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(captures["calls"]), 2)
+        self.assertEqual([record["tool_call_id"] for record in decision["tool_runs"]], ["R1", "R2"])
+        self.assertEqual(len(decision["generation_rejections"]), 1)
+        self.assertFalse(decision["generation_rejections"][0]["tool_called"])
+        self.assertFalse(decision["netlist_repair_attempts"][0]["adopted"])
+        self.assertTrue((output_dir / "runs/R2/rejected_proposals/P1/rejection.json").is_file())
+        self.assertTrue((output_dir / "runs/R2/rejected_proposals/P1/llm_response.json").is_file())
+        self.assertEqual((input_dir / "netlist/pre_scan.v").read_text(), "module top(); endmodule\n")
+        feedback = captures["requests"][-1]["messages"][-1]["content"]
+        self.assertIn("NO tool call and NO candidate adoption", feedback)
 
     def test_main_paths_budget_and_full_final_log(self):
         result, decision, captures, input_dir, output_dir = self.run_main()

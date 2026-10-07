@@ -43,6 +43,14 @@ class ReportValidation(unittest.TestCase):
             stream.write("77     Single Data Flip-Flop (DFF) Count         6814\n")
         self.assertEqual(coverage_problems([path], "present_design top\ninsert_dft_logic\n"), [])
 
+    def test_coverage_scopes_literal_load_top_without_present_design(self):
+        path = self.insertion_report()
+        path.write_text(path.read_text().replace("8680", "8679"))
+        for name in ('top', '{top}', '"top"'):
+            self.assertTrue(coverage_problems([path], f"load_netlist /input/pre.v -top {name}\ninsert_dft_logic\n"))
+        self.assertEqual(coverage_problems([path], "load_netlist /input/pre.v -top $top\ninsert_dft_logic\n"), [])
+        self.assertEqual(coverage_problems([path], "load_netlist /input/pre.v -top top\nload_netlist /input/other.v\ninsert_dft_logic\n"), [])
+
     def test_coverage_each_accounting_identity_is_checked(self):
         path = self.insertion_report()
         valid = path.read_text()
