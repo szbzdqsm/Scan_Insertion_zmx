@@ -105,7 +105,7 @@ def _selectors(dofile: str, words_for: Callable[[str], list[str]]) -> list[dict[
 def _failed_exclusion(issue: dict[str, Any], output_dir: Path) -> bool:
     found = issue.get("found", {})
     excerpt = str(found.get("excerpt", ""))
-    if not re.search(r"\[ERROR\].*CMD-0067.*No valid value for 'instance_list'", excerpt):
+    if not re.search(r"\[ERROR\].*CMD-(?:0067|0074).*No valid value for 'instance_list'", excerpt):
         return False
     source = Path(str(found.get("source", "")))
     locator = re.fullmatch(r"L(\d+)", str(found.get("locator", "")))

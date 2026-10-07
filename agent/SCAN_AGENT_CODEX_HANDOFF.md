@@ -8,6 +8,10 @@
 
 ## 最新接手状态（2026-10-07）
 
+整体优化续接：**357 项回归、Ruff、同一 v46 镜像真实 Public 11/11 及独立文件/引用复核 11/11 通过**；默认镜像已更新为 v46。结构提示共用扫描，增加实际 Liberty 映射预检查、完整帮助选择、独立原子复制、完成轮次校验复用和计时。链数审计及 CMD-0074 空集合错误变体均已真实验证。完整现场 `outputs/public-live-20261007T152438333183Z/`；原 Task 2 R1 字节一致，旧失败/中断不改判，未合并跨版本成绩。源码 CPU 更快，Task 1 case5 322.24 秒，但本批累计 1317.53 秒比 v39 高约 25%，不能声称整体稳定加速。本轮清理 45 份旧重复日志约 840 MiB，逐文件清单见根 PERFORMANCE.md。完整语义、Hidden、物理 Lockup 等边界仍见要求核对，未上传评测平台。
+
+以下为此前开发记录；以根 LIVE_VALIDATION.md 和 PERFORMANCE.md 最新段落为准。
+
 性能续接：仅优化 clock_latch_context/report_validation/shift_report_recipe 的逐行解析，297 项回归与 Ruff、v40 代表用例 3/3、原 v39 保存现场复核 11/11 通过；完整全批仍以 v39 为准。新旧时钟候选 JSON、扫描单元行和 ShiftReg 集合一致；实际整体时间未稳定缩短，详见仓库根 PERFORMANCE.md。旧 Public 日志又清理 219 份/1.55 GiB，当前成功及关键失败现场保留，逐文件清单位于 outputs/log-cleanup-20261007-performance.json。
 
 最终更新：固定 v39 镜像全部 Public **11/11** 通过当前真实模型/工具验收，290 项回归与 Ruff 通过；实际现场在 `outputs/public-live-20261007T043627790503Z/`。默认 `scan-agent-dev:local` 已指向该镜像。复跑不使用 Golden/预设答案，Task 2 原始 R1 保持字节一致。完整语义、全程硬截止及 Hidden 等边界见要求核对；未上传评测平台。

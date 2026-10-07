@@ -52,6 +52,13 @@ class ExclusionEvidence(unittest.TestCase):
         self.assertIn("user_defined_nonscannable", evidence["excerpt"])
         self.assertIn("u_ctrl/keep0", evidence["excerpt"])
 
+    def test_actual_cmd_0074_variant_uses_the_same_strict_command_and_state_proof(self):
+        self.original.write_text(self.original.read_text().replace("CMD-0067", "CMD-0074"))
+        self.issue["found"]["excerpt"] = self.error.replace("CMD-0067", "CMD-0074")
+        self.assertIsNotNone(self.evidence())
+        self.write_rows([(self.rows[0][0], "scannable"), self.rows[1], self.rows[2]])
+        self.assertIsNone(self.evidence())
+
     def test_selected_cell_or_exception_in_wrong_state_blocks_proof(self):
         for rows in ([self.rows[0], ("u_ctrl/ff2", "scannable"), self.rows[2]],
                      self.rows[:2] + [("u_ctrl/keep0", "user_defined_nonscannable")], self.rows[:2], []):

@@ -23,7 +23,7 @@ from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerp
 from netlist_structure import shift_register_context, shift_register_groups
 from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
 from report_validation import report_rows as typed_report_rows, _full_insertion_designs
-from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts
+from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts, tcl_chunks
 from floating_inputs import floating_clock_outputs
 from clock_latch_context import clock_latch_context, clock_latch_hints
 from clock_association_recipe import clock_association_problems, configure_clock_associations
@@ -489,7 +489,7 @@ def get_task_artifacts(input_dir: Path) -> tuple[str, str, list[Path], list[Path
     return task, task_spec, netlists, libs, original if original.is_file() else None
 
 
-def liberty_summary(path: Path) -> str:
+def liberty_summary(path: Path, *, cell_names: set[str] | None = None) -> str:
     """Read pins and literal gate-control facts, without guessing control polarity."""
     names = []
     pin_map: dict[str, list[str]] = {}
@@ -516,6 +516,8 @@ def liberty_summary(path: Path) -> str:
                 current = cell.group(1)
                 current_pin, facts, is_gate, table_lines = "", [], False, 0
                 names.append(current)
+                if cell_names is not None:
+                    cell_names.add(current)
                 if re.search(r"df|sdf|latch|clk|dl", current, re.I) and len(pin_map) < 128:
                     pin_map[current] = []
             pin = pin_pattern.match(line)
@@ -541,11 +543,31 @@ def liberty_summary(path: Path) -> str:
                 table_lines -= 1
         finish_cell()
     pins = dict(sorted(pin_map.items(), key=lambda item: ("sdf" not in item[0], item[0]))[:80])
-    return (f"{path.name}: {len(names)} cells; sample={', '.join(names[:30])}\n"
-            + ("Actual Liberty clock-gate control evidence (source lines; infer polarity only when supported): "
-               + json.dumps(gate_facts) + "\n" if gate_facts else "")
-            +
-            "Actual sequential/clock cell pin names (scan cells first): " + json.dumps(pins))[:8000]
+    pin_summary = (f"{path.name}: {len(names)} cells; sample={', '.join(names[:30])}\n"
+                   "Actual sequential/clock cell pin names (scan cells first): " + json.dumps(pins))[:8000]
+    evidence = ("\nActual Liberty clock-gate control evidence (source lines; infer polarity only when supported): "
+                + json.dumps(gate_facts) if gate_facts else "")
+    return pin_summary + evidence
+
+
+def mapping_cell_problems(script: str, cell_names: set[str]) -> list[str]:
+    """Reject only nonexistent literal mapping names; never execute dynamic Tcl."""
+    if not cell_names:
+        return []
+    problems = []
+    for chunk in tcl_chunks(script):
+        if not re.match(r"\s*set_scan_cell_mapping\b", chunk):
+            continue
+        words = literal_tcl_words(chunk.strip())
+        if len(words) != 3:
+            continue
+        for word in words[1:]:
+            literal = word[1:-1] if word[:1] in {'"', '{'} and word[-1:] in {'"', '}'} else word
+            if re.search(r"[$\[\]\\;\s]", literal):
+                continue
+            if literal not in cell_names:
+                problems.append(f"set_scan_cell_mapping references '{literal}', absent from the actual supplied Liberty cells")
+    return list(dict.fromkeys(problems))
 
 
 def netlist_diagnostic_context(active: dict[Path, Path], diagnostic: str, limit: int = 6000) -> str:
@@ -869,9 +891,10 @@ def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
 
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
                     clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None,
-                    structural_groups: list[dict] | None = None, include_command_help: bool = True) -> str:
+                    structural_groups: list[dict] | None = None, include_command_help: bool = True,
+                    library_cells: set[str] | None = None) -> str:
     lib_names = [str(p) for p in libs]
-    lib_summary = [liberty_summary(p) for p in libs]
+    lib_summary = [liberty_summary(p, cell_names=library_cells) for p in libs]
     shift_summary = shift_register_context(netlists, libraries=libs, hints=structural_groups) if re.search(r"移位寄存器|scan\s+segment", task_spec, re.I) else "Not requested"
     context = f"""# Natural-language task specification
 {task_spec}
@@ -934,7 +957,7 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     reset_inference_evidenced: bool = False,
                     clock_candidates: list[dict] | None = None,
                     mode_hints: list[dict] | None = None,
-                    diagnostics: str = "") -> tuple[str, dict[str, Any]]:
+                    diagnostics: str = "", library_cells: set[str] | None = None) -> tuple[str, dict[str, Any]]:
     mode = ("Repair the CURRENT Dofile from actual diagnostics and task requirements; preserve already valid settings."
             if base_dofile is not None else "Generate a Dofile from the task requirements.")
     if task == "task2" and original:
@@ -1127,6 +1150,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
                                            permit_reset_inference=reset_inference_evidenced or
                                            bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
             problems.extend(mode_control_problems(dofile, spec, mode_hints or [], literal_tcl_words))
+            problems.extend(mapping_cell_problems(dofile, library_cells or set()))
             if previous_actual_dofile is not None:
                 problems.extend(unchanged_control_retry_problems(
                     previous_actual_dofile, dofile, previous_unallowed_codes or set(),
@@ -1620,6 +1644,50 @@ def locate_evidence(files: list[Path], output_dir: Path, excerpt: str,
     return None
 
 
+def chain_count_claim(text: str, rows: list[dict[str, Any]]) -> tuple[str, int] | None:
+    """Identify one explicit count and one real partition; ambiguous claims abstain."""
+    counts = set(int(value) for value in re.findall(r"\bchain_count\b[\s`'\"=:]*(\d+)\b", text, re.I))
+    partitions = {row["Partition"] for row in rows if row["Partition"] and
+                  re.search(r"(?<![\w$])" + re.escape(row["Partition"]) + r"(?![\w$])", text)}
+    if len(counts) == len(partitions) == 1 and next(iter(counts)) > 0:
+        return next(iter(partitions)), next(iter(counts))
+    return None
+
+
+def internal_partition_count(rows: list[dict[str, Any]], partition: str) -> int:
+    return sum(row["Partition"] == partition and bool(re.fullmatch(r"I\s+\S+|\d+", row["Chain"]))
+               for row in rows)
+
+
+def chain_count_positive_evidence(issue: dict[str, Any], files: list[Path], output_dir: Path) -> dict[str, str] | None:
+    """Bind a real before/after count change to all actual rows of one partition."""
+    found = issue.get("found", {})
+    subject = str(issue.get("phenomenon", "")) + " " + str(issue.get("diagnosis", {}).get("located_object", ""))
+    if not re.search(r"\bchain_count\b", subject, re.I):
+        return None
+    old_path = output_dir / found.get("source", "")
+    if old_path.suffix.lower() not in {".rpt", ".report", ".txt"} or not old_path.is_file():
+        return None
+    old_rows = chain_rows([old_path])
+    claim = chain_count_claim(subject, old_rows)
+    if not claim or internal_partition_count(old_rows, claim[0]) == claim[1]:
+        return None
+    for path in files:
+        if path.suffix.lower() not in {".rpt", ".report", ".txt"}:
+            continue
+        rows = chain_rows([path])
+        if internal_partition_count(rows, claim[0]) != claim[1]:
+            continue
+        actual = [row for row in rows if row["Partition"] == claim[0] and
+                  re.fullmatch(r"I\s+\S+|\d+", row["Chain"])]
+        first, last = min(row["line"] for row in actual), max(row["line"] for row in actual)
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            excerpt = "".join(line for number, line in enumerate(stream, 1) if first <= number <= last).rstrip("\r\n")
+        return {"source": path.relative_to(output_dir).as_posix(),
+                "locator": f"L{first}" if first == last else f"L{first}-L{last}", "excerpt": excerpt}
+    return None
+
+
 def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                        verification_plans: dict[str, dict[str, Any]], output_dir: Path,
                        previous_run: str, current_run: str, change_id: str,
@@ -1761,6 +1829,14 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                     else locate_evidence(files, output_dir, cited))
         if not evidence:
             continue
+        if chain_evidence and not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited):
+            source = output_dir / evidence["source"]
+            if source.suffix.lower() in {".rpt", ".report", ".txt"}:
+                actual_rows = chain_rows([source])
+                claim = chain_count_claim(str(item.get("phenomenon", "")) + " " + located + " " + diagnostic, actual_rows)
+                if claim and internal_partition_count(actual_rows, claim[0]) == claim[1]:
+                    # A satisfied full typed count cannot discover a count failure.
+                    continue
         diagnosis = {"summary": str(item.get("diagnosis", "")),
                      "located_object": str(item.get("located_object", "")),
                      "root_cause": str(item.get("root_cause", "")),
@@ -2080,6 +2156,9 @@ def positive_issue_evidence(issue: dict[str, Any], plan: dict[str, Any],
     """Accept conservative, issue-specific positive evidence from a real rerun."""
     found = issue["found"]["excerpt"]
     diagnosis = issue["diagnosis"]
+    count_evidence = chain_count_positive_evidence(issue, files, output_dir)
+    if count_evidence:
+        return count_evidence
     if "Failed to retrieve the design" in found or re.search(r"Nothing matched for ['\"]design['\"]", found):
         for path in files:
             if path.suffix != ".log":
@@ -2296,9 +2375,11 @@ def main() -> int:
         structural_groups = timed_call(performance_stages, "source_structure", shift_register_groups, netlists, libraries=libs, reset_hints=reset_hints,
             instance_map=instances if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else None)
         control_hints = {root: values for root, values in reset_hints.items() if values}
+        library_cells: set[str] = set()
         static_context = timed_call(performance_stages, "static_context", context_for_run, input_dir, task_spec, limits, netlists, libs, "",
                                          clock_candidates=clock_candidates, mode_hints=mode_hints,
-                                         structural_groups=structural_groups, include_command_help=False)
+                                         structural_groups=structural_groups, include_command_help=False,
+                                         library_cells=library_cells)
         known_reset_ports = set(control_hints)
         reset_inference_evidenced = False
         floating = (timed_call(performance_stages, "source_floating", floating_clock_outputs, netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
@@ -2387,7 +2468,8 @@ def main() -> int:
                                                      known_reset_ports=known_reset_ports,
                                                      reset_inference_evidenced=reset_inference_evidenced,
                                                      clock_candidates=clock_candidates, mode_hints=mode_hints,
-                                                     diagnostics=last_log + "\n" + previous_reports)
+                                                     diagnostics=last_log + "\n" + previous_reports,
+                                                     library_cells=library_cells)
                         previous_netlist_root = active_netlist_root
                         if meta.get("netlist_edits"):
                             edits = meta["netlist_edits"]

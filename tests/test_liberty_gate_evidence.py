@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-from scan_agent import liberty_summary
+from scan_agent import liberty_summary, mapping_cell_problems
 
 
 class LibertyGateEvidenceTests(unittest.TestCase):
@@ -82,6 +82,38 @@ cell (plain) {
         self.assertLessEqual(len(self.facts(summary)), 8)
         self.assertIn("30 cells", summary)
         self.assertIn("Actual sequential/clock cell pin names", summary)
+
+    def test_cell_inventory_is_complete_and_literal_mapping_is_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "actual.lib"
+            path.write_text('cell (dff) {\n}\ncell (sff) {\n}\ncell (other) {\n}\n')
+            names = set()
+            liberty_summary(path, cell_names=names)
+            self.assertEqual(names, {"dff", "sff", "other"})
+            self.assertEqual(mapping_cell_problems('set_scan_cell_mapping {dff} "sff"\n', names), [])
+            problems = mapping_cell_problems('set_scan_cell_mapping dff missing\n', names)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("missing", problems[0])
+
+    def test_dynamic_mapping_and_comments_are_not_interpreted(self):
+        self.assertEqual(mapping_cell_problems(
+            '# set_scan_cell_mapping absent absent\nset_scan_cell_mapping $from $to\n', {"dff"}), [])
+        self.assertEqual(mapping_cell_problems('set_scan_cell_mapping absent absent\n', set()), [])
+
+    def test_gate_evidence_does_not_shrink_pin_summary_budget(self):
+        cells = ''.join(f'cell (sdf_cell_{n:03d}) {{\n' +
+                        ''.join(f' pin (pin_{p:02d}) {{ }}\n' for p in range(24)) + '}\n'
+                        for n in range(100))
+        without = self.summary(cells)
+        with_gate = self.summary(cells + '''cell (clk_gate) {
+ pin (TEST) {
+  clock_gate_test_pin : true;
+ }
+}
+''')
+        # Cell count changes, but the original capped pin text stays complete.
+        self.assertEqual(without.split("Actual sequential", 1)[1],
+                         with_gate.split("Actual sequential", 1)[1].split("\nActual Liberty", 1)[0])
 
 
 if __name__ == "__main__":
