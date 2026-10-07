@@ -30,6 +30,7 @@ from clock_association_recipe import clock_association_problems, configure_clock
 from mode_control_context import mode_control_context, mode_control_hints, mode_control_problems, requested_constant_modes
 from mode_control_context import mode_control_report_problems
 from insertion_evidence import insertion_replacement_evidence
+from shift_report_recipe import configure as configure_natural_shift_reports, natural_shift_report_problems
 from model_script_view import model_owned_script
 from drc_retry_preflight import unchanged_control_retry_problems
 from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets
@@ -201,7 +202,7 @@ def manual_context(query: str, max_chars: int = 12000) -> str:
         (r"Wrapper|黑盒|CTL", ["load_ctl", "set_wrapper_cfg", "add_dedicated_wrapper_cell_type"]),
         (r"替换|回替|replacement", ["set_scan_cell_mapping", "replace_unscan"]),
         (r"闩锁|latch|内部时钟|关联关系", ["associated_internal_clocks"]),
-        (r"移位寄存器|segment", ["set_scan_segment", "rpt_scan_segment"]),
+        (r"移位寄存器|segment", ["rpt_shift_register", "set_scan_segment", "rpt_scan_segment"]),
     ):
         if re.search(pattern, query, re.I):
             critical.extend(commands)
@@ -240,7 +241,7 @@ def command_syntax(query: str, max_chars: int = 30000) -> str:
         names = ["load_ctl", "set_wrapper_cfg", "add_dedicated_wrapper_cell_type", "rpt_dedicated_wrapper_cell_type",
                  "rpt_wrapper_cfg", "rpt_wrapper_implementation"] + names
     if re.search(r"移位寄存器|segment", query, re.I):
-        names = ["set_scan_segment", "rpt_scan_segment"] + names
+        names = ["rpt_shift_register", "set_scan_segment", "rpt_scan_segment"] + names
     if re.search(r"忽略|允许|无需处理", query):
         names = ["set_scan_drc_rule_handling", "rpt_scan_drc_rule_handling"] + names
     chunks = []
@@ -305,6 +306,12 @@ def unsupported_options(dofile: str, task_spec: str | None = None, *,
             if not re.search(r"\s-port\s+(?!\{\s*\}|\"\")(?:\S)", line):
                 problems.append("set_wrapper_cfg -style none requires actual -port objects; use set_wrapper_cfg disable for global disable")
         rules_command = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|\S+)\s+(Error|Warning|Info|Ignore)\b", line)
+        rule_words = literal_tcl_words(line.strip()) if re.match(r"\s*set_scan_drc_rule_handling\b", line) else []
+        if rule_words and len(rule_words) >= 2 and not re.search(r"[$\[\\]", rule_words[1]):
+            literal_level = rule_words[2].strip('"{}') if len(rule_words) >= 3 else ""
+            if not re.search(r"[$\[\\]", literal_level) and literal_level not in {"Error", "Warning", "Info", "Ignore"}:
+                problems.append("set_scan_drc_rule_handling needs rule_names followed directly by Error/Warning/Info/Ignore; "
+                                "do not insert a '-' placeholder before the level")
         if rules_command:
             invalid = [rule for rule in rules_command.group(1).strip("{}").split()
                        if not re.fullmatch(r"DFTR(?:[1-9]|1[0-7]|-(?:TIE[01]|L[12]))", rule)]
@@ -931,6 +938,10 @@ The actual read-only input directory is {input_dir}. The current run directory a
                    "SignalType and ConstantValue can be verified in the real signal report. "
                    "Prefer Dofile mode and reset configuration before structural edits. A zero replacement "
                    "count requires actual subsequent insertion and chain evidence, not just a control declaration.")
+    system += ("\nFor a report of naturally identified shift registers use the installed rpt_shift_register -file API "
+               "after actual examine_scan_chain analysis. rpt_scan_segment reports explicitly configured segments; "
+               "an empty segment table does not prove natural ShiftReg membership. The runtime can compile the "
+               "task-listed natural report command, but the tool must actually produce and validate it.")
     if segments:
         system += ("\nThe runtime compiles ALL supplied actual shift-register candidates into set_scan_segment "
                    "commands and preserves their actual scan-enable pin connections. You may omit your own segment "
@@ -984,6 +995,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
             adapted = normalize_associated_pin_paths(adapted, instances or {})
             adapted, segment_references = configure_shift_segments(adapted, segments or [], spec)
             adapted, floating_references = configure_floating_inputs(adapted, floating or {})
+            adapted, natural_shift_references = configure_natural_shift_reports(adapted, spec, literal_tcl_words)
             if adapted.strip() != dofile.strip():
                 (run_dir / "llm_normalization.json").write_text(json.dumps({
                     "kind": "documented_api_and_input_derived_recipes", "original_dofile": dofile,
@@ -1020,6 +1032,16 @@ The actual read-only input directory is {input_dir}. The current run directory a
                 result["requirement_mapping"] = mappings
                 (run_dir / "llm_floating_clock_recipe.json").write_text(json.dumps({"input_pins": floating,
                     "actual_commands": floating_references}, ensure_ascii=False, indent=2))
+            if natural_shift_references:
+                mappings = result.get("requirement_mapping", [])
+                if not isinstance(mappings, list) or (task == "task1" and not mappings):
+                    raise ValueError("Task 1 still needs model-provided key configuration mappings")
+                requirement = "Native report of tool-identified natural shift registers"
+                mappings = [item for item in mappings if not isinstance(item, dict) or item.get("requirement") != requirement]
+                mappings.append({"requirement": requirement, "dft_config": "; ".join(natural_shift_references)})
+                result["requirement_mapping"] = mappings
+                (run_dir / "llm_natural_shift_report_recipe.json").write_text(json.dumps(
+                    {"actual_commands": natural_shift_references}, ensure_ascii=False, indent=2))
             for item in result.get("requirement_mapping", []):
                 if isinstance(item, dict) and isinstance(item.get("dft_config"), str):
                     clauses = re.split(r";\s*(?=[A-Za-z_]+\b)", item["dft_config"])
@@ -1090,13 +1112,17 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
         if not source.is_file() or source.is_symlink() or source == log_path or source == dofile_path:
             continue
         if _is_inside(source, delivery) or _is_inside(source, reports):
+            if source.suffix.lower() != ".dofile":
+                copied.append(source)
             continue
         rel = source.relative_to(run_dir)
-        if rel.parts and rel.parts[0] == "input":
+        if rel.parts and rel.parts[0] in {"input", "rejected_proposals"}:
             continue
         if source.name.endswith(".dofile") or source.suffix.lower() == ".log":
             continue
         if source.name.startswith("llm_") and source.suffix == ".json":
+            continue
+        if source.name in {"repair_rejection.json", "repair_integrity_failure.json"}:
             continue
 
         parts = list(rel.parts)
@@ -1237,6 +1263,7 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     problems.extend(wrapper_problems(report_files, task_spec))
     problems.extend(clock_association_problems(report_files, dofile, clock_candidates or [], task_spec, literal_tcl_words))
     problems.extend(mode_control_report_problems(report_files, dofile, task_spec, mode_hints or [], literal_tcl_words))
+    problems.extend(natural_shift_report_problems([log_path, *report_files], task_spec))
     report_text = "\n".join(read_text(p, 50000) for p in report_files)
     actual_chains = chain_rows(report_files)
     problems.extend(chain_problems(actual_chains, task_spec))
@@ -1589,6 +1616,15 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
         fix_text = str(item.get("fix", ""))
         diagnosed_rules = rule_codes(located + " " + diagnostic + " " + fix_text + " " + str(item.get("phenomenon", "")))
+        chain_evidence = bool(re.search(r"(?m)^\s*(?:[IW]\s+\S+|\d+)\s+\d+\s+", cited) or
+                              re.search(r"Chain\s+Length\s+Input", cited))
+        parameter_claim = bool(re.search(r"off[-_ ]state|\busage\b|incomplete.{0,30}(?:declaration|command)|"
+                                         r"missing.{0,20}(?:parameters?|options?)|缺少.{0,20}参数", diagnostic, re.I))
+        if (chain_evidence and parameter_claim and not re.search(r"\[(?:ERROR|FATAL)\]", cited) and
+                not re.search(r"OffState|Usage", cited)):
+            # Chain topology does not reveal signal parameters, regardless of
+            # whether the diagnosis names one port, several ports, or a partition.
+            continue
         if "WrapperConfigurationParameter" in cited and re.search(r"\bport\s+`?([A-Za-z_][\w$]*)", located, re.I):
             target_port = re.search(r"\bport\s+`?([A-Za-z_][\w$]*)", located, re.I).group(1)
             if not re.search(r"(?<![\w$])" + re.escape(target_port) + r"(?![\w$])", cited):

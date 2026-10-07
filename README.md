@@ -2,7 +2,7 @@
 
 开发源码位于 [agent/](agent/README.md)，正式 Word 和宣讲 PPT 也保存在该目录。[要求核对](agent/CONTEST_REQUIREMENTS.md)和[主办方 Q&A 核对](agent/CONTEST_QA.md)记录规则与待办；当前仍是开发版本。
 
-2026-10-07 核对：191 项回归检查、Ruff 和镜像构建通过。最新完整 Public 批次为 7/11，当前源码尚未完成完整重跑，仍有大型用例和语义验收缺口。已清理约 2.77 GiB 旧日志，最新验证现场保留。
+2026-10-07 后续开发：两个大型 Public 已实际插链通过，Task 1 case6 及修复后的 Task 2 case2 也分别通过；固定 v37 镜像的完整 11 例正在运行。288 项回归检查和 Ruff 通过。语义验收仍有独立验证边界，详见要求核对。旧日志清理记录及最新现场保留。
 
 ## VS Code + WSL 开发
 
@@ -54,6 +54,8 @@ docker build -t scan-agent-dev:local agent
 .venv/bin/python scripts/run_public_cases.py --jobs 1
 # 指定用例重试
 .venv/bin/python scripts/run_public_cases.py --select task_1/case2 task_2/case1
+# 使用相同固定镜像补齐一个已结束子集批次；保留已有结果，不重复执行
+.venv/bin/python scripts/run_public_cases.py --image scan-agent:live-v37 --resume-batch outputs/已有批次
 ```
 
 Public 验证脚本隐藏答案文件，固定本批镜像 ID，以普通用户运行容器，保留全部尝试和 `summary.json`。摘要里的通过表示当前 Agent 检查通过，完整扫描语义仍需独立核验。

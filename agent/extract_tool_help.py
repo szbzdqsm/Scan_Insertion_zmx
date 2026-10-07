@@ -16,7 +16,7 @@ COMMANDS = (
     "dump_netlist dump_ctl dump_def rpt_scan_chain rpt_scan_chain_cell rpt_scan_element "
     "rpt_scan_cfg rpt_scan_signal rpt_scan_drc_violation rpt_scan_partition "
     "rpt_wrapper_cfg rpt_wrapper_implementation add_dedicated_wrapper_cell_type rpt_dedicated_wrapper_cell_type "
-    "rpt_insertion_info set_scan_segment rpt_scan_segment "
+    "rpt_insertion_info set_scan_segment rpt_scan_segment rpt_shift_register "
     "add_pseudo_pi rpt_pseudo_pi get_cells get_pins get_ports get_nets get_obj_insts "
     "get_attribute get_property list_properties rpt_property "
     "sizeof_collection foreach_in_collection"

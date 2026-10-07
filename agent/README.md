@@ -2,7 +2,7 @@
 
 ## Latest status (2026-10-07)
 
-The latest complete live-model Public batch passed the current checks in 7/11 cases (v30). Later v34 subsets passed 2/2 small cases and failed both large cases (0/2). The current source has passed 191 local regression checks, Ruff and a fresh Docker build, but has not completed a full live Public rerun. See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for the current requirements audit and [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for measured results. Earlier Golden replay results below are historical tool validation.
+Both large Public cases have completed actual autonomous insertion and the current audit in v36; that four-case batch passed 3/4. The remaining case (Task 2 case2) passed a v37 rerun after rejecting an unrelated parameter diagnosis. A complete v37 Public batch is in progress. The source has passed 288 local regression checks and Ruff. See [CONTEST_REQUIREMENTS.md](CONTEST_REQUIREMENTS.md) for the requirements audit and [LIVE_VALIDATION.md](../LIVE_VALIDATION.md) for measured results. Earlier Golden replay results below are historical tool validation.
 
 The runtime now uses build-time official command help, bounded structural context with actual Liberty pin names, command preflight, report redirection normalization, live tool logs, process-group timeouts, and indexed audit evidence. Task 1 mappings must refer to literal executed Tcl. A bounded private Pre-scan editing/EQY workflow is implemented and has passed small real proofs, including sky130 cells; see [NETLIST_REPAIR.md](NETLIST_REPAIR.md) for its restrictions. Some ICGs still lack usable functional models, and complete Public and semantic validation remain unfinished. Do not upload this development version for evaluation.
 

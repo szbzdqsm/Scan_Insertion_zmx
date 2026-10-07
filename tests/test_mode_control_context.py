@@ -253,12 +253,48 @@ endmodule
         self.assertEqual(len(self.report_problems(report)), 1)
         self.assertIn("chip input scan_mode", self.report_problems(report)[0])
 
-    def test_unknown_dynamic_and_multi_root_report_scopes_remain_unverified(self):
+    def test_unknown_script_cannot_waive_unique_source_top_requirements(self):
         for script in [self.script.replace("present_design chip", "present_design $top"),
                        self.script.replace("exit\n", "present_design another_top\nexit\n"),
                        self.script.replace("present_design chip\n", "")]:
             with self.subTest(script=script):
-                self.assertEqual(self.report_problems("", script), [])
+                self.assertEqual(len(self.report_problems("", script)), 2)
+                self.assertEqual(self.report_problems(self.report(), script), [])
+
+    def test_unknown_output_or_exclusion_tcl_cannot_hide_wrong_actual_mode(self):
+        wrong = self.report(rows=[("scan_mode", "scan_enable", ""), ("mbist_mode", "constant", "0")])
+        missing = self.report(rows=[("mbist_mode", "constant", "0")])
+        for command in ["custom_output_setup $out_dir", "custom_exclude $jtag_cells", "source local_exclusions.tcl"]:
+            script = self.script.replace("examine_scan_drc", command + "\nexamine_scan_drc")
+            with self.subTest(command=command):
+                self.assertEqual(self.problems(script), [])  # Preflight abstains.
+                self.assertTrue(any("reports scan_mode" in problem for problem in self.report_problems(wrong, script)))
+                self.assertTrue(any("chip input scan_mode" in problem for problem in self.report_problems(missing, script)))
+                self.assertEqual(self.report_problems(self.report(), script), [])
+
+    def test_unique_source_fallback_rejects_foreign_report_root(self):
+        script = "unknown_output_setup\n" + self.script
+        self.assertEqual(len(self.report_problems(self.report(root="unrelated"), script)), 2)
+
+    def test_ambiguous_source_roots_or_mode_ports_do_not_gain_a_fallback(self):
+        report = Path(self.temporary.name) / "scan_signal.rpt"
+        report.write_text("")
+        unknown_script = "unknown_output_setup\n" + self.script
+        duplicate_root = {**self.hints[0], "root": "second_top"}
+        self.assertEqual(mode_control_report_problems([report], unknown_script, self.spec,
+                                                     self.hints + [duplicate_root], literal_tcl_words), [])
+        ambiguous = {**self.hints[0], "mode_candidates": self.hints[0]["mode_candidates"] +
+                     [{**self.hints[0]["mode_candidates"][1], "port": "test_mode"}]}
+        self.assertEqual(mode_control_report_problems([report], unknown_script, self.spec,
+                                                     [ambiguous], literal_tcl_words), [])
+        incomplete = {**self.hints[0], "source_ports_complete": False}
+        self.assertEqual(mode_control_report_problems([report], unknown_script, self.spec,
+                                                     [incomplete], literal_tcl_words), [])
+
+    def test_model_context_requires_constant_scan_mode_and_separate_enable(self):
+        context = mode_control_context([], self.spec, hints=self.hints)
+        self.assertIn("MUST remain type constant", context)
+        self.assertIn("separate scan-enable", context)
 
     def test_actual_mode_proof_supports_safe_jtag_exclusion_guard(self):
         script = self.script.replace("present_design chip", "load_netlist chip.v -top chip")

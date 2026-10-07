@@ -110,6 +110,8 @@ def _readonly_word(word: str, words_for: Callable[[str], list[str]]) -> bool:
             if len(words) < 2 or words[1] not in _FILE_READ_ONLY:
                 return False
             arguments = words[2:]
+        elif words == ["info", "script"]:
+            arguments = []  # A path query cannot redeclare a design or scan control.
         elif words[0] in _READ_ONLY:
             arguments = words[1:]
         else:

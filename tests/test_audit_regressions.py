@@ -605,6 +605,13 @@ class AuditRegression(unittest.TestCase):
             self.assertEqual(agent.unsupported_options('set_scan_drc_rule_handling {DFTR-TIE0 DFTR17} Ignore'), [])
             self.assertEqual(agent.unsupported_options('set_scan_drc_rule_handling {DFTR10} Warning'), [])
 
+    def test_drc_level_is_a_direct_positional_argument(self):
+        (self.root / "tool_help.json").write_text("{}")
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            self.assertTrue(agent.unsupported_options("set_scan_drc_rule_handling DFTR10 - Warning\n"))
+            self.assertTrue(agent.unsupported_options("set_scan_drc_rule_handling DFTR10\n"))
+            self.assertEqual(agent.unsupported_options("set_scan_drc_rule_handling DFTR10 Warning\n"), [])
+
     def test_drc_exceptions_need_explicit_task_authorization(self):
         self.assertEqual(agent.allowed_drc_codes("不允许忽略 DFTR10"), set())
         self.assertEqual(agent.allowed_drc_codes("禁止修改网表，但允许忽略 DFTR-TIE0/DFTR-TIE1"), {"DFTRTIE0", "DFTRTIE1"})
@@ -698,6 +705,28 @@ class AuditRegression(unittest.TestCase):
         report.write_text(header + f"{'scan_mode':16}{'pre_existing':18}{'constant':22}{'N/A':12}{'1':16}\n")
         agent.verify_issue_fixes(issues, plans, self.out, "R2", True)
         self.assertTrue(issues[0]["attempts"][-1]["verify"]["resolved"])
+
+    def test_chain_row_cannot_discover_missing_parameters_on_multiple_ports(self):
+        row = "I wb_chain_0 266 scan_data_in_0 scan_data_out_0 test_se wb_clk_i wb_partition"
+        (self.out / "runs/R1/reports/scan_chain.rpt").write_text(row + "\n")
+        for located in ("ports se_rx, test_se", "se_rx and test_se", "partition wb_partition"):
+            item = dict(self.item, evidence_excerpt=row, located_object=located,
+                        root_cause="Missing -off_state and -usage parameters", fix="Declare off_state 0 and usage all")
+            self.assertEqual(self.record(item)[0], [])
+
+    def test_artifacts_include_direct_tool_outputs_and_exclude_rejected_proposals(self):
+        run = self.out / "runs/R2"
+        (run / "deliverables").mkdir()
+        (run / "deliverables/R2.dofile").write_text("exit\n")
+        (run / "deliverables/post_scan.v").write_text("module scanned(); endmodule\n")
+        (run / "reports/scan_signal.rpt").write_text("Actual report\n")
+        rejected = run / "rejected_proposals/P1"
+        rejected.mkdir(parents=True)
+        (rejected / "rejection.json").write_text('{"tool_called":false}\n')
+        (rejected / "llm_response.json").write_text('{"content":"invalid"}\n')
+        produced = {p.relative_to(run).as_posix() for p in agent.collect_tool_outputs(run, "R2")}
+        self.assertEqual(produced, {"deliverables/post_scan.v", "reports/scan_signal.rpt"})
+        self.assertFalse((run / "deliverables/rejected_proposals").exists())
 
     def test_config_option_fix_requires_actual_report_value(self):
         item = dict(self.item, evidence_excerpt="[ERROR] set_scan_cfg execution failed",

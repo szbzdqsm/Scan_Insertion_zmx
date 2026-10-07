@@ -215,7 +215,11 @@ def mode_control_context(paths: list[Path], spec: str, *, hints: list[dict] | No
             "Do not invent test_mode when the input top instead has scan_mode; do not treat generic scan-enable, clocks, "
             "resets or functional inputs as these mode constants. Missing/ambiguous names or unsupported HDL require actual "
             "source/tool investigation. Configure required constants with set_scan_signal -type constant -port PORT "
-            "-constant_value 0/1. This is structural guidance, not a DRC or post-scan proof.\n" +
+            "-constant_value 0/1. A source scan_mode listed in required_literal_constants MUST remain type constant; "
+            "configuring it as scan_enable does not satisfy the constant-mode requirement. Use a separate scan-enable "
+            "control (for example a new scan_enable port when allowed), preserving an existing dedicated enable when "
+            "available. Verify both mode constants in actual scan_signal reports. This is structural guidance, not a "
+            "DRC or post-scan proof.\n" +
             json.dumps(rows, ensure_ascii=False, indent=2))[:limit]
 
 
@@ -344,14 +348,27 @@ def _mode_control_scope(script: str, spec: str, hints: list[dict],
 
 def mode_control_report_problems(paths: list[Path], script: str, spec: str, hints: list[dict],
                                  words_for: Callable[[str], list[str]]) -> list[str]:
-    """Check actual typed signal rows for a statically identifiable source top.
+    """Check actual typed mode rows for a proven script root or unique source top.
 
-    Unknown/dynamic Tcl or ambiguous selected roots returns no findings and
-    leaves this semantic check unverified.  A known scope requires an actual
-    Design block, all three typed columns, and a matching constant value for
-    every uniquely inferred mode control.  Script text is never report proof.
+    Unknown Tcl cannot waive an unambiguous requirement on the only input top.
+    If neither a script root nor one complete source top with unique scalar
+    controls is available, this check stays unverified. A known target requires
+    a real Design block and typed constant rows. Script text is never proof.
     """
     scope = _mode_control_scope(script, spec, hints, words_for)
+    if scope is None and len(hints) == 1:
+        hint = hints[0]
+        roles = requested_constant_modes(spec)
+        expected = _expected(hint, spec)
+        # Every requested role must have one known scalar input. Unknown or
+        # ambiguous source names are not resolved by guessing from a report.
+        unique_controls = bool(roles) and all(
+            len(candidates := [candidate for candidate in hint.get("mode_candidates", []) if candidate.get("role") == role]) == 1
+            and candidates[0].get("confidence") == "literal_scalar_name"
+            for role in roles)
+        if (hint.get("source_ports_complete") and unique_controls and len(expected) == len(roles)
+                and re.fullmatch(_IDENTIFIER, hint.get("root", ""))):
+            scope = hint["root"], expected
     if scope is None:
         return []
     root, expected = scope
