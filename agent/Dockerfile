@@ -29,6 +29,14 @@ COPY insertion_evidence.py /submission/insertion_evidence.py
 COPY shift_report_recipe.py /submission/shift_report_recipe.py
 COPY artifact_operations.py /submission/artifact_operations.py
 COPY help_selection.py /submission/help_selection.py
+COPY runtime_limits.py /submission/runtime_limits.py
+COPY audit_refresh.py /submission/audit_refresh.py
+COPY case_deadline.py /submission/case_deadline.py
+COPY original_dofile.py /submission/original_dofile.py
+COPY repair_deliverables.py /submission/repair_deliverables.py
+COPY source_hierarchy.py /submission/source_hierarchy.py
+COPY tool_process.py /submission/tool_process.py
+COPY agent_runner.py /submission/agent_runner.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json
 RUN chmod +x /submission/agent_system

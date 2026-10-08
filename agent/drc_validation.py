@@ -7,7 +7,129 @@ import re
 
 def rule_codes(text: str) -> set[str]:
     return {re.sub(r"[-_ ]", "", rule).upper()
-            for rule in re.findall(r"\bDFTR[-_ ]?(?:TIE[01]|L[12]|\d+)\b", text, re.I)}
+            for rule in re.findall(r"(?<![A-Za-z0-9_])DFTR[-_ ]?(?:TIE[01]|L[12]|\d+)(?![A-Za-z0-9_])", text, re.I)}
+
+
+_RULE_PATTERN = r"(?<![A-Za-z0-9_])DFTR[-_ ]?(?:TIE[01]|L[12]|\d+)(?![A-Za-z0-9_])"
+_PERMISSION = re.compile(
+    r"(?P<ignore>忽略|\bignore\w*\b)|(?P<retain>无需处理|不需要处理|不用处理)|"
+    r"(?P<allow>允许|许可|可以|可|\b(?:allow\w*|permit\w*|can|may)\b)", re.I)
+_BRIDGE_WORDS = re.compile(
+    r"仅|只|以下|下列|这些|上述|该|的|可|可以|允许|许可|保留|剩余|残余|残留|遗留|存在|出现|"
+    r"忽略|无需处理|不需要处理|不用处理|违例|违规|规则|检查|标号|编号|为|种|类|固有|特性|"
+    r"形式|以|\b(?:the|following|these|above|them|can|may|be|are|is|as|to|"
+    r"DRC|rule\w*|violation\w*|warning\w*|residual\w*|remaining|retain\w*|"
+    r"remain\w*|exist\w*|allow\w*|permit\w*|inherent|intrinsic|ignored)\b", re.I)
+_RESIDUAL_OBJECT = re.compile(
+    r"保留|剩余|残余|残留|遗留|存在|出现|违例|违规|规则|无需处理|不需要处理|不用处理|"
+    r"\b(?:DRC|rule\w*|violation\w*|warning\w*|residual\w*|remain\w*|retain\w*|exist\w*)\b", re.I)
+_NON_DRC_OBJECT = re.compile(r"报告|格式|日志|文件|输出|显示|编码|\b(?:report|format|log|file|output|display|encoding)\w*\b", re.I)
+_NEGATIVE_IGNORE = re.compile(
+    r"(?:不允许|不得|禁止|不能|不可|不要|不).{0,16}(?:忽略|\bignore\w*)|"
+    r"\b(?:must\s+not|do\s+not|cannot|never)\s+ignore\w*|\bnot\s+allowed\b", re.I)
+_NEGATIVE_RESIDUAL = re.compile(
+    r"修复|消除|清零|必须处理|(?:不允许|不得|禁止|不能|不可).{0,16}(?:保留|残留|存在|出现)|"
+    r"\b(?:repair|fix|resolve)\w*|\b(?:must\s+not|do\s+not|cannot|never).{0,16}(?:remain|retain|exist)", re.I)
+_CONDITIONAL_PERMISSION = re.compile(r"仅在|只有|如果|范围|指定实例|特定实例|\b(?:if|when|provided|instances?)\b", re.I)
+_ACTION_START = (r"忽略|无需处理|不需要处理|不用处理|允许|许可|可以|可保留|不允许|不得|禁止|不能|不可|必须|修复|消除|清零|"
+                 r"\b(?:ignore\w*|allow\w*|permit\w*|must|do|never|repair\w*|fix\w*|resolve\w*)\b")
+_OTHER_ACTION_START = r"输出|生成|导出|保存|修改|显示|报告|记录|混合|保持|\b(?:keep|generate|dump|write|save|modify|report|display|mix)\w*\b"
+_CLAUSE_SPLIT = re.compile(
+    r"[，,]|但是|然而|但|\bbut\b|(?:并且|并|且|以及|和|与|及|\band\b)(?=\s*(?:" +
+    _ACTION_START + r"|" + _OTHER_ACTION_START + r"|" + _RULE_PATTERN +
+    r"[^，,;；。\n]{0,40}(?:" + _ACTION_START + r")))", re.I)
+
+
+def _clear_drc_bridge(text: str) -> str:
+    return re.sub(r"[\s`'\"()（）:：/\[\]_、.\-\d]|\band\b|与|及|和", "", _BRIDGE_WORDS.sub("", text), flags=re.I)
+
+
+def _permission_sets(spec: str) -> tuple[set[str], set[str]]:
+    """Scope each predicate separately, retaining uncertainty as no permission."""
+    retained, ignored, denied_residual, denied_ignore = set(), set(), set(), set()
+    for sentence in re.split(r"[\n;；。]", spec):
+        pending: set[str] = set()
+        carry_kind: str | None = None
+        for clause in _CLAUSE_SPLIT.split(sentence):
+            if not clause.strip():
+                continue
+            refs = list(re.finditer(_RULE_PATTERN, clause, re.I))
+            codes = rule_codes(clause)
+            clean = re.sub(r"无需处理|不需要处理|不用处理", "", clause)
+            no_ignore = _NEGATIVE_IGNORE.search(clean)
+            no_residual = _NEGATIVE_RESIDUAL.search(clean)
+            conditional = _CONDITIONAL_PERMISSION.search(clause)
+            if no_ignore or no_residual or conditional:
+                target = codes
+                if not target and pending:
+                    stripped = _NEGATIVE_IGNORE.sub("", _NEGATIVE_RESIDUAL.sub("", clean))
+                    if not _clear_drc_bridge(stripped):
+                        target = pending
+                if no_residual or conditional:
+                    denied_residual.update(target)
+                if no_ignore or no_residual or conditional:
+                    denied_ignore.update(target)
+                pending, carry_kind = set(), None
+                continue
+            granted_kind = None
+            # A report/log/format permission cannot authorize the DRC condition,
+            # even when its identifier immediately follows "allow".
+            verbs = list(_PERMISSION.finditer(clause))
+            object_start = min([ref.start() for ref in refs] + [verb.start() for verb in verbs], default=0)
+            if not _NON_DRC_OBJECT.search(clause[object_start:]):
+                for verb in _PERMISSION.finditer(clause):
+                    kind = "ignore" if verb.lastgroup == "ignore" else "retain"
+                    if kind == "retain" and not _RESIDUAL_OBJECT.search(clause):
+                        continue
+                    after = next((index for index, ref in enumerate(refs) if ref.start() >= verb.end()), None)
+                    before = next((index for index in range(len(refs) - 1, -1, -1) if refs[index].end() <= verb.start()), None)
+                    target: set[str] = set()
+                    if after is not None and not _clear_drc_bridge(clause[verb.end():refs[after].start()]):
+                        last = after
+                        while last + 1 < len(refs) and not _clear_drc_bridge(clause[refs[last].end():refs[last + 1].start()]):
+                            last += 1
+                        # Keep the entire addressed object honest: a dangling
+                        # unrelated action after the rule list is not a waiver.
+                        if not _clear_drc_bridge(clause[refs[last].end():]):
+                            target = set().union(*(rule_codes(ref.group()) for ref in refs[after:last + 1]))
+                    elif before is not None and not _clear_drc_bridge(clause[refs[before].end():verb.start()]):
+                        first = before
+                        while first and not _clear_drc_bridge(clause[refs[first - 1].end():refs[first].start()]):
+                            first -= 1
+                        if not _clear_drc_bridge(clause[verb.end():]):
+                            target = set().union(*(rule_codes(ref.group()) for ref in refs[first:before + 1]))
+                    elif not refs and pending and not _clear_drc_bridge(clause[:verb.start()] + clause[verb.end():]):
+                        target = pending
+                    if target:
+                        (ignored if kind == "ignore" else retained).update(target)
+                        granted_kind = kind
+                # A comma-separated bare list inherits only its own preceding
+                # predicate, including the distinction between retain and ignore.
+                if codes and carry_kind and not _clear_drc_bridge(re.sub(_RULE_PATTERN, "", clause, flags=re.I)):
+                    (ignored if carry_kind == "ignore" else retained).update(codes)
+                    granted_kind = carry_kind
+            if codes:
+                pending, carry_kind = codes, granted_kind
+            elif granted_kind:
+                carry_kind = granted_kind
+            elif (re.search(r"固有特性|设计固有|inherent|intrinsic", clause, re.I) and
+                  not re.search(r"允许|许可|allow|permit|时钟|clock|网表|netlist|输出|report", clause, re.I)):
+                continue
+            else:
+                pending, carry_kind = set(), None
+    retained -= denied_residual
+    ignored -= denied_residual | denied_ignore
+    return retained | ignored, ignored
+
+
+def authorized_rule_codes(spec: str) -> set[str]:
+    """Bind residual permission to its DRC object, never to an unrelated action."""
+    return _permission_sets(spec)[0]
+
+
+def authorized_ignored_rule_codes(spec: str) -> set[str]:
+    """Only ignore predicates authorize suppression; residual Warning stays visible."""
+    return _permission_sets(spec)[1]
 
 
 def redirected_drc_codes(run_dir: Path, cache: dict) -> set[str]:

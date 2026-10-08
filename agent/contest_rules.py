@@ -5,7 +5,7 @@ import hashlib
 
 
 QA_URL = "https://docs.qq.com/doc/DQkp3SGFOaGphZmZa"
-QA_READ_DATE = "2026-10-06"
+QA_READ_DATE = "2026-10-08"
 # Q19 applies only to this published task, irrespective of its mount directory.
 # This identifies the task specification, not a solution or an expected report.
 PUBLIC_TASK2_CASE2_SPEC_SHA256 = "67e012d73d0406da0d786a2ceb942dfb618ef48e89a3887df9b93e32d0f8e6fd"

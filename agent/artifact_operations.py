@@ -20,6 +20,20 @@ import tempfile
 from typing import Any
 
 
+def assert_output_directories(output_dir: Path, paths: list[str]) -> None:
+    """Require real case-local publication directories, never linked parents."""
+    root = output_dir.resolve(strict=True)
+    for relative in paths:
+        path = root
+        for name in Path(relative).parts:
+            if name in {'..', '.', ''}:
+                raise ValueError('Invalid output directory component')
+            path = path / name
+            value = path.lstat()
+            if not stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode) or not path.resolve().is_relative_to(root):
+                raise ValueError('Final output directory is not a real case-local directory: ' + str(path))
+
+
 def _clone_file(source: Path, destination: Path) -> bool:
     """Try Linux FICLONE; an unsupported filesystem needs an ordinary copy."""
     if sys.platform != "linux":
@@ -83,7 +97,7 @@ def _stat_fields(value: os.stat_result) -> tuple[int, ...]:
             value.st_mtime_ns, value.st_ctime_ns)
 
 
-def _run_signature(run_dir: Path) -> tuple[tuple[Any, ...], ...] | None:
+def _run_signature(run_dir: Path, *, exclude_input: bool = True) -> tuple[tuple[Any, ...], ...] | None:
     """Snapshot all non-input artifacts plus symlink targets and ancestors.
 
     Directory symlinks outside input are deliberately uncacheable: checking only
@@ -140,7 +154,7 @@ def _run_signature(run_dir: Path) -> tuple[tuple[Any, ...], ...] | None:
                 names = sorted(entry.name for entry in entries)
             for name in names:
                 child_relative = relative / name
-                if child_relative.parts[0] != "input":
+                if not (exclude_input and child_relative.parts[0] == "input"):
                     visit(path / name, child_relative)
 
     try:

@@ -172,6 +172,15 @@ def run_proof(originals: list[Path], candidates: list[Path], libs: list[Path], t
             process.wait()
             stream.write("\n[agent] EQY process group terminated at proof deadline\n")
             code, marker = None, "TIMEOUT"
+        except BaseException:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait()
+            stream.write("\n[agent] EQY process group terminated during case interruption\n")
+            raise
     result = {"passed": code == 0 and marker == "PASS", "returncode": code, "result": marker,
               "elapsed_seconds": round(time.monotonic() - started, 3), "top": top,
               "log": str(log), "original_netlists": [str(path) for path in originals],

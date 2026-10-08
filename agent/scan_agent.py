@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import deque
 import difflib
 import functools
@@ -10,9 +11,8 @@ import itertools
 import json
 import os
 import re
-import signal
 import shutil
-import subprocess
+import stat
 import sys
 import time
 from pathlib import Path
@@ -35,10 +35,17 @@ from model_script_view import model_owned_script
 from drc_retry_preflight import unchanged_control_retry_problems
 from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets
 from contest_rules import QA_READ_DATE, QA_URL, qa_context, qa_residual_codes
-from drc_validation import drc_summaries, excluded_scan_cells, redirected_drc_codes, residual_positive_evidence, rule_codes, summary_permitted
+from drc_validation import authorized_ignored_rule_codes, authorized_rule_codes, drc_summaries, excluded_scan_cells, redirected_drc_codes, residual_positive_evidence, rule_codes, summary_permitted
 from scan_exclusion_evidence import exclusion_command_evidence
-from artifact_operations import RunValidationCache, independent_copy
+from artifact_operations import RunValidationCache, assert_output_directories, independent_copy, _run_signature
 from help_selection import render_selected_help
+from runtime_limits import effective_case_seconds
+from audit_refresh import build_audit_refresh_request, current_evidence_catalog, validate_audit_refresh
+from case_deadline import CaseDeadline, CaseDeadlineExceeded
+from original_dofile import copy_original_dofile, read_original_text
+from repair_deliverables import publish_repair_deliverables
+from source_hierarchy import source_hierarchy_context, source_hierarchy_hints
+from tool_process import run_tool_process
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -109,7 +116,34 @@ def discover_files(input_dir: Path, suffix: str) -> list[Path]:
     return sorted(p for p in input_dir.rglob(f"*{suffix}") if p.is_file())
 
 
-def netlist_summary(paths: list[Path], query: str = "") -> str:
+def role_input_files(input_dir: Path, netlists: list[Path], libs: list[Path], original: Path | None) -> list[Path]:
+    """Freeze declared input roles, never read answers or credentials for hashing."""
+    paths = [*netlists, *libs]
+    paths.extend(p for p in (input_dir / 'task_spec.md', input_dir / 'limitations.md', original) if p and p.is_file())
+    paths.extend(p for p in input_dir.rglob('*') if p.is_file() and p.suffix.lower() in {'.ctl', '.vh', '.svh', '.sdc'})
+    return sorted({p for p in paths if p.name.lower() not in {'golden.dofile', 'preset_issues.json', '.env'}
+                   and not p.name.lower().startswith('.env.')})
+
+
+def actual_run_files(run_dir: Path) -> list[Path]:
+    """Bind current tool products and scripts to their exact bytes and path set."""
+    return sorted(p for p in run_dir.rglob('*') if p.is_file() and
+                  p.relative_to(run_dir).parts[0] not in {'input', 'rejected_proposals'} and
+                  not p.name.startswith('llm_'))
+
+
+def input_tree_signature(input_dir: Path) -> tuple | None:
+    """Track input contents/links, without unrelated ancestor directory timestamps."""
+    snapshot = _run_signature(input_dir, exclude_input=False)
+    if snapshot is None:
+        return None
+    root = Path(os.path.abspath(input_dir))
+    return tuple(record[:4] + (None, None, None) + record[7:] if
+                 stat.S_ISDIR(record[3]) and not Path(record[0]).is_relative_to(root) else record
+                 for record in snapshot)
+
+
+def netlist_summary(paths: list[Path], query: str = "", *, hierarchy_hints: dict | None = None) -> str:
     """Bound context size; never load a multi-hundred-MB gate netlist into the LLM prompt."""
     out: list[str] = []
     for p in paths:
@@ -170,12 +204,16 @@ def netlist_summary(paths: list[Path], query: str = "") -> str:
         links = {name: [f"{instance}:{kind}" for instance, kind in entries if kind in module_names]
                  for name, entries in hierarchy.items()}
         child_modules = {kind for entries in hierarchy.values() for _, kind in entries}
-        roots = sorted(module_names - child_modules)
+        roots = (hierarchy_hints["roots"] if hierarchy_hints is not None else sorted(module_names - child_modules))
         preferred = sorted(module_names.intersection(re.findall(r"[A-Za-z_][\w$]*", query)))
         preferred_roots = [name for name in preferred if name in roots]
         order = list(dict.fromkeys(preferred_roots + preferred + roots + list(links)))
         shown_roots = list(dict.fromkeys(preferred_roots + roots))[:40]
-        out.append("Root modules (not instantiated by another module in this file): " + ", ".join(shown_roots))
+        scope = "provided file family" if hierarchy_hints is not None else "this file (bounded legacy hint)"
+        description = (f"Root modules (not instantiated by another module in {scope})" if
+                       hierarchy_hints is None or hierarchy_hints.get('roots_complete') else
+                       'Unverified root candidates (source hierarchy incomplete; use actual tool discovery)')
+        out.append(description + ': ' + ', '.join(shown_roots))
         if len(roots) > 40:
             out.append(f"Root module candidates total: {len(roots)}; only 40 names shown.")
         out.append("Hierarchy (module -> child-instance:module): " +
@@ -247,21 +285,7 @@ def command_syntax(query: str, max_chars: int = 30000, *, current: str = "", ori
 
 
 def allowed_drc_codes(spec: str) -> set[str]:
-    allowed = set()
-    for sentence in re.split(r"[\n;；。]", spec):
-        pending = set()
-        for clause in re.split(r"[，,]", sentence):
-            codes = rule_codes(clause)
-            negative = re.search(r"不允许|不得|禁止|不忽略|not allowed|must not|do not ignore", clause, re.I)
-            positive = re.search(r"忽略|允许|无需处理|不需要处理|\ballow|\bignore|\bpermit", clause, re.I)
-            if negative:
-                pending = set()
-                continue
-            if positive:
-                allowed.update(codes or pending)
-            if codes:
-                pending = codes
-    return allowed
+    return authorized_rule_codes(spec)
 
 
 def permitted_residual_drc_codes(task: str, spec: str) -> set[str]:
@@ -317,7 +341,7 @@ def unsupported_options(dofile: str, task_spec: str | None = None, *,
                 problems.append("These DRC rules only support Error/Warning, never Info/Ignore: " + ", ".join(forbidden))
             if task_spec is not None:
                 changed = {re.sub(r"[-_ ]", "", rule).upper() for rule in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", level.group(1))}
-                disallowed = changed - allowed_drc_codes(task_spec)
+                disallowed = changed - authorized_ignored_rule_codes(task_spec)
                 if disallowed:
                     problems.append("Task does not authorize suppressing these DRC rules: " + ", ".join(sorted(disallowed)))
         if not re.match(r"\s*set_scan_signal\b", line):
@@ -393,11 +417,7 @@ def normalize_report_redirection(dofile: str) -> str:
 
 
 def parse_limit_seconds(text: str) -> int:
-    vals = re.findall(r"(?:wall\s*time|执行总时间|总时间|时间限制)[^\d]{0,40}(\d+)\s*(秒|seconds?|s\b|分钟|minutes?|min\b)?", text, re.I)
-    if not vals:
-        return int(os.environ.get("AGENT_CASE_TIMEOUT", "1500"))
-    n, unit = vals[0]
-    return int(n) * (60 if unit and ("分" in unit or "min" in unit.lower()) else 1)
+    return effective_case_seconds(text, os.environ.get("AGENT_CASE_TIMEOUT"))
 
 
 def parse_tool_limit(text: str) -> int | None:
@@ -633,7 +653,15 @@ def append_audit_reports(dofile: str, run_dir: Path, task_spec: str = "") -> str
                 continue
             if re.search(r"rule.handling|规则|等级|SpecifiedLevel", line, re.I):
                 continue
-            required_drc.update(re.findall(r"(?<![\w./])([\w.-]+\.rpt)(?![\w./])", line, re.I))
+            names = re.findall(r"(?<![\w./])([\w.-]+\.rpt)(?![\w./])", line, re.I)
+            named_drc = [name for name in names if re.search(r"drc|violation|违例", name, re.I)
+                         and not re.search(r"rule|handling|规则|等级", name, re.I)]
+            # A mixed output list does not assign every report the DRC role.
+            # A sole arbitrary filename can be bound by its DRC description.
+            if named_drc:
+                required_drc.update(named_drc)
+            elif len(names) == 1 and not re.search(r"chain|signal|cfg|config|handling|wrapper|element", names[0], re.I):
+                required_drc.update(names)
     if required_drc:
         extra += "\n# Agent task-listed DRC reports\n" + "\n".join(
             f'rpt_scan_drc_violation > "{run_dir / "reports" / name}"' for name in sorted(required_drc)) + "\n# End agent task-listed DRC reports\n"
@@ -767,35 +795,12 @@ def normalize_reset_levels(dofile: str, hints: dict[str, Any], configuration: st
 
 
 def normalize_associated_pin_paths(dofile: str, instances: dict[str, Any], configuration: str | None = None) -> str:
-    """Correct a nonexistent prefix only when the exact pin exists directly at top."""
-    designs = re.findall(r"(?m)^\s*present_design\s+([\w$]+)\s*$", configuration or "")
-    current = designs[0] if len(set(designs)) == 1 else ""
-    result = []
-    for line in dofile.splitlines():
-        present = re.match(r"\s*present_design\s+([\w$]+)\s*$", line)
-        if present:
-            current = present.group(1)
-        words = literal_tcl_words(line.strip())
-        if words and words[0] == "set_scan_signal" and "-associated_internal_clocks" in words:
-            index = words.index("-associated_internal_clocks")
-            if index + 1 < len(words):
-                path = words[index+1].strip('"{}').lstrip("/").removeprefix(current + "/")
-                pieces = path.split("/")
-                if len(pieces) >= 2 and "$" not in path and not re.search(r"\s", path):
-                    module = current
-                    target = None
-                    for name in pieces[:-1]:
-                        target = instances.get(module, {}).get(name)
-                        if not target:
-                            break
-                        module = target["type"]
-                    valid = target and pieces[-1] in target["pins"]
-                    direct = instances.get(current, {}).get(pieces[-2])
-                    if not valid and direct and pieces[-1] in direct["pins"]:
-                        words[index+1] = "{" + pieces[-2] + "/" + pieces[-1] + "}"
-                        line = line[:len(line)-len(line.lstrip())] + " ".join(words)
-        result.append(line)
-    return "\n".join(result) + "\n"
+    """Keep object identity: a same-named top leaf is not proof of an alias.
+
+    The compatibility entry point remains. Hierarchical repairs must come from
+    actual source/tool evidence, never by silently discarding path components.
+    """
+    return dofile
 
 
 def apply_dofile_edits(base: str, edits: Any) -> str:
@@ -892,9 +897,12 @@ def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
                     clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None,
                     structural_groups: list[dict] | None = None, include_command_help: bool = True,
-                    library_cells: set[str] | None = None) -> str:
+                    library_cells: set[str] | None = None, hierarchy_hints_out: dict | None = None) -> str:
     lib_names = [str(p) for p in libs]
     lib_summary = [liberty_summary(p, cell_names=library_cells) for p in libs]
+    hierarchy = source_hierarchy_hints(netlists, library_cells)
+    if hierarchy_hints_out is not None:
+        hierarchy_hints_out.update(hierarchy)
     shift_summary = shift_register_context(netlists, libraries=libs, hints=structural_groups) if re.search(r"移位寄存器|scan\s+segment", task_spec, re.I) else "Not requested"
     context = f"""# Natural-language task specification
 {task_spec}
@@ -912,7 +920,10 @@ Liberty files: {lib_names}
 {chr(10).join(lib_summary)}
 
 # Best-effort structural netlist scan
-{netlist_summary(netlists, task_spec)}
+{netlist_summary(netlists, task_spec, hierarchy_hints=hierarchy)}
+
+# Source module hierarchy, completeness and literal paths
+{source_hierarchy_context(netlists, task_spec, hints=hierarchy)}
 
 # Shift-register structures requested by the task
 {shift_summary}
@@ -1250,13 +1261,18 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
 
 
 def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path: Path | None = None,
-             abort_on_error: bool = True, allowed_drc: set[str] | None = None) -> dict[str, Any]:
+             abort_on_error: bool = True, allowed_drc: set[str] | None = None,
+             original_source: Path | None = None) -> dict[str, Any]:
     delivery = run_dir / "deliverables"
     reports = run_dir / "reports"
     delivery.mkdir(parents=True, exist_ok=True)
     reports.mkdir(parents=True, exist_ok=True)
     dofile_path = delivery / f"{run_id}.dofile"
-    dofile_path.write_text(dofile, encoding="utf-8")
+    if original_source is not None:
+        execute_path = execute_path or run_dir / f"{run_id}.dofile"
+        copy_original_dofile(original_source, execute_path, dofile_path)
+    else:
+        dofile_path.write_text(dofile, encoding="utf-8")
     if execute_path is None:
         # Keep [info script] rooted at the run directory so common script_dir-relative
         # output conventions stay inside this round's isolated workspace.
@@ -1264,58 +1280,18 @@ def tool_run(dofile: str, run_dir: Path, run_id: str, timeout: int, execute_path
         execute_path.write_text(dofile, encoding="utf-8")
     log_path = run_dir / f"{run_id}.log"
     cmd = [TOOL, "-f", str(execute_path)]
-    started = time.monotonic()
-    with log_path.open("w", encoding="utf-8") as log:
-        proc = subprocess.Popen(cmd, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
-                                start_new_session=True)
-        error = None
-        suffix = ""
-        drc_count = 0
-        observed_rules: set[str] = set()
-        report_monitor_cache = {}
-        with log_path.open(encoding="utf-8", errors="replace") as monitor:
-            while proc.poll() is None:
-                chunk = monitor.read(262144)
-                window = suffix + chunk
-                for line in window.splitlines():
-                    if "CMD-0034" in line:
-                        continue
-                    if re.search(r"\[(?:WARNING|INFO)\].*\[\s*DFTDRC-", line):
-                        observed_rules.update(re.sub(r"[-_ ]", "", rule).upper()
-                                              for rule in re.findall(r"DFTR[-_ ]?(?:TIE[01]|\d+)", line))
-                    summary = re.fullmatch(r"\s*Total violations:\s*(\d+)\s*", line)
-                    if summary:
-                        drc_count = int(summary.group(1))
-                if abort_on_error and re.search(r"\[(?:ERROR|FATAL)\]", suffix + chunk):
-                    error = "early_tool_error"
-                elif abort_on_error and allowed_drc is not None and redirected_drc_codes(run_dir, report_monitor_cache) - allowed_drc:
-                    error = "unallowed_drc"
-                elif abort_on_error and allowed_drc is not None and drc_count > 0 and observed_rules - allowed_drc:
-                    error = "unallowed_drc"
-                elif time.monotonic() - started >= max(1, timeout):
-                    error = "timeout"
-                if error:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait()
-                    log.write("\n[agent] tool timeout\n" if error == "timeout" else
-                              "\n[agent] generated script stopped after actual unallowed DRC; remaining commands were not executed\n"
-                              if error == "unallowed_drc" else
-                              "\n[agent] generated script stopped after actual ERROR; remaining commands were not executed\n")
-                    break
-                suffix = (suffix + chunk)[-100:]
-                time.sleep(0.1)
-        code = proc.wait()
-        status = "aborted" if error == "timeout" else "error" if error or code != 0 else "completed"
-    elapsed = time.monotonic() - started
+    result = run_tool_process(cmd, run_dir, run_id, timeout, log_path,
+                              abort_on_error=abort_on_error, allowed_drc=allowed_drc)
     # Collect only actual tool outputs. Preserve subdirectories and never fabricate reports.
     collection_started = time.monotonic()
-    output_files = collect_tool_outputs(run_dir, run_id)
-    return {"run_id": run_id, "status": status, "returncode": code, "error": error,
-            "elapsed_seconds": round(elapsed, 3), "collection_seconds": round(time.monotonic() - collection_started, 3), "log_path": log_path,
-            "artifacts": [p.relative_to(run_dir).as_posix() for p in output_files]}
+    try:
+        output_files = collect_tool_outputs(run_dir, run_id)
+    except CaseDeadlineExceeded as exc:
+        exc.tool_record = result
+        raise
+    result.update(collection_seconds=round(time.monotonic() - collection_started, 3),
+                  artifacts=[p.relative_to(run_dir).as_posix() for p in output_files])
+    return result
 
 
 def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: str,
@@ -2316,8 +2292,70 @@ def issue_audit_problems(task: str, issues: list[dict[str, Any]], changes: list[
     return problems
 
 
-def main() -> int:
-    start = time.monotonic()
+def refresh_existing_audit(client: OpenAI, output_dir: Path, issues: list[dict], plans: dict,
+                           run_records: list[dict], current_run: str, frozen_inputs: dict,
+                           input_signature: tuple | None, input_dir: Path, frozen_artifacts: tuple | None,
+                           deadline: float, reviews: list[dict], permitted_drc: set[str]) -> bool:
+    """Update plans using an unchanged finished run, without inventing R/F events."""
+    run_dir = output_dir / 'runs' / current_run
+    if (not frozen_inputs or input_signature is None or frozen_artifacts is None or
+            changed_paths(frozen_inputs) or input_tree_signature(input_dir) != input_signature or
+            _run_signature(run_dir) != frozen_artifacts):
+        return False
+    catalog = current_evidence_catalog(output_dir, current_run)
+    messages = build_audit_refresh_request(issues, run_records, current_run, catalog)
+    if not json.loads(messages[1]['content'])['issues'] or not catalog:
+        return False
+    folder = output_dir / 'audit_reviews' / f'A{len(reviews) + 1}'
+    folder.mkdir(parents=True, exist_ok=False)
+    record = {'audit_review_id': folder.name, 'actual_run_ref': current_run, 'tool_called': False,
+              'status': 'not_applied', 'updated_issue_ids': []}
+    reviews.append(record)
+    (folder / 'evidence_catalog.json').write_text(json.dumps(catalog, ensure_ascii=False, indent=2))
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            return False
+        response = ask(client.with_options(timeout=model_request_timeout(remaining), max_retries=0),
+                       messages[0]['content'], messages[1]['content'], max_tokens=1500,
+                       request_log=folder / 'llm_response.json')
+        updates = validate_audit_refresh(json_from_response(response), issues, run_records, current_run, catalog)
+        for update in updates.values():
+            actual = locate_evidence(run_evidence_files(run_dir), output_dir, update['expected_excerpt'], positive=True)
+            if not actual or actual['source'] != update['source'] or actual['locator'] != update['locator']:
+                raise ValueError('Selected audit evidence differs from the actual source/line locator')
+        if (changed_paths(frozen_inputs) or input_tree_signature(input_dir) != input_signature or
+                _run_signature(run_dir) != frozen_artifacts):
+            raise ValueError('Inputs/proofs/artifacts changed during read-only audit refresh')
+        work_issues, work_plans = copy.deepcopy(issues), copy.deepcopy(plans)
+        work_plans.update(updates)
+        verify_issue_fixes(work_issues, work_plans, output_dir, current_run, True, permitted_drc)
+        if (changed_paths(frozen_inputs) or input_tree_signature(input_dir) != input_signature or
+                _run_signature(run_dir) != frozen_artifacts):
+            raise ValueError('Inputs/proofs/artifacts changed while verifying read-only audit plans')
+        issues[:] = work_issues
+        plans.clear()
+        plans.update(work_plans)
+        record.update(status='plans_applied', updated_issue_ids=sorted(updates))
+        return bool(updates)
+    except Exception as exc:
+        record.update(status='rejected', reason=f'{type(exc).__name__}: {exc}')
+        return False
+    finally:
+        (folder / 'review.json').write_text(json.dumps(record, ensure_ascii=False, indent=2))
+
+
+def serialize_tool_runs(records: list[dict]) -> list[dict]:
+    return [{'tool_call_id': r['run_id'], 'log_file': r['log_file'], 'exit_status': r['exit_status'],
+             'returncode': r.get('returncode'), 'elapsed_seconds': r.get('elapsed_seconds'),
+             'collection_seconds': r.get('collection_seconds', 0), 'artifacts': r.get('artifacts', []),
+             **({'termination_reason': r['termination_reason']} if r.get('termination_reason') else {}),
+             **({'repair_integrity_passed': r['repair_integrity_passed']} if 'repair_integrity_passed' in r else {})}
+            for r in records]
+
+
+def main(started_at: float | None = None) -> int:
+    start = time.monotonic() if started_at is None else started_at
     parser = argparse.ArgumentParser()
     parser.add_argument("-input", "--input", required=True)
     parser.add_argument("-output", "--output", required=True)
@@ -2332,7 +2370,7 @@ def main() -> int:
     runs_root.mkdir(exist_ok=True)
     # Stable parent directories let metadata validation distinguish unchanged
     # evidence from modifications while final products remain independent copies.
-    for directory in ("final_results", "final_results/reports", "final_results/deliverables"):
+    for directory in ("final_results", "final_results/reports", "final_results/deliverables", "audit_reviews"):
         (output_dir / directory).mkdir(exist_ok=True)
     validation_cache = RunValidationCache()
     performance_stages: dict[str, float] = {}
@@ -2342,6 +2380,13 @@ def main() -> int:
     verification_plans: dict[str, dict[str, Any]] = {}
     repair_attempts: list[dict[str, Any]] = []
     generation_rejections: list[dict[str, Any]] = []
+    audit_reviews: list[dict[str, Any]] = []
+    case_deadline: CaseDeadline | None = None
+    final_protected_snapshot: dict = {}
+    final_execution_snapshot: dict = {}
+    final_active_netlists: dict[Path, Path] = {}
+    final_source_signature: tuple | None = None
+    final_artifact_fingerprints: dict = {}
     requirement_mapping: list[dict[str, Any]] = []
     final_dofile = ""
     task = "task1"
@@ -2353,17 +2398,20 @@ def main() -> int:
             raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
         if not os.environ.get("SCANINSERTION_LICENSE_SERVER"):
             raise RuntimeError("SCANINSERTION_LICENSE_SERVER is required")
+        limits_path = input_dir / 'limitations.md'
+        limits = read_original_text(limits_path) if limits_path.is_file() else ''
+        timeout_total = parse_limit_seconds(limits)
+        case_deadline = CaseDeadline(start + timeout_total, clock=time.monotonic)
+        case_deadline.arm()
         task, task_spec, netlists, libs, original_path = timed_call(performance_stages, "input_discovery", get_task_artifacts, input_dir)
         active_netlists = {path: path for path in netlists}
         active_netlist_root = input_dir / "netlist"
-        limits = read_text(input_dir / "limitations.md", 8000)
-        timeout_total = parse_limit_seconds(limits)
         # Small-case artifacts finalize in seconds; do not discard 20% of a
         # 150-second budget. Large netlists retain the longer copy/audit reserve.
         finalize_reserve = 30 if sum(path.stat().st_size for path in netlists) > 64 * 1024 * 1024 else 8
         max_calls = parse_tool_limit(limits)
         client: OpenAI | None = None
-        original = read_text(original_path, 50000) if original_path else None
+        original = read_original_text(original_path) if original_path else None
         previous = original or ""
         last_log = ""
         generation_error = ""
@@ -2376,10 +2424,11 @@ def main() -> int:
             instance_map=instances if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else None)
         control_hints = {root: values for root, values in reset_hints.items() if values}
         library_cells: set[str] = set()
+        hierarchy_hints: dict = {}
         static_context = timed_call(performance_stages, "static_context", context_for_run, input_dir, task_spec, limits, netlists, libs, "",
                                          clock_candidates=clock_candidates, mode_hints=mode_hints,
                                          structural_groups=structural_groups, include_command_help=False,
-                                         library_cells=library_cells)
+                                         library_cells=library_cells, hierarchy_hints_out=hierarchy_hints)
         known_reset_ports = set(control_hints)
         reset_inference_evidenced = False
         floating = (timed_call(performance_stages, "source_floating", floating_clock_outputs, netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
@@ -2430,7 +2479,8 @@ def main() -> int:
             if run_records:
                 context += "\n# Localized actual input source around prior diagnostics (Dofile repairs also need source traces)\n" + netlist_diagnostic_context(active_netlists, last_log + "\n" + previous_reports)
             if active_netlist_root != input_dir / "netlist":
-                context += f"\n# EQY-proven current netlist directory\n{active_netlist_root}\n"
+                context += (f"\n# EQY-proven current netlist directory; preceding static hints refer to the original input\n{active_netlist_root}\n"
+                            + source_hierarchy_context(list(active_netlists.values()), task_spec, hints=hierarchy_hints))
             if validation_problems:
                 context += "\n# Independent output-validator findings from previous round\n" + "\n".join(validation_problems)
             pending = [issue for issue in issue_records if not issue.get("attempts", [{}])[-1].get("verify", {}).get("resolved")]
@@ -2442,8 +2492,9 @@ def main() -> int:
             if task == "task2" and index == 1 and original is not None:
                 # R1 is a faithful diagnostic run of the supplied Dofile. Preserve the original as evidence.
                 dofile, meta = original, {"summary": "Run the supplied original Dofile to gather diagnostic evidence.", "requirement_mapping": [], "issue_resolutions": []}
-                (script_root / "original.dofile").write_text(original, encoding="utf-8")
                 execution_path = script_root / "original.dofile"
+                (run_dir / 'deliverables').mkdir(exist_ok=True)
+                copy_original_dofile(original_path, execution_path, run_dir / 'deliverables/R1.dofile')
             else:
                 admitted = False
                 for proposal_index in range(3):
@@ -2483,6 +2534,26 @@ def main() -> int:
                                 task, task_spec, original or "", input_dir, netlists, active_netlists, libs,
                                 edits, output_dir, repair_tag, start + timeout_total - finalize_reserve - 1)
                             active_netlist_root = output_dir / "netlist_versions" / repair_tag
+                            current_paths = list(active_netlists.values())
+                            hierarchy_hints = source_hierarchy_hints(current_paths, library_cells)
+                            clock_candidates = (clock_latch_hints(current_paths, libs) if
+                                                re.search(r'ICG|门控|缓冲|latch|闩锁', task_spec, re.I) else [])
+                            mode_hints = mode_control_hints(current_paths) if requested_constant_modes(task_spec) else []
+                            reset_hints, instances = {}, {}
+                            structural_groups = shift_register_groups(current_paths, libraries=libs, reset_hints=reset_hints,
+                                instance_map=instances if re.search(r'闩锁|latch|关联关系', task_spec, re.I) else None)
+                            control_hints = {root: values for root, values in reset_hints.items() if values}
+                            floating = (floating_clock_outputs(current_paths) if
+                                        re.search(r'悬空|浮空|unconnected|floating', task_spec, re.I) and
+                                        re.search(r'伪|pseudo', task_spec, re.I) and re.search(r'时钟|clock', task_spec, re.I) else {})
+                            expected_segments = (structural_groups if
+                                re.search(r'所有.{0,20}移位寄存器|all.{0,20}shift.{0,20}register', task_spec, re.I) else [])
+                            dofile = normalize_reset_levels(model_owned_script(dofile), control_hints)
+                            dofile, _ = configure_shift_segments(dofile, expected_segments, task_spec)
+                            dofile, _ = configure_floating_inputs(dofile, floating)
+                            dofile, _ = configure_natural_shift_reports(dofile, task_spec, literal_tcl_words)
+                            dofile, _ = configure_clock_associations(dofile, clock_candidates, task_spec, literal_tcl_words)
+                            dofile = append_audit_reports(dofile, run_dir, task_spec)
                             repair_attempts.append({"run_ref": rid, "admitted": True, "adopted": False,
                                                     "lec_ref": f"lec/{repair_tag}/aggregate.log"})
                         if active_netlist_root != input_dir / "netlist":
@@ -2547,9 +2618,9 @@ def main() -> int:
                 pending_changes.append(change)
             snapshot = {}
             if active_netlist_root != input_dir / "netlist":
-                protected = list(active_netlists.values())
+                protected = list(active_netlists) + list(active_netlists.values())
                 protected.extend(path for path in (output_dir / "lec").rglob("*")
-                                 if path.is_file() and path.name in {"check.eqy", "eqy.log", "aggregate.log", "PASS"})
+                                 if path.is_file() and path.name in {"summary.json", "check.eqy", "eqy.log", "aggregate.log", "PASS"})
                 snapshot = fingerprint_paths(protected)
                 (run_dir / "llm_protected_repair_fingerprints.json").write_text(json.dumps(snapshot, indent=2))
             remaining = timeout_total - (time.monotonic() - start)
@@ -2557,9 +2628,16 @@ def main() -> int:
                 generation_error = f"Insufficient time after fingerprinting before {rid}"
                 break
             per_run_timeout = max(1, int(remaining - finalize_reserve))
+            guarded_sources = role_input_files(input_dir, netlists, libs, original_path) + list(active_netlists.values())
+            if execution_path is not None:
+                guarded_sources.append(execution_path)
+            execution_snapshot = fingerprint_paths(guarded_sources)
+            source_signature = input_tree_signature(input_dir)
             result = timed_call(performance_stages, "eda_and_collection", tool_run, dofile, run_dir, rid, per_run_timeout, execution_path,
                               abort_on_error=not (task == "task2" and index == 1),
-                               allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None)
+                               allowed_drc=permitted_residual_drc_codes(task, task_spec) if re.search(r"\bDRC\b|违例", task_spec, re.I) else None,
+                               original_source=original_path if task == 'task2' and index == 1 else None)
+            completed_artifact_fingerprints = fingerprint_paths(actual_run_files(run_dir))
             changes.extend(pending_changes)
             final_dofile = dofile
             if not (task == "task2" and index == 1):
@@ -2585,7 +2663,7 @@ def main() -> int:
             ok, problems = timed_call(performance_stages, "round_validation", validation_cache.validate, run_dir,
                 lambda: check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates, mode_hints),
                 dofile=dofile, task_spec=task_spec, status=result["status"], expected=expected_checks, tool_finished=True)
-            modified = changed_paths(snapshot)
+            modified = changed_paths(snapshot) + changed_paths(execution_snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
                 record["repair_integrity_passed"] = False
@@ -2594,6 +2672,10 @@ def main() -> int:
                 problems.extend(integrity_problems)
             elif snapshot:
                 record["repair_integrity_passed"] = True
+            final_protected_snapshot, final_execution_snapshot = snapshot, execution_snapshot
+            final_active_netlists = dict(active_netlists)
+            final_source_signature = source_signature
+            final_artifact_fingerprints = completed_artifact_fingerprints
             validation_problems = problems
             if meta.get("requirement_mapping"):
                 requirement_mapping = []
@@ -2609,6 +2691,19 @@ def main() -> int:
             validation_problems = problems + issue_audit_problems(task, issue_records, changes)
             if integrity_problems:
                 break
+            if ok and client is not None and issue_audit_problems(task, issue_records, changes):
+                frozen_artifacts = _run_signature(run_dir)
+                audit_guard = {**execution_snapshot, **snapshot,
+                               **fingerprint_paths([run_dir / 'deliverables' / f'{rid}.dofile'])}
+                for _ in range(2):
+                    updated = timed_call(performance_stages, 'audit_refresh', refresh_existing_audit,
+                        client, output_dir, issue_records, verification_plans, run_records, rid,
+                        audit_guard, source_signature, input_dir, frozen_artifacts,
+                        start + timeout_total - finalize_reserve - 1, audit_reviews,
+                        permitted_residual_drc_codes(task, task_spec))
+                    if not updated or not issue_audit_problems(task, issue_records, changes):
+                        break
+                validation_problems = problems + issue_audit_problems(task, issue_records, changes)
             unresolved = any(issue.get("found", {}).get("verified") and
                              not (issue.get("attempts") and issue["attempts"][-1].get("verify", {}).get("resolved"))
                              for issue in issue_records)
@@ -2617,6 +2712,7 @@ def main() -> int:
         if not run_records:
             raise RuntimeError("No ScanInsertion tool call was made within the time budget")
         final_run_dir = runs_root / run_records[-1]["run_id"]
+        assert_output_directories(output_dir, ['final_results/reports', 'final_results/deliverables'])
         final_results = output_dir / "final_results"
         final_results.mkdir(exist_ok=True)
         timed_call(performance_stages, "final_copy", independent_copy, final_run_dir / f"{run_records[-1]['run_id']}.log", final_results / "final.log")
@@ -2624,7 +2720,8 @@ def main() -> int:
         reports = final_results / "reports"
         deliverables.mkdir(exist_ok=True)
         reports.mkdir(exist_ok=True)
-        (deliverables / "final.dofile").write_text(final_dofile, encoding="utf-8")
+        timed_call(performance_stages, 'final_copy', independent_copy,
+                   final_run_dir / 'deliverables' / f"{run_records[-1]['run_id']}.dofile", deliverables / 'final.dofile')
         # Copy actual tool-created products only.
         timed_call(performance_stages, "final_copy", copy_tree_contents, final_run_dir / "reports", reports)
         timed_call(performance_stages, "final_copy", copy_tree_contents, final_run_dir / "deliverables", deliverables)
@@ -2636,6 +2733,26 @@ def main() -> int:
         if integrity_problems:
             tool_checks_passed = False
             final_problems.extend(integrity_problems)
+        final_changed = (changed_paths(final_protected_snapshot) + changed_paths(final_execution_snapshot) +
+                         changed_paths(final_artifact_fingerprints))
+        if set(final_artifact_fingerprints) != {str(p) for p in actual_run_files(final_run_dir)}:
+            final_changed.append('Actual tool artifact path set changed after process completion')
+        if final_source_signature is not None and input_tree_signature(input_dir) != final_source_signature:
+            final_changed.append('Input directory metadata/path set changed after execution')
+        if final_changed:
+            tool_checks_passed = False
+            final_problems.append('Inputs/executed candidates/proofs changed before final adoption: ' + ', '.join(final_changed))
+        repair_delivery = None
+        if not final_changed and not integrity_problems:
+            try:
+                repair_delivery = timed_call(performance_stages, 'repair_delivery', publish_repair_deliverables,
+                    output_dir, task=task, final_run=run_records[-1]['run_id'],
+                    active_netlists=final_active_netlists, repair_attempts=repair_attempts,
+                    protected_fingerprints=final_protected_snapshot, libraries=libs,
+                    deadline=start + timeout_total - 1)
+            except RepairRejected as exc:
+                tool_checks_passed = False
+                final_problems.append('Final repair delivery rejected: ' + str(exc))
         audit_problems = issue_audit_problems(task, issue_records, changes)
         audit_complete = not audit_problems
         passed = tool_checks_passed and audit_complete
@@ -2655,15 +2772,16 @@ def main() -> int:
             "audit_problems": audit_problems,
             "requirement_mapping": requirement_mapping,
             "issue_resolutions": issue_records,
-            "tool_runs": [{"tool_call_id": r["run_id"], "log_file": r["log_file"],
-                           "exit_status": r["exit_status"], "returncode": r.get("returncode"),
-                           "elapsed_seconds": r.get("elapsed_seconds"), "collection_seconds": r.get("collection_seconds", 0),
-                           "artifacts": r.get("artifacts", []),
-                           **({"repair_integrity_passed": r["repair_integrity_passed"]} if "repair_integrity_passed" in r else {})}
-                          for r in run_records],
+            "tool_runs": serialize_tool_runs(run_records),
             "file_changes": changes,
             "netlist_repair_attempts": repair_attempts,
             "generation_rejections": generation_rejections,
+            "audit_reviews": audit_reviews,
+            "repair_delivery": repair_delivery,
+            "source_analysis": {"hierarchy_complete": hierarchy_hints.get('complete', False),
+                                "hierarchy_issues": hierarchy_hints.get('issue_counts', {}),
+                                "mode_levels": "task_grounded_or_unknown",
+                                "physical_scan_eligibility": "not_independently_verified"},
             "performance": {"validation_cache": dict(validation_cache.stats),
                             "stages_seconds": {name: round(value, 6) for name, value in performance_stages.items()},
                             "elapsed_before_serialization": round(time.monotonic() - start, 6)},
@@ -2674,16 +2792,29 @@ def main() -> int:
                           "issue_audit_complete": audit_complete,
                           "problems": final_problems + audit_problems}, ensure_ascii=False))
         return 0 if passed else 2
-    except Exception as e:
+    except (Exception, CaseDeadlineExceeded) as e:
+        if isinstance(e, CaseDeadlineExceeded):
+            actual_record = getattr(e, 'tool_record', None)
+            if actual_record and not any(r['run_id'] == actual_record['run_id'] for r in run_records):
+                raw = {key: value for key, value in actual_record.items() if key != 'log_path'}
+                raw['log_file'] = actual_record['log_path'].relative_to(output_dir).as_posix()
+                raw['exit_status'] = actual_record['status']
+                run_records.append(raw)
         error_message = f"{type(e).__name__}: {e}"
         print(error_message, file=sys.stderr)
         if not (output_dir / "decision_log.json").exists():
             (output_dir / "decision_log.json").write_text(json.dumps({"case_id": case_id_for(input_dir), "task": task,
                 "final_run": run_records[-1]["run_id"] if run_records else "", "summary": "Agent failed: " + error_message,
                 "requirement_mapping": requirement_mapping, "issue_resolutions": issue_records,
-                "tool_runs": run_records, "file_changes": changes,
+                "tool_runs": serialize_tool_runs(run_records), "file_changes": changes,
+                "status": 'aborted' if isinstance(e, CaseDeadlineExceeded) else 'error',
+                "tool_checks_passed": False, "issue_audit_complete": False,
+                "audit_reviews": audit_reviews,
                 "generation_rejections": generation_rejections}, ensure_ascii=False, indent=2), encoding="utf-8")
         return 1
+    finally:
+        if case_deadline is not None:
+            case_deadline.close()
 
 
 if __name__ == "__main__":

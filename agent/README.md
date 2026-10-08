@@ -1,6 +1,8 @@
 # Scan Insertion Agent
 
-## Latest status (2026-10-07)
+## Latest status (2026-10-08)
+
+The generic workflow update passed 460 regression checks and Ruff. A newly constructed gate-level design with unfamiliar names passed the real model and tool. A repaired multi-file design and its standalone export passed actual EQY; an inequivalent candidate was rejected. See [GENERALIZATION.md](../GENERALIZATION.md). The latest complete Public baseline and default image remain v46 (11/11); this candidate has only representative live validation. Hidden and full semantic checks remain unverified. Earlier dated records below are historical.
 
 Performance follow-up: the optimized source/report parsers passed 297 regression checks and Ruff. A v40 three-case live rerun passed 3/3, and all saved v39 artifacts still pass. The controlled parser benchmarks improved; complete-case times remain variable and one large rerun was slower. See [PERFORMANCE.md](../PERFORMANCE.md). The latest complete live Public batch remains v39 11/11.
 

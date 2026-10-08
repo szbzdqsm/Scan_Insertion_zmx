@@ -14,7 +14,8 @@ class ModeControlContext(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.netlist = Path(self.temporary.name) / "chip.v"
-        self.spec = "模式控制端口应锁定为使设计进入扫描测试模式、不进入 MBIST 的常量"
+        self.generic_spec = "模式控制端口应锁定为使设计进入扫描测试模式、不进入 MBIST 的常量"
+        self.spec = self.generic_spec + "；scan_mode 为常量 1；mbist_mode 为常量 0。"
         self.source = """module chip (clk, scan_mode, mbist_mode, ordinary_flag, scan_enable);
 input clk;
 input scan_mode;
@@ -83,18 +84,21 @@ exit
                 self.assertEqual(self.problems("present_design chip\n", spec), [])
 
     def test_english_explicit_modes_are_recognized(self):
-        spec = "Mode controls must be constants to enter scan test mode and disable MBIST."
+        spec = "Mode controls must be constants to enter scan test mode and disable MBIST.\nscan_mode must be constant 1; mbist_mode must be constant 0."
         self.assertEqual(requested_constant_modes(spec), {"scan_test", "mbist"})
         self.assertEqual(self.problems(spec=spec), [])
 
-    def test_active_low_literal_names_invert_only_the_requested_mode(self):
+    def test_active_low_literal_names_do_not_prove_polarity(self):
         self.netlist.write_text("""module low (input scan_mode_n, input mbist_en_b);
 endmodule
 """)
         hints = mode_control_hints([self.netlist])
         script = "present_design low\nset_scan_signal -type constant -port scan_mode_n -constant_value 0\nset_scan_signal -type constant -port mbist_en_b -constant_value 1\n"
-        self.assertEqual(self.problems(script, hints=hints), [])
-        self.assertTrue(self.problems(script.replace("-port scan_mode_n -constant_value 0", "-port scan_mode_n -constant_value 1"), hints=hints))
+        self.assertEqual(self.problems(script, spec=self.generic_spec, hints=hints), [])
+        self.assertEqual(self.problems(script.replace("-port scan_mode_n -constant_value 0", "-port scan_mode_n -constant_value 1"),
+                                       spec=self.generic_spec, hints=hints), [])
+        explicit = self.generic_spec + "；scan_mode_n 为常量 1；mbist_en_b 为常量 0。"
+        self.assertTrue(self.problems(script, spec=explicit, hints=hints))
 
     def test_ansi_ports_and_multiline_nonansi_declarations(self):
         self.netlist.write_text("""module chip(input wire clk,
@@ -129,7 +133,7 @@ endmodule
 """)
         hints = mode_control_hints([self.netlist])
         script = "present_design chip\nset_scan_signal -type constant -port mbist_mode -constant_value 0\n"
-        self.assertEqual(self.problems(script, hints=hints), [])
+        self.assertEqual(self.problems(script, spec=self.generic_spec, hints=hints), [])
 
     def test_dynamic_tcl_or_ports_skip_the_narrow_check(self):
         for script in ["if {1} {\n" + self.script + "}\n", self.script.replace("-port scan_mode", "-port $mode"),
@@ -189,9 +193,9 @@ child core (
         self.assertEqual(hints[0]["source"], str(self.netlist))
         self.assertEqual(hints[0]["line"], 2)
         self.assertEqual(hints[0]["mode_candidates"], [
-            {"port": "mbist_mode", "role": "mbist", "active_level": 1, "confidence": "literal_scalar_name",
+            {"port": "mbist_mode", "role": "mbist", "active_level": None, "name_polarity_hint": 1, "confidence": "name_hint_only",
              "direction": "input", "scalar": True, "source": str(self.netlist), "line": 2},
-            {"port": "scan_mode", "role": "scan_test", "active_level": 1, "confidence": "literal_scalar_name",
+            {"port": "scan_mode", "role": "scan_test", "active_level": None, "name_polarity_hint": 1, "confidence": "name_hint_only",
              "direction": "input", "scalar": True, "source": str(self.netlist), "line": 2}])
 
     def test_duplicate_and_parameterized_sources_fail_closed(self):
@@ -323,7 +327,7 @@ endmodule
                                                      self.hints + [duplicate_root], literal_tcl_words), [])
         ambiguous = {**self.hints[0], "mode_candidates": self.hints[0]["mode_candidates"] +
                      [{**self.hints[0]["mode_candidates"][1], "port": "test_mode"}]}
-        self.assertEqual(mode_control_report_problems([report], unknown_script, self.spec,
+        self.assertEqual(mode_control_report_problems([report], unknown_script, self.generic_spec,
                                                      [ambiguous], literal_tcl_words), [])
         incomplete = {**self.hints[0], "source_ports_complete": False}
         self.assertEqual(mode_control_report_problems([report], unknown_script, self.spec,

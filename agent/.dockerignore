@@ -22,3 +22,11 @@
 !shift_report_recipe.py
 !artifact_operations.py
 !help_selection.py
+!runtime_limits.py
+!audit_refresh.py
+!case_deadline.py
+!original_dofile.py
+!repair_deliverables.py
+!source_hierarchy.py
+!tool_process.py
+!agent_runner.py

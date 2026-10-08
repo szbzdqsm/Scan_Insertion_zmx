@@ -1,8 +1,8 @@
 """Conservative source-only mode-port hints and checks for literal Dofile settings.
 
-These checks neither edit a netlist nor prove scan semantics.  A setting is
-required only when the task explicitly requests a constant scan-test mode (or
-disabled MBIST), and one scalar input has the corresponding literal name.
+These checks neither edit a netlist nor prove scan semantics. Names are weak
+investigation hints. A literal setting is required only when the task supplies
+its value and the corresponding scalar input is established from source.
 """
 from __future__ import annotations
 
@@ -26,6 +26,18 @@ _PORT_IDENTIFIER = re.compile(_IDENTIFIER)
 _DIRECTION = re.compile(r"^(input|output|inout)\s+", re.I)
 _TYPES = re.compile(r"^(?:(?:wire|reg|logic|tri|signed|unsigned)\s+)+")
 _MODE_NAME = re.compile(r"^(scan_mode|test_mode|mbist_mode|mbist_en|mbist_enable)(?:_(n|b|l))?(?:_(i|in))?$", re.I)
+_CONSTANT_LANGUAGE = re.compile(
+    r"常量|锁定|锁死|固定|\bconstants?\b|\btie(?:d)?\b|\bheld\b|\block(?:ed)?\b", re.I)
+_AMBIGUOUS_VALUE_CONTEXT = re.compile(
+    r"禁止|不允许|不得|不能|不要|功能模式|正常模式|"
+    r"\b(?:if|when|unless|never)\b|\b(?:must|shall|do)\s+not\b|\bnot\s+allowed\b|"
+    r"\bfunctional\s+mode\b", re.I)
+_VALUE = r"(?:1'[bB][01]|[01]|high|low|高电平|低电平)"
+_AFTER_PORT_VALUE = re.compile(
+    r"\s*[`'\"]?\s*(?:(?:must|shall|should)\s+be\s+)?(?:(?:is|(?:held|tied|locked|set)\s+(?:to|at)|to|"
+    r"(?:应|必须|需|需要)?(?:设置|设定|配置|锁定|固定|保持|置)?(?:成|为|到|于)|[=:：])\s*)?"
+    r"(?:(?:constant(?:\s+value)?|常量(?:值)?|logic)\s*(?:of|[=:：]|为)?\s*)?"
+    r"(?P<value>" + _VALUE + r")(?![\w'])", re.I)
 
 
 def _uncomment(raw: str, blocked: bool) -> tuple[str, bool]:
@@ -184,10 +196,12 @@ def mode_control_hints(paths: list[Path]) -> list[dict[str, Any]]:
             found = _MODE_NAME.fullmatch(port)
             if found:
                 candidates.append({"port": port, "role": "mbist" if found.group(1).lower().startswith("mbist") else "scan_test",
-                                   "active_level": 0 if found.group(2) else 1,
-                                   "confidence": "literal_scalar_name" if detail["scalar"] else "vector_not_inferred",
+                                   "active_level": None, "name_polarity_hint": 0 if found.group(2) else 1,
+                                   "confidence": "name_hint_only" if detail["scalar"] else "vector_not_inferred",
                                    **detail})
-        result.append({"root": name, "input_ports": sorted(inputs), "mode_candidates": candidates,
+        result.append({"root": name, "input_ports": sorted(inputs),
+                       "scalar_input_ports": sorted(port for port, detail in inputs.items() if detail["scalar"]),
+                       "mode_candidates": candidates,
                        "source_ports_complete": bool(complete), "source": module["source"], "line": module["line"]})
     return result
 
@@ -204,31 +218,105 @@ def requested_constant_modes(spec: str) -> set[str]:
             requested.add("scan_test")
         if re.search(r"不进入\s*MBIST|(?:禁用|禁止|关闭).{0,12}MBIST|(?:disable|no|not(?:\s+enter)?|without).{0,12}MBIST", sentence, re.I):
             requested.add("mbist")
+    literal_binding = any(
+        _CONSTANT_LANGUAGE.search(line) and not _AMBIGUOUS_VALUE_CONTEXT.search(line) and
+        any(_AFTER_PORT_VALUE.match(line[token.end():]) for token in _PORT_IDENTIFIER.finditer(line))
+        for line in spec.splitlines())
+    constant_table = any("|" in line and any(
+        re.fullmatch(r"常量(?:值)?|锁定值|constant(?:[ _-]*value)?|ConstantValue", cell.strip().strip("`* "), re.I)
+        for cell in line.strip().strip("|").split("|")) for line in spec.splitlines())
+    if not requested and (literal_binding or constant_table):
+        # A literal requirement can name an unfamiliar control rather than a
+        # conventional scan/test/MBIST port. This enables source investigation;
+        # _requirements still has to bind a value to an actual scalar input.
+        requested.add("explicit_literal")
     return requested
 
 
-def _expected(hint: dict, spec: str) -> dict[str, int]:
+def _value(text: str) -> int | None:
+    return {"0": 0, "1": 1, "1'b0": 0, "1'b1": 1,
+            "low": 0, "high": 1, "低电平": 0, "高电平": 1}.get(text.strip().lower())
+
+
+def _requirements(hint: dict, spec: str) -> tuple[dict[str, dict], dict[str, str]]:
+    """Bind exact task values to scalar source inputs, abstaining on ambiguity.
+
+    Conventional names/suffixes and successful script declarations are never
+    proof of functional mode polarity. This parser accepts direct bindings and
+    explicit constant-value tables; it does not infer pairs stated respectively
+    or interpret general descriptions of entering a test mode.
+    """
     if not hint.get("source_ports_complete"):
-        return {}
-    wanted = requested_constant_modes(spec)
-    result = {}
-    for role in sorted(wanted):
-        candidates = [candidate for candidate in hint.get("mode_candidates", []) if candidate.get("role") == role]
-        if len(candidates) == 1 and candidates[0].get("confidence") == "literal_scalar_name":
-            candidate = candidates[0]
-            result[candidate["port"]] = candidate["active_level"] if role == "scan_test" else 1 - candidate["active_level"]
-    return result
+        return {}, {}
+    scalar = set(hint.get("scalar_input_ports", [])) & set(hint.get("input_ports", []))
+    values: dict[str, list[dict]] = {}
+    constant_column = None
+    for number, line in enumerate(spec.splitlines(), 1):
+        if _AMBIGUOUS_VALUE_CONTEXT.search(line):
+            # A condition before a comma still scopes the later assignment.
+            # Do not turn a functional-mode or prohibited setting into an
+            # unconditional scan-test constant.
+            constant_column = None
+            continue
+        if "|" in line:
+            cells = [cell.strip().strip("`* ") for cell in line.strip().strip("|").split("|")]
+            column = next((index for index, cell in enumerate(cells)
+                           if re.fullmatch(r"常量(?:值)?|锁定值|constant(?:[ _-]*value)?|ConstantValue", cell, re.I)), None)
+            if column is not None:
+                constant_column = column
+                continue
+            if constant_column is not None and constant_column < len(cells):
+                ports = [cell for index, cell in enumerate(cells) if index != constant_column and cell in scalar]
+                value = _value(cells[constant_column])
+                if len(ports) == 1 and value is not None and not _AMBIGUOUS_VALUE_CONTEXT.search(line):
+                    values.setdefault(ports[0], []).append({"value": value, "source": "task_spec.md",
+                                                           "line": number, "excerpt": line,
+                                                           "confidence": "explicit_task_value"})
+                elif not all(re.fullmatch(r"[:\-\s]+", cell) for cell in cells):
+                    constant_column = None
+        else:
+            constant_column = None
+        for clause in re.split(r"[;；。，,]", line):
+            if not _CONSTANT_LANGUAGE.search(clause) or _AMBIGUOUS_VALUE_CONTEXT.search(clause):
+                continue
+            for token in _PORT_IDENTIFIER.finditer(clause):
+                port = token.group()
+                if port not in scalar:
+                    continue
+                match = _AFTER_PORT_VALUE.match(clause[token.end():])
+                if match and (value := _value(match.group("value"))) is not None:
+                    values.setdefault(port, []).append({"value": value, "source": "task_spec.md",
+                                                       "line": number, "excerpt": line,
+                                                       "confidence": "explicit_task_value"})
+    expected, ambiguous = {}, {}
+    for port, evidence in sorted(values.items()):
+        if len({item["value"] for item in evidence}) == 1:
+            expected[port] = evidence[0]
+        else:
+            ambiguous[port] = "conflicting_explicit_task_values"
+    return expected, ambiguous
+
+
+def _expected(hint: dict, spec: str) -> dict[str, int]:
+    return {port: evidence["value"] for port, evidence in _requirements(hint, spec)[0].items()}
 
 
 def mode_control_context(paths: list[Path], spec: str, *, hints: list[dict] | None = None, limit: int = 12000) -> str:
     candidates = mode_control_hints(paths) if hints is None else hints
-    rows = [{**hint, "required_literal_constants": _expected(hint, spec)} for hint in candidates]
-    return ("Mode-port candidates from read-only input module declarations. Only scalar, uniquely named scan_mode/test_mode "
-            "and MBIST controls have literal polarity hints. Values are conditional on an explicit constant-mode task. "
+    rows = []
+    for hint in candidates:
+        requirements, unverified = _requirements(hint, spec)
+        rows.append({**hint, "required_literal_constants": {port: evidence["value"] for port, evidence in requirements.items()},
+                     "constant_requirement_evidence": requirements, "unverified_constant_requirements": unverified})
+    return ("Mode-port candidates from read-only input module declarations. Conventional names and suffixes are "
+            "weak hints, not proof of functional polarity. active_level is unknown unless actual functional evidence "
+            "establishes it. Do not infer a required constant from a name_polarity_hint. Only explicit task values "
+            "bound to actual scalar inputs appear in required_literal_constants, with task source lines. Generic "
+            "scan-test/MBIST descriptions require further source and tool investigation; unknown values remain unverified. "
             "Do not invent test_mode when the input top instead has scan_mode; do not treat generic scan-enable, clocks, "
             "resets or functional inputs as these mode constants. Missing/ambiguous names or unsupported HDL require actual "
             "source/tool investigation. Configure required constants with set_scan_signal -type constant -port PORT "
-            "-constant_value 0/1. A source scan_mode listed in required_literal_constants MUST remain type constant; "
+            "-constant_value 0/1. Any input listed in required_literal_constants MUST remain type constant; "
             "configuring it as scan_enable does not satisfy the constant-mode requirement. Use a separate scan-enable "
             "control (for example a new scan_enable port when allowed), preserving an existing dedicated enable when "
             "available. Verify both mode constants in actual scan_signal reports. This is structural guidance, not a "
@@ -244,9 +332,9 @@ def mode_control_problems(script: str, spec: str, hints: list[dict],
     Evaluated Tcl, unknown bodies, or dynamic relevant declarations disable this
     narrow check. Literal continuations and command separators are supported.
     """
-    if not requested_constant_modes(spec):
-        return []
-    roots = {hint.get("root"): hint for hint in hints if _expected(hint, spec)}
+    expected_by_root = {hint.get("root"): _expected(hint, spec) for hint in hints if hint.get("source_ports_complete")}
+    roots = {hint.get("root"): hint for hint in hints
+             if hint.get("source_ports_complete") and (requested_constant_modes(spec) or expected_by_root[hint.get("root")])}
     if not roots:
         return []
     design = ""
@@ -295,7 +383,7 @@ def mode_control_problems(script: str, spec: str, hints: list[dict],
         ports = options.get("-port", "").split()
         if any(re.search(r"[$\[\]\\]", port) for port in ports):
             return []
-        expected = _expected(roots[design], spec)
+        expected = expected_by_root[design]
         for port in ports:
             if _MODE_NAME.fullmatch(port) and port not in roots[design].get("input_ports", []):
                 nonexistent.append(f"Mode control {port} is not a real input of {design}; use the input-source port declarations")
@@ -305,7 +393,7 @@ def mode_control_problems(script: str, spec: str, hints: list[dict],
                 declared.setdefault((design, port), []).append((options.get("-type", ""), options.get("-constant_value", "")))
     problems = nonexistent
     for design in sorted(seen_roots):
-        for port, value in _expected(roots[design], spec).items():
+        for port, value in expected_by_root[design].items():
             settings = declared.get((design, port), [])
             if settings != [("constant", str(value))]:
                 problems.append(f"Task requires the real input {design}/{port} locked as -type constant -constant_value {value}; "
@@ -316,7 +404,7 @@ def mode_control_problems(script: str, spec: str, hints: list[dict],
 def _mode_control_scope(script: str, spec: str, hints: list[dict],
                         words_for: Callable[[str], list[str]]) -> tuple[str, dict[str, int]] | None:
     """Identify one literal selected source root; unknown Tcl leaves it unverified."""
-    roots = {hint.get("root"): _expected(hint, spec) for hint in hints if _expected(hint, spec)}
+    roots = {hint.get("root"): expected for hint in hints if (expected := _expected(hint, spec))}
     if not roots:
         return None
     try:
@@ -371,15 +459,10 @@ def mode_control_report_problems(paths: list[Path], script: str, spec: str, hint
     scope = _mode_control_scope(script, spec, hints, words_for)
     if scope is None and len(hints) == 1:
         hint = hints[0]
-        roles = requested_constant_modes(spec)
         expected = _expected(hint, spec)
-        # Every requested role must have one known scalar input. Unknown or
-        # ambiguous source names are not resolved by guessing from a report.
-        unique_controls = bool(roles) and all(
-            len(candidates := [candidate for candidate in hint.get("mode_candidates", []) if candidate.get("role") == role]) == 1
-            and candidates[0].get("confidence") == "literal_scalar_name"
-            for role in roles)
-        if (hint.get("source_ports_complete") and unique_controls and len(expected) == len(roles)
+        # A unique source top and explicit task-value bindings establish scope.
+        # A conventional mode name alone cannot grant this fallback.
+        if (hint.get("source_ports_complete") and expected
                 and re.fullmatch(_IDENTIFIER, hint.get("root", ""))):
             scope = hint["root"], expected
     if scope is None:

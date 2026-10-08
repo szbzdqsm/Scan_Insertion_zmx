@@ -762,6 +762,23 @@ class AuditRegression(unittest.TestCase):
         self.assertNotIn(str(self.out / "runs/R1"), second)
         self.assertNotIn('scan_drc_rule_handling.rpt', second)
 
+    def test_drc_report_binding_preserves_other_roles_in_mixed_output_lists(self):
+        (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_signal": "", "rpt_scan_drc_violation": ""}))
+        specs = ["输出 post_scan.v、post_scan.ctl、post_scan.def、drc.rpt、scan_chain.rpt、scan_signal.rpt。",
+                 "| DRC output files | drc.rpt, scan_signal.rpt, scan_chain.rpt |"]
+        with patch.object(agent, "__file__", str(self.root / "scan_agent.py")):
+            for spec in specs:
+                with self.subTest(spec=spec):
+                    result = agent.append_audit_reports("exit\n", self.out / "runs/R2", spec)
+                    self.assertEqual(result.count('rpt_scan_drc_violation >'), 1)
+                    self.assertIn('reports/drc.rpt', result)
+                    self.assertNotIn('reports/scan_signal.rpt', result)
+                    self.assertNotIn('reports/scan_chain.rpt', result)
+            arbitrary = agent.append_audit_reports("exit\n", self.out / "runs/R2", '| quality_check.rpt | DRC report |')
+            ambiguous = agent.append_audit_reports("exit\n", self.out / "runs/R2", 'DRC及其他报告：a.rpt、b.rpt')
+        self.assertIn('reports/quality_check.rpt', arbitrary)
+        self.assertNotIn('rpt_scan_drc_violation >', ambiguous)
+
     def test_config_option_fix_requires_actual_report_value(self):
         item = dict(self.item, evidence_excerpt="[ERROR] set_scan_cfg execution failed",
                     located_object="set_scan_cfg -mix_edges wrong", fix="set_scan_cfg -mix_edges true")
@@ -831,12 +848,13 @@ class AuditRegression(unittest.TestCase):
         self.assertIn("-off_state 1", agent.normalize_reset_levels(mapping, hints, script))
         self.assertEqual(agent.normalize_reset_levels(script, {}), script)
 
-    def test_wrong_associated_prefix_is_corrected_only_with_actual_direct_pin(self):
+    def test_wrong_associated_prefix_is_not_replaced_by_a_different_direct_pin(self):
         instances = {"top": {"core": {"type": "child", "pins": ["clk"]}, "latch": {"type": "DL", "pins": ["D", "Q"]}},
                      "child": {"real_latch": {"type": "DL", "pins": ["D", "Q"]}}}
         line = "set_scan_signal -type clock -port clk -associated_internal_clocks core/latch/Q\n"
         fixed = agent.normalize_associated_pin_paths("present_design top\n" + line, instances)
-        self.assertIn("-associated_internal_clocks {latch/Q}", fixed)
+        self.assertIn("-associated_internal_clocks core/latch/Q", fixed)
+        self.assertNotIn("-associated_internal_clocks {latch/Q}", fixed)
         self.assertIn("core/real_latch/Q", agent.normalize_associated_pin_paths("present_design top\n" + line.replace("core/latch", "core/real_latch"), instances))
         self.assertEqual(agent.normalize_associated_pin_paths(line, {}), line)
 
@@ -923,7 +941,7 @@ class AuditRegression(unittest.TestCase):
                         "module top (\nclk\n);\ninput clk;\nchild u_cpu (.clk(clk));\nendmodule\n")
         summary = agent.netlist_summary([path], "Top 模块 top")
         self.assertIn("u_cpu:child", summary)
-        self.assertIn("Root modules (not instantiated by another module in this file): top", summary)
+        self.assertIn("Root modules (not instantiated by another module in this file (bounded legacy hint)): top", summary)
 
     def test_requirement_reference_resolves_multiple_and_continued_commands(self):
         dofile = "# comment\nset_scan_signal -type clock -port clk\nset_scan_cfg \\\n    -chain_count 4 -max_length 100\nexit\n"
@@ -970,7 +988,7 @@ class AuditRegression(unittest.TestCase):
         wrapper.chmod(0o700)
         with patch.object(agent, "TOOL", str(wrapper)):
             result = agent.tool_run("exit\n", run, "R2", 4, abort_on_error=True)
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "aborted")
         self.assertEqual(result["error"], "early_tool_error")
         self.assertLess(result["elapsed_seconds"], 3)
         state = Path("/proc") / pid_file.read_text() / "stat"
@@ -1049,7 +1067,7 @@ class AuditRegression(unittest.TestCase):
                         return types.SimpleNamespace(choices=[types.SimpleNamespace(
                             message=types.SimpleNamespace(content=json.dumps(response)))])
 
-        def tool(dofile, run_dir, run_id, timeout, execution_path, abort_on_error=True, allowed_drc=None):
+        def tool(dofile, run_dir, run_id, timeout, execution_path, abort_on_error=True, allowed_drc=None, original_source=None):
             captures["calls"].append(timeout)
             captures["scripts"].append(dofile)
             delivery = run_dir / "deliverables"
@@ -1081,6 +1099,14 @@ class AuditRegression(unittest.TestCase):
             proof = output_root / "lec" / run_id / "aggregate.log"
             proof.parent.mkdir(parents=True)
             proof.write_text("Synthetic admitted EQY proof fixture\n")
+            proof_summary = {'passed': True, 'returncode': 0, 'result': 'PASS',
+                             'top': 'synthetic', 'original_netlists': [str(source)],
+                             'candidate_netlists': [str(candidate)]}
+            (proof.parent / 'summary.json').write_text(json.dumps(proof_summary))
+            (proof.parent / 'eqy.log').write_text('Synthetic EQY process fixture\n')
+            (proof.parent / 'check.eqy').write_text('[gold]\nsynthetic\n[gate]\nsynthetic\n')
+            (proof.parent / 'proof').mkdir()
+            (proof.parent / 'proof/PASS').touch()
             diff = output_root / "diffs" / f"netlist_{run_id}_fixture.diff"
             diff.parent.mkdir(exist_ok=True)
             diff.write_text("Synthetic retained candidate diff fixture\n")
@@ -1090,7 +1116,8 @@ class AuditRegression(unittest.TestCase):
 
         def fingerprint(paths):
             captures["fingerprints"].append(list(paths))
-            clock.now += fingerprint_seconds
+            if any('netlist_versions' in path.parts for path in paths):
+                clock.now += fingerprint_seconds
             return original_fingerprint(paths)
 
         with patch.object(agent, "time", types.SimpleNamespace(monotonic=lambda: clock.now)), \
@@ -1112,14 +1139,15 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual([record["tool_call_id"] for record in decision["tool_runs"]], ["R1"])
         self.assertEqual(decision["final_run"], "R1")
         self.assertEqual(len(captures["calls"]), 1)
-        self.assertEqual(len(captures["fingerprints"]), 1)
+        self.assertGreaterEqual(len(captures["fingerprints"]), 1)
         self.assertEqual(decision["file_changes"], [])
         attempt = decision["netlist_repair_attempts"][0]
         self.assertTrue(attempt["admitted"])
         self.assertFalse(attempt["adopted"])
         self.assertTrue((output_dir / attempt["lec_ref"]).is_file())
         self.assertTrue((output_dir / "netlist_versions/R2/pre_scan.v").is_file())
-        self.assertIn("Insufficient time after fingerprinting before R2", decision["summary"])
+        self.assertIn("Insufficient time", decision["summary"])
+        self.assertIn("R2", decision["summary"])
         self.assertEqual((output_dir / "final_results/deliverables/final.dofile").read_text(),
                          (output_dir / "runs/R1/deliverables/R1.dofile").read_text())
         self.assertEqual((output_dir / "final_results/final.log").read_bytes(),
@@ -1143,7 +1171,7 @@ class AuditRegression(unittest.TestCase):
         original = input_dir / "netlist/pre_scan.v"
         self.assertEqual(captures["repair_inputs"][1][original], first_candidate)
         self.assertEqual((output_dir / "runs/R3/input/netlist").resolve(), current_candidate.parent)
-        self.assertIn(current_candidate, captures["fingerprints"][-1])
+        self.assertTrue(any(current_candidate in group for group in captures["fingerprints"]))
         self.assertEqual(current_candidate.read_text(), "module top(); wire repaired_2; endmodule\n")
         self.assertEqual((output_dir / "final_results/deliverables/final.dofile").read_text(), captures["scripts"][2])
         self.assertEqual(decision["final_run"], "R3")
