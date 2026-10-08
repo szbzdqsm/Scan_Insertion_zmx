@@ -292,6 +292,14 @@ def permitted_residual_drc_codes(task: str, spec: str) -> set[str]:
     return allowed_drc_codes(spec) | qa_residual_codes(task, spec)
 
 
+def audit_visible_residual_codes(task: str, spec: str) -> set[str]:
+    """Visible authorized residuals are observations, not defects to invent.
+
+    A task's Ignore handling remains independently verifiable configuration.
+    """
+    return qa_residual_codes(task, spec) | (allowed_drc_codes(spec) - authorized_ignored_rule_codes(spec))
+
+
 def unsupported_options(dofile: str, task_spec: str | None = None, *,
                         known_reset_ports: set[str] | None = None,
                         permit_reset_inference: bool = False) -> list[str]:
@@ -301,6 +309,10 @@ def unsupported_options(dofile: str, task_spec: str | None = None, *,
         return []
     syntax = json.loads(path.read_text())
     problems = []
+    dynamic_commands = re.search(r"(?m)^\s*(?:proc|source|eval|interp|namespace)\b", dofile)
+    if not dynamic_commands and 'mkdir' not in syntax and re.search(r"(?m)^\s*mkdir(?:\s|$)", dofile):
+        problems.append("mkdir is a shell command, not a Tcl command; use file mkdir. "
+                        "The runtime already creates the reports and deliverables directories.")
     if (task_spec is not None and qa_residual_codes("task2", task_spec) and
             re.search(r"(?m)^\s*set_scan_element\s+(?:false|0|no|off)\b", dofile, re.I)):
         problems.append("Q19 permits visible DFTR10, not exclusion of scan FFs; remove set_scan_element false")
@@ -1028,6 +1040,10 @@ The actual read-only input directory is {input_dir}. The current run directory a
                "effective value already satisfies the task. A gated-clock CE latch stores enable data: "
                "its Q is not a clock merely because the downstream clock is inactive. Associate a source "
                "clock only with a demonstrated derived clock output or clock pin, using actual hierarchy.")
+    system += ("\nThe runtime already creates the reports and deliverables directories. "
+               "Write Tcl rather than shell commands: if another directory is required, use file mkdir, "
+               "never bare mkdir or mkdir -p. Do not invent a defect solely because those output directories "
+               "are not created explicitly in the Dofile.")
     if mode_hints:
         system += ("\nUse the supplied real top-level mode-port declarations and task-conditioned constants. "
                    "Do not invent test_mode when only scan_mode exists. A scan_enable declaration is distinct "
@@ -1735,6 +1751,10 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         diagnosed_rules = rule_codes(located + " " + diagnostic + " " + fix_text + " " + str(item.get("phenomenon", "")))
         chain_evidence = bool(re.search(r"(?m)^\s*(?:[IW]\s+\S+|\d+)\s+\d+\s+", cited) or
                               re.search(r"Chain\s+Length\s+Input", cited))
+        claim_rules = rule_codes(located + " " + diagnostic + " " + str(item.get("phenomenon", "")))
+        if chain_evidence and claim_rules and not cited_rules and not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited):
+            # A chain table supplies topology, not an observed DRC rule result.
+            continue
         parameter_claim = bool(re.search(r"off[-_ ]state|\busage\b|incomplete.{0,30}(?:declaration|command)|"
                                          r"missing.{0,20}(?:parameters?|options?)|缺少.{0,20}参数", diagnostic, re.I))
         if (chain_evidence and parameter_claim and not re.search(r"\[(?:ERROR|FATAL)\]", cited) and
@@ -2033,12 +2053,16 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                                     return {"source": path.relative_to(output_dir).as_posix(),
                                             "locator": f"L{number}", "excerpt": line.strip()}
     if "set_scan_drc_rule_handling" in subject:
+        requested = rule_codes(" ".join(str(diagnosis.get(key, "")) for key in
+                                       ("located_object", "summary", "root_cause")) +
+                               " " + str(issue.get("phenomenon", ""))) or rule_codes(excerpt)
         for command in logical_lines:
             match = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|DFTR[\w-]+)\s+(Error|Warning|Info|Ignore)\b", command)
             if not match or "-inst" in command:
                 continue
             rules = set(re.findall(r"DFTR[-\w]+", match.group(1)))
-            if not rules or not all(rule.removeprefix("DFTR-") in subject or rule in subject for rule in rules):
+            targeted = {rule for rule in rules if rule_codes(rule) & requested}
+            if not targeted or not requested <= rule_codes(match.group(1)):
                 continue
             for path in files:
                 if "rule_handling" not in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
@@ -2047,9 +2071,9 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                 matches = []
                 for number, line in enumerate(lines, 1):
                     row = re.fullmatch(r"\s*(DFTR[-\w]+)\s+(?:Error|Warning|Info|Ignore)\s+(Error|Warning|Info|Ignore)\s+all\s*", line)
-                    if row and row.group(1) in rules and row.group(2) == match.group(2):
+                    if row and row.group(1) in targeted and row.group(2) == match.group(2):
                         matches.append((number, row.group(1)))
-                if {rule for _, rule in matches} == rules:
+                if {rule for _, rule in matches} == targeted:
                     first, last = min(n for n, _ in matches), max(n for n, _ in matches)
                     return {"source": path.relative_to(output_dir).as_posix(),
                             "locator": f"L{first}" if first == last else f"L{first}-L{last}",
@@ -2685,7 +2709,7 @@ def main(started_at: float | None = None) -> int:
                                                     "dft_config": str(item.get("dft_config", "")),
                                                     "config_ref": {"source": "final_results/deliverables/final.dofile", "locator": ""}})
             record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id,
-                               netlist_change_ids, qa_residual_codes(task, task_spec))
+                               netlist_change_ids, audit_visible_residual_codes(task, task_spec))
             verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok,
                                permitted_residual_drc_codes(task, task_spec))
             validation_problems = problems + issue_audit_problems(task, issue_records, changes)

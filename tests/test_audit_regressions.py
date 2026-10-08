@@ -355,6 +355,59 @@ class AuditRegression(unittest.TestCase):
         self.assertIn("rule_handling", verify["source"])
         self.assertEqual(verify["excerpt"], "DFTR-TIE1 Warning Ignore all")
 
+    def test_chain_topology_cannot_discover_an_unobserved_drc_rule_failure(self):
+        table = ('Design: unfamiliar\nChain Length Input Output ScanEnable Clocks Partition\n'
+                 'I 1 1 ingress_1 egress_1 shift clk arbitrary_partition\n')
+        (self.out / 'runs/R1/reports/scan_chain.rpt').write_text(table)
+        for rule in ('DFTR-TIE0', 'DFTR7'):
+            with self.subTest(rule=rule):
+                item = dict(self.item, evidence_excerpt=table.rstrip(), phenomenon=f'{rule} violation',
+                            located_object='unfamiliar latch', root_cause=f'{rule} not handled',
+                            fix=f'set_scan_drc_rule_handling {rule} Warning')
+                self.assertEqual(self.record(item)[0], [])
+        topology = dict(self.item, evidence_excerpt=table.rstrip(), located_object='partition arbitrary_partition',
+                        root_cause='wrong clock in partition', phenomenon='incorrect partition clock',
+                        fix='add_scan_partition arbitrary_partition -clocks {clk}\nset_scan_drc_rule_handling DFTR7 Warning')
+        self.assertEqual(len(self.record(topology)[0]), 1)
+
+    def test_explicit_visible_residuals_are_not_registered_as_defects_but_ignore_is_separate(self):
+        specification = '允许保留 DFTR11 和 DFTR12 违例，忽略 DFTR-TIE0。其余违例必须清零。'
+        permitted = agent.audit_visible_residual_codes('task2', specification)
+        self.assertEqual(permitted, {'DFTR11', 'DFTR12'})
+        for rule in ('DFTR11', 'DFTR12', 'DFTR3'):
+            diagnostic = f"[WARNING] [DFTDRC-1001] DRC rule '{rule}' fails."
+            (self.out / 'runs/R1/R1.log').write_text(diagnostic+'\n')
+            item = dict(self.item, evidence_excerpt=diagnostic, root_cause=rule+' remains')
+            issues = []
+            agent.record_issue_fixes({'issue_resolutions':[item]}, issues, {}, self.out, 'R1', 'R2', 'F1',
+                                    accepted_residual=permitted)
+            self.assertEqual(len(issues), 0 if rule in permitted else 1)
+        self.assertEqual(agent.audit_visible_residual_codes('task2', '不得保留DFTR11'), set())
+
+    def test_one_rule_in_a_group_can_be_verified_by_its_own_actual_handling_row(self):
+        row = 'DFTR-TIE0 Warning Warning all'
+        item = dict(self.item, evidence_excerpt=row, located_object='set_scan_drc_rule_handling DFTR-TIE0',
+                    root_cause='incorrect configured handling for DFTR-TIE0',
+                    fix='set_scan_drc_rule_handling {DFTR-TIE0 DFTR-TIE1} Ignore')
+        (self.out / 'runs/R1/reports/rpt_scan_drc_rule_handling.audit.rpt').write_text(row+'\n')
+        issues, _ = self.record(item)
+        # The diagnosis names only TIE0; the executed command also handles TIE1.
+        issues[0]['attempts'][0]['fix']['action'] = 'Added DFTR-TIE0 to set_scan_drc_rule_handling Ignore list'
+        report = self.out / 'runs/R2/reports/rpt_scan_drc_rule_handling.audit.rpt'
+        for actual, valid in [('DFTR-TIE1 Warning Ignore all', False),
+                              ('DFTR-TIE0 Warning Warning all', False),
+                              ('DFTR-TIE0 Warning Ignore all', True)]:
+            report.write_text(actual+'\n')
+            with self.subTest(actual=actual):
+                evidence = agent.configuration_evidence(issues[0], [report], self.out, item['fix'])
+                self.assertEqual(evidence is not None, valid)
+        issues[0]['attempts'][0]['fix']['action'] = item['fix']
+        self.assertIsNotNone(agent.configuration_evidence(issues[0], [report], self.out, item['fix']))
+        issues[0]['diagnosis']['located_object'] = 'set_scan_drc_rule_handling DFTR-TIE0 DFTR-TIE1'
+        self.assertIsNone(agent.configuration_evidence(issues[0], [report], self.out, item['fix']))
+        report.write_text('DFTR-TIE0 Warning Ignore all\nDFTR-TIE1 Warning Ignore all\n')
+        self.assertIsNotNone(agent.configuration_evidence(issues[0], [report], self.out, item['fix']))
+
     def test_rule_table_without_command_name_is_not_a_drc_violation(self):
         item = dict(self.item, evidence_excerpt="DFTR7 Warning Warning all", located_object="DFTR7 level",
                     root_cause="wrong configured severity", fix="change configured severity")
@@ -761,6 +814,18 @@ class AuditRegression(unittest.TestCase):
         self.assertIn(str(self.out / "runs/R2/reports/drc.rpt"), second)
         self.assertNotIn(str(self.out / "runs/R1"), second)
         self.assertNotIn('scan_drc_rule_handling.rpt', second)
+
+    def test_undefined_shell_mkdir_is_rejected_before_tool_but_tcl_and_custom_commands_are_preserved(self):
+        (self.root / 'tool_help.json').write_text('{}')
+        with patch.object(agent, '__file__', str(self.root / 'scan_agent.py')):
+            for bad in ['mkdir reports\nexit\n', 'mkdir -p {arbitrary output}\nexit\n']:
+                with self.subTest(script=bad):
+                    self.assertTrue(any('file mkdir' in p for p in agent.unsupported_options(bad)))
+            for valid in ['file mkdir reports\nexit\n', '# mkdir is not executed\nexit\n',
+                          'proc mkdir {path} {file mkdir $path}\nmkdir reports\nexit\n',
+                          'source helpers.tcl\nmkdir reports\nexit\n', 'exec mkdir -p reports\nexit\n']:
+                with self.subTest(script=valid):
+                    self.assertEqual(agent.unsupported_options(valid), [])
 
     def test_drc_report_binding_preserves_other_roles_in_mixed_output_lists(self):
         (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_signal": "", "rpt_scan_drc_violation": ""}))

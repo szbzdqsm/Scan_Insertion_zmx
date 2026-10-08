@@ -110,8 +110,9 @@ def build_audit_refresh_request(issues: list[dict], run_records: list[dict], cur
     system = (
         "Select verification evidence for existing unresolved audit issues only. No tool will run. "
         "The listed current run already executed; only its actual catalog text may be selected. "
-        "Return exactly {\"verification_updates\":[{\"issue_id\":\"I1\",\"evidence_id\":\"V1\"}]}. "
-        "Return an empty array if the supplied evidence cannot prove an issue's existing fix. "
+        "Return exactly one JSON object: {\"verification_updates\":[{\"issue_id\":\"I1\",\"evidence_id\":\"V1\"}]}. "
+        "Return {\"verification_updates\":[]} if the supplied evidence cannot prove an issue's existing fix. "
+        "Output only the JSON object, without markdown fences or other text. "
         "Do not change diagnoses, discoveries, fixes, Dofiles, netlists or run identifiers; do not "
         "withdraw issues or claim success/resolved. A runtime semantic verifier decides closure. "
         "Absence of an old diagnostic is not positive evidence."

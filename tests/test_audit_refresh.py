@@ -1,4 +1,5 @@
 import copy
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -90,6 +91,32 @@ class AuditRefreshTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in messages], ["system", "user"])
         self.assertIn("No tool will run", messages[0]["content"])
         self.assertIn("rst reset 1", messages[1]["content"])
+
+    def test_every_message_contract_explicitly_requests_json_even_for_chinese_only_inputs(self):
+        chinese = copy.deepcopy(self.issues)
+        chinese[0]["found"]["excerpt"] = "复位关闭电平与实际低有效复位不符"
+        chinese[0]["diagnosis"] = {"root_cause": "原配置的复位极性错误"}
+        chinese[0]["attempts"][0]["fix"]["action"] = "按实际库函数设置正确关闭电平"
+        catalog = {"V1": self.catalog["V1"] | {"excerpt": "复位配置已实际生成"}}
+        for issues, evidence in [(self.issues, self.catalog), (chinese, catalog), ([], {}), (chinese, {})]:
+            with self.subTest(issues=issues, evidence=evidence):
+                before = copy.deepcopy((issues, self.runs, evidence))
+                messages = build_audit_refresh_request(issues, self.runs, "R2", evidence)
+                self.assertRegex(messages[0]["content"].lower(), r"\bjson\b")
+                self.assertRegex("\n".join(message["content"] for message in messages).lower(), r"\bjson\b")
+                self.assertIn("Output only the JSON object", messages[0]["content"])
+                self.assertEqual((issues, self.runs, evidence), before)
+
+    def test_json_prompt_keeps_the_same_selection_schema_and_empty_object_form(self):
+        messages = build_audit_refresh_request(self.issues, self.runs, "R2", self.catalog)
+        system = messages[0]["content"]
+        self.assertIn('{"verification_updates":[{"issue_id":"I1","evidence_id":"V1"}]}', system)
+        self.assertIn('{"verification_updates":[]}', system)
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual(set(payload), {"current_actual_run", "issues", "current_actual_evidence_catalog"})
+        self.assertEqual(payload["current_actual_run"], "R2")
+        self.assertEqual(payload["current_actual_evidence_catalog"], self.catalog)
+        self.assertEqual(self.validate({"verification_updates": []}), {})
 
     def test_catalog_uses_only_actual_line_text_and_number(self):
         with tempfile.TemporaryDirectory() as directory:
