@@ -8,6 +8,8 @@
 
 ## 最新接手状态（2026-10-08）
 
+2026-10-09 更新：可选映射缺行号的通用原因已修复，Task 2 也校验实际 Tcl，显式空数组清空旧映射；22 项小检查及 Ruff 通过。官方 ZIP 目录构建的 submission-v57 单跑 Task 2 case3 通过，141.13 秒/2 次工具调用，6 条映射均有行号、独立引用复核 1/1 无未知；旧 v56 原判保留。源码 ZIP 在 `outputs/mapping-fix-20261009/submission-package/submission.zip`，空 Key 配置及源码 SHA 清单按官方结构生成，见根 SUBMISSION_PACKAGING.md。只测这一例，完整基线与本地默认仍为 v56，未上传平台。
+
 最新完整重跑：**v56 固定镜像真实 Public 11/11、466 项回归与 Ruff 通过**，全部未越时，默认镜像为 v56。现场 `outputs/public-live-20261008T113903939155Z/`；镜像 ID 和逐例时间见根 LIVE_VALIDATION.md。实际文件/原始 R1/问题与 F/diff 引用独立复核无矛盾；Task 2 case3 一条额外可选映射缺行号，保留未确定，不能声称所有映射语义都已证明。本轮修复 JSON 审计契约、纯链表不能发现 DRC 状态、规则组目标绑定、Tcl mkdir 预检查及任务可见残余登记。旧失败/中断保留，清理 22 份旧重复日志约 232 MiB，清单见 PERFORMANCE.md。当前源码与完整验证镜像哈希一致，未上传评测平台。以下 v52/v46 是更早状态。
 
 通用迭代已实现，460 项回归及 Ruff 通过；独立陌生命名设计真实模型/工具通过，修复的最终单文件导出真实 EQY 通过。Q&A 已重新读取到 A31。详细变更、证据与边界见根 [GENERALIZATION.md](../GENERALIZATION.md)；本轮候选为 general-v52，完整 Public 基线及默认镜像仍为 v46。下文旧记录按其日期理解，不覆盖最新状态。

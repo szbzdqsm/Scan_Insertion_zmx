@@ -2,6 +2,8 @@
 
 核对日期：2026-10-08。规范依据是用户提供的[正式 Word](赛题指南_广立微.docx)和[主办方已审核 Q&A](https://docs.qq.com/doc/DQkp3SGFOaGphZmZa)；[宣讲 PPT](EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx)为参考。Q&A 摘要及规则适用范围见 [CONTEST_QA.md](CONTEST_QA.md)。
 
+2026-10-09 小范围修复：新源码对 Task 2 可选映射也检查候选/实际/最终脚本位置，并正确清空显式空数组。22 项小检查、Ruff、Task 2 case3 单例及独立复核通过，新结果 6 条映射均有行号；旧 v56 未确定行不改判。官方参考 README 已规定根 `.env`/Dockerfile 与 `submission/` 的 ZIP 结构，本地空 Key 包构建与入口检查通过，见 [SUBMISSION_PACKAGING.md](../SUBMISSION_PACKAGING.md)。本次没有完整重跑修改版。
+
 本次通用迭代已完整重跑：**v56 同一固定镜像 Public 11/11、466 项回归及 Ruff 通过**，所有用例未越时，默认镜像为 v56。最终实际文件/原始 R1/问题与修改引用独立复核无矛盾；Task 2 case3 一条可选映射缺行号，完整额外映射复核为 10 例通过、1 例未确定。新增源码完整性标记、模式出处、中文规则/时间解析、全程截止、只读审计和最终证明绑定；重跑修复了 JSON 契约、纯链表证据错配、Tcl mkdir 预检查与任务可见残余登记。详细结果与局限见 [GENERALIZATION.md](../GENERALIZATION.md) 和 [LIVE_VALIDATION.md](../LIVE_VALIDATION.md)。下文 v46 为上一轮基线历史。
 
 **同一 v46 镜像的 11 个 Public 用例已全部通过当前验收。** 真实模型、实际插链产物及当前审计已经验证；Hidden 与完整语义合规仍有下列独立验证边界。

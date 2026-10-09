@@ -906,6 +906,24 @@ def normalize_mapping_annotation(dofile: str, configuration: str) -> str:
     return candidate if config_reference(dofile, candidate) else configuration
 
 
+def requirement_mapping_problems(task: str, mappings: Any, dofile: str) -> list[str]:
+    """Any published mapping must cite literal configuration in its actual script."""
+    if not isinstance(mappings, list):
+        return ["requirement_mapping must be an array"]
+    if task == "task1" and not mappings:
+        return ["Task 1 requires a nonempty requirement_mapping with literal Dofile configurations"]
+    problems = []
+    for index, item in enumerate(mappings):
+        if (not isinstance(item, dict) or not isinstance(item.get("requirement"), str) or
+                not item["requirement"].strip() or not isinstance(item.get("dft_config"), str)):
+            problems.append(f"requirement_mapping[{index}] needs a requirement and a literal dft_config")
+        elif not config_reference(dofile, item["dft_config"]):
+            problems.append(f"requirement_mapping[{index}] has no actual Tcl match: {item['dft_config'][:500]}. "
+                            "Copy actual commands/options. An implicit tool default has no script locator; "
+                            "update the actual supported configuration or remove this optional Task 2 mapping.")
+    return problems
+
+
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
                     clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None,
                     structural_groups: list[dict] | None = None, include_command_help: bool = True,
@@ -1044,6 +1062,10 @@ The actual read-only input directory is {input_dir}. The current run directory a
                "Write Tcl rather than shell commands: if another directory is required, use file mkdir, "
                "never bare mkdir or mkdir -p. Do not invent a defect solely because those output directories "
                "are not created explicitly in the Dofile.")
+    system += ("\nEvery supplied requirement_mapping, including optional Task 2 mappings, must match "
+               "literal Tcl in the returned script. Do not map an implicit default to a command that was "
+               "never written. Task 2 may explicitly return requirement_mapping: [] to clear optional "
+               "mappings; omit the field only when an inherited mapping remains unchanged and valid.")
     if mode_hints:
         system += ("\nUse the supplied real top-level mode-port declarations and task-conditioned constants. "
                    "Do not invent test_mode when only scan_mode exists. A scan_enable declaration is distinct "
@@ -1101,6 +1123,8 @@ The actual read-only input directory is {input_dir}. The current run directory a
                 dofile = apply_dofile_edits(base_dofile, result["dofile_edits"])
             if "requirement_mapping" not in result and previous_mapping:
                 result["requirement_mapping"] = [dict(item) for item in previous_mapping]
+            if not isinstance(result.get("requirement_mapping", []), list):
+                raise ValueError("requirement_mapping must be an array")
             if not isinstance(dofile, str) or not dofile.strip():
                 raise ValueError("LLM JSON is missing a non-empty dofile")
             adapted = normalize_wrapper_roots(normalize_scan_port_formats(
@@ -1182,16 +1206,7 @@ The actual read-only input directory is {input_dir}. The current run directory a
                 problems.extend(unchanged_control_retry_problems(
                     previous_actual_dofile, dofile, previous_unallowed_codes or set(),
                     netlist_edits=result.get("netlist_edits"), words_for=literal_tcl_words))
-            if task == "task1":
-                mappings = result.get("requirement_mapping")
-                if not isinstance(mappings, list) or not mappings:
-                    problems.append("Task 1 requires a nonempty requirement_mapping with literal Dofile configurations")
-                else:
-                    for index, item in enumerate(mappings):
-                        if not isinstance(item, dict) or not str(item.get("requirement", "")).strip():
-                            problems.append(f"requirement_mapping[{index}] needs a requirement and a literal dft_config")
-                        elif not config_reference(dofile, str(item.get("dft_config", ""))):
-                            problems.append(f"requirement_mapping[{index}] has no actual Tcl match: {str(item.get('dft_config', ''))[:500]}. Copy actual commands/options; omit prose suffixes and collection placeholders.")
+            problems.extend(requirement_mapping_problems(task, result.get("requirement_mapping", []), dofile))
             if not problems:
                 return append_audit_reports(strip_fence(dofile), run_dir, spec), result
         except ValueError as error:
@@ -2687,6 +2702,9 @@ def main(started_at: float | None = None) -> int:
             ok, problems = timed_call(performance_stages, "round_validation", validation_cache.validate, run_dir,
                 lambda: check_output(run_dir, task_spec, task, dofile, result["status"], expected_segments, floating, clock_candidates, mode_hints),
                 dofile=dofile, task_spec=task_spec, status=result["status"], expected=expected_checks, tool_finished=True)
+            mapping_errors = requirement_mapping_problems(task, meta.get("requirement_mapping", requirement_mapping), dofile)
+            problems.extend(mapping_errors)
+            ok = ok and not mapping_errors
             modified = changed_paths(snapshot) + changed_paths(execution_snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
@@ -2701,7 +2719,7 @@ def main(started_at: float | None = None) -> int:
             final_source_signature = source_signature
             final_artifact_fingerprints = completed_artifact_fingerprints
             validation_problems = problems
-            if meta.get("requirement_mapping"):
+            if "requirement_mapping" in meta:
                 requirement_mapping = []
                 for item in meta.get("requirement_mapping", []):
                     if isinstance(item, dict):
@@ -2779,10 +2797,14 @@ def main(started_at: float | None = None) -> int:
                 final_problems.append('Final repair delivery rejected: ' + str(exc))
         audit_problems = issue_audit_problems(task, issue_records, changes)
         audit_complete = not audit_problems
-        passed = tool_checks_passed and audit_complete
         for mapping in requirement_mapping:
             config = mapping.get("dft_config", "")
             mapping.setdefault("config_ref", {})["locator"] = config_reference(final_dofile, config)
+        mapping_errors = requirement_mapping_problems(task, requirement_mapping, final_dofile)
+        if mapping_errors:
+            tool_checks_passed = False
+            final_problems.extend(mapping_errors)
+        passed = tool_checks_passed and audit_complete
         decision = {
             "case_id": case_id_for(input_dir),
             "organizer_clarifications": {"source": QA_URL, "read_date": QA_READ_DATE,
