@@ -35,7 +35,11 @@ COPY case_deadline.py /submission/case_deadline.py
 COPY original_dofile.py /submission/original_dofile.py
 COPY repair_deliverables.py /submission/repair_deliverables.py
 COPY source_hierarchy.py /submission/source_hierarchy.py
+COPY dft_signal_requirements.py /submission/dft_signal_requirements.py
+COPY exclusion_requirements.py /submission/exclusion_requirements.py
 COPY tool_process.py /submission/tool_process.py
+COPY partial_insertion_validation.py /submission/partial_insertion_validation.py
+COPY partial_issue_evidence.py /submission/partial_issue_evidence.py
 COPY agent_runner.py /submission/agent_runner.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json

@@ -28,5 +28,9 @@
 !original_dofile.py
 !repair_deliverables.py
 !source_hierarchy.py
+!dft_signal_requirements.py
+!exclusion_requirements.py
 !tool_process.py
+!partial_insertion_validation.py
+!partial_issue_evidence.py
 !agent_runner.py

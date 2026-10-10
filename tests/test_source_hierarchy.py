@@ -232,6 +232,48 @@ endmodule
         self.assertEqual(context["roots"], ["layer_0"])
         self.assertTrue(all(len(row["segments"]) <= 17 for row in context["module_instances"]))
 
+    def test_definition_pass_skips_leaf_connection_recognition(self):
+        from unittest.mock import patch
+        import source_hierarchy
+
+        path = self.source("definition_only.v", "module shell();\n" +
+                           "\n".join(f"unfamiliar_library ff_{index}(.D(d), .Q(q));" for index in range(51)) +
+                           "\nendmodule\n")
+        with patch.object(source_hierarchy, "_SIMPLE_NAMED_CONNECTIONS") as connections:
+            records = list(source_hierarchy._records(path, 65536, {"unfamiliar_library"}, headers_only=True))
+        connections.fullmatch.assert_not_called()
+        self.assertEqual([text for text, _, _ in records], ["module shell()", "endmodule"])
+
+    def test_header_optimization_matches_full_record_baseline_for_lexical_edges(self):
+        from unittest.mock import patch
+        import source_hierarchy
+
+        full_records = source_hierarchy._records
+
+        def original_record_pass(path, maximum, libraries=None, **_kwargs):
+            return full_records(path, maximum, libraries, headers_only=False)
+        sources = [
+            "module root();\nleaf ff(.D(d));\n/* unfinished",
+            "module root();\nunknown ff(.D(d));\n/* unfinished",
+            'module root();\nleaf ff(.D(d));\nlocalparam label="unfinished',
+            "module root();\nwire \\name;\nmodule nested(); endmodule\n",
+            "module root();\nleaf ff(.D(" + "x" * 80 + "));\nendmodule\n",
+            "module root(); leaf ff(.D(d)); endmodule\nmodule sub(); endmodule\n",
+            "module root();\nunknown ff(.D(d))\n`ifdef OTHER\nendmodule\n`endif\n",
+            "module root();\nleaf \\with;semicolon (.D(d));\nendmodule\n",
+            "module root();\nassign q = d;\n// complete comment\nendmodule\n",
+            "module root();\nwire q;\n/* comment */ module sub(); endmodule\n",
+        ]
+        for index, source in enumerate(sources):
+            path = self.source(f"lexical_{index}.v", source)
+            for maximum in (24, 65536):
+                for libraries in ({"leaf"}, {"leaf", "module"}):
+                    with self.subTest(index=index, max_statement_chars=maximum, libraries=libraries):
+                        actual = source_hierarchy_hints([path], libraries, max_statement_chars=maximum)
+                        with patch.object(source_hierarchy, "_records", side_effect=original_record_pass):
+                            expected = source_hierarchy_hints([path], libraries, max_statement_chars=maximum)
+                        self.assertEqual(actual, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,8 +25,10 @@ def _scope(query: str, words_for: Callable[[str], list[str]]) -> dict[str, Any] 
     if expression[:1] in {'"', "{"}:
         expression = expression[1:-1]
     includes, excludes = [], []
+    sequential_only = False
     for clause in expression.split("&&"):
         if re.fullmatch(r"\s*is_(?:sequential|scannable)\s*==\s*true\s*", clause):
+            sequential_only |= bool(re.fullmatch(r"\s*is_sequential\s*==\s*true\s*", clause))
             continue
         match = re.fullmatch(r'\s*full_name\s*(=~|!~|==|!=)\s*("[^"\n]+"|\{[^}\n]+\}|[^\s]+)\s*', clause)
         if not match:
@@ -36,7 +38,8 @@ def _scope(query: str, words_for: Callable[[str], list[str]]) -> dict[str, Any] 
         if not pattern or "$" in pattern or "\\" in pattern:
             return None
         (excludes if operator in {"!~", "!="} else includes).append((operator, pattern))
-    return {"includes": includes, "excludes": excludes, "endpoints": None} if includes else None
+    return {"includes": includes, "excludes": excludes, "endpoints": None,
+            "sequential_only": sequential_only} if includes else None
 
 
 def _matches(name: str, terms: list[tuple[str, str]]) -> bool:

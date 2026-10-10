@@ -43,6 +43,34 @@ class AuditRegression(unittest.TestCase):
                                  self.out, "R1", "R2", "F1")
         return issues, plans
 
+    def test_signal_value_cannot_discover_unspecified_polarity(self):
+        excerpt = "gate_b pre_existing scan_enable(spec) 1 clock_gating"
+        (self.out / "runs/R1/reports/signal.rpt").write_text(excerpt + "\n")
+        item = dict(self.item, evidence_excerpt=excerpt, located_object="gate_b",
+                    diagnosis="off_state is wrong because suffix _b is active-low",
+                    root_cause="off_state was inferred from name", fix="Set off_state 0")
+        issues, plans = [], {}
+        agent.record_issue_fixes({"issue_resolutions": [item]}, issues, plans, self.out,
+                                "R1", "R2", "F1", task_spec="Use port `gate_b` to control ICG.")
+        self.assertEqual(issues, [])
+
+    def test_explicit_signal_level_may_discover_polarity_failure(self):
+        excerpt = "gate_b pre_existing scan_enable(spec) 1 clock_gating"
+        (self.out / "runs/R1/reports/signal.rpt").write_text(excerpt + "\n")
+        item = dict(self.item, evidence_excerpt=excerpt, located_object="gate_b",
+                    diagnosis="off_state differs from required 0", root_cause="wrong off_state",
+                    fix="Set off_state 0")
+        issues, plans = [], {}
+        agent.record_issue_fixes({"issue_resolutions": [item]}, issues, plans, self.out,
+                                "R1", "R2", "F1", task_spec="Use port `gate_b` to control ICG with off_state 0.")
+        self.assertEqual(len(issues), 1)
+
+    def test_actual_drc_can_discover_control_failure_without_task_level(self):
+        issues, plans = [], {}
+        agent.record_issue_fixes({"issue_resolutions": [self.item]}, issues, plans, self.out,
+                                "R1", "R2", "F1", task_spec="Configure scan insertion.")
+        self.assertEqual(len(issues), 1)
+
     def test_old_round_evidence_and_closed_change_ids(self):
         issues, plans = self.record()
         issue = issues[0]
@@ -801,6 +829,25 @@ class AuditRegression(unittest.TestCase):
         produced = {p.relative_to(run).as_posix() for p in agent.collect_tool_outputs(run, "R2")}
         self.assertEqual(produced, {"deliverables/post_scan.v", "reports/scan_signal.rpt"})
         self.assertFalse((run / "deliverables/rejected_proposals").exists())
+
+    def test_real_design_files_written_in_reports_are_also_delivered(self):
+        run = self.out / 'runs/R2'
+        source = run / 'reports/intermediate.v'
+        source.write_text('module real_fixture(); endmodule\n')
+        products = agent.collect_tool_outputs(run, 'R2')
+        target = run / 'deliverables/intermediate.v'
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertNotEqual(target.stat().st_ino, source.stat().st_ino)
+        self.assertIn(target, products)
+        self.assertIn(source, products)
+
+    def test_conflicting_real_deliverables_are_not_overwritten(self):
+        run = self.out / 'runs/R2'
+        (run / 'deliverables').mkdir()
+        (run / 'reports/intermediate.v').write_text('one actual output\n')
+        (run / 'deliverables/intermediate.v').write_text('another actual output\n')
+        with self.assertRaisesRegex(RuntimeError,'Conflicting real deliverable'):
+            agent.collect_tool_outputs(run,'R2')
 
     def test_task_listed_drc_is_requested_from_the_native_tool_once_per_round(self):
         (self.root / "tool_help.json").write_text(json.dumps({"rpt_scan_signal": "", "rpt_scan_drc_violation": ""}))

@@ -51,6 +51,10 @@ def tcl_chunks(script: str) -> list[str]:
 
 
 def normalize_unrequested_counts(script: str, spec: str) -> str:
+    # Imported lazily: report_validation also consumes this module's Tcl lexer.
+    from report_validation import chain_role_requirements
+    if 'I' in chain_role_requirements(spec):
+        return script
     if not spec or re.search(r"chain_count|链(?:数|数量)|\d+\s*条(?:扫描)?链|number.{0,20}chains", spec, re.I):
         return script
     return re.sub(r"(?m)^(\s*set_scan_cfg\b[^\n]*)", lambda match:

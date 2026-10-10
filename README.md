@@ -1,5 +1,9 @@
 # Scan Insertion Agent
 
+本轮最新结果：v60 Task1 case3/case5 分别31.41/377.03秒；v61 Task2 case5 647.56秒；v63 Task1 case4 33.90秒；v64 Task1 case1 36.41秒，各按对应检查通过。584项回归与Ruff通过。结果分属不同固定镜像，不能合并为新版全量成绩；当前默认开发镜像更新为v64，旧完整基线保留。
+
+2026-10-10 平台结果复核：平台评分输出明确 11/11 仅覆盖格式与运行。新发现并修复 I/W 分别计数、ICG 指定控制口、子树排除例外、局部 FF 回替范围和 TAP 域排除遗漏；加入真实结构检查、源解析优化与命令阶段观测。旧 v56 全批记录保留，其检查范围没有覆盖这些新发现。详见 [平台结果复核](PLATFORM_RESULT_REVIEW.md)。本轮仅重跑受影响用例，不作为新版完整 Public 成绩。
+
 开发源码位于 [agent/](agent/README.md)，正式 Word 和宣讲 PPT 也保存在该目录。[要求核对](agent/CONTEST_REQUIREMENTS.md)和[主办方 Q&A 核对](agent/CONTEST_QA.md)记录规则与待办；当前仍是开发版本。
 
 2026-10-09 可选映射修复：Task 2 的映射现也必须绑定实际 Tcl，显式空数组可清空旧映射，最终发布再次校验。**22 项小范围检查、Ruff、Task 2 case3 单例及独立引用复核通过**，新结果 6 条映射均有行号。已按官方参考结构生成本地 `submission.zip`；详见[打包说明](SUBMISSION_PACKAGING.md)与[验证记录](LIVE_VALIDATION.md)。本次未做全批重跑，完整基线仍是 v56。

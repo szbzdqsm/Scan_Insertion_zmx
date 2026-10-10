@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 import re
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from dofile_recipe import tcl_chunks
 
@@ -149,7 +149,8 @@ def coverage_problems(paths: list[Path], dofile: str) -> list[str]:
     return problems
 
 
-def report_rows(path: Path, required: set[str]) -> Iterator[dict[str, Any]]:
+def report_rows(path: Path, required: set[str], *,
+                row_filter: Callable[[str], bool] | None = None) -> Iterator[dict[str, Any]]:
     # A header must contain every required token. Most report lines contain no
     # header token at all; only candidates need tokenization and layout changes.
     # Empty requirements retain the original behavior (every line is a header).
@@ -166,6 +167,8 @@ def report_rows(path: Path, required: set[str]) -> Iterator[dict[str, Any]]:
                     continue
             if not columns or not line.strip() or line.lstrip().startswith(("-", "Design:")):
                 continue
+            if row_filter is not None and not row_filter(line):
+                continue
             row = {name: line[span].strip() for name, span in columns}
             row.update(source=source, line=number)
             yield row
@@ -176,11 +179,23 @@ def chain_rows(paths: list[Path]) -> list[dict[str, Any]]:
     for path in paths:
         if "chain" not in path.name.lower() or "cell" in path.name.lower():
             continue
+        seen = set()
         for row in report_rows(path, {"Chain", "Length", "Input", "Output", "Partition"}):
             if not re.fullmatch(r"(?:[IW]\s+\S+|\d+)", row["Chain"]) or not row["Length"].isdigit():
                 continue
-            key = tuple(row[name] for name in ("Chain", "Partition", "Input", "Output"))
-            rows[key] = row
+            key = tuple(row[name] for name in ("Chain", "Partition"))
+            previous = rows.get(key)
+            if previous:
+                fields = {name for name in previous.keys() & row.keys() if name not in {"source", "line"} and not name.startswith("_chain_")}
+                if any(previous.get(name) != row.get(name) for name in fields):
+                    previous["_chain_conflict"] = True
+                if key in seen:
+                    previous["_chain_duplicate"] = True
+                for name in row.keys() - previous.keys():
+                    previous[name] = row[name]
+            else:
+                rows[key] = row
+            seen.add(key)
     return list(rows.values())
 
 
@@ -214,8 +229,157 @@ def scan_formats(spec: str) -> tuple[str, str] | None:
     return None
 
 
+_CHAIN_ROLE_COUNT = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<role>unwrapper[ _-]*(?:scan[ _-]*)?(?:chains?|链)|"
+    r"(?:non[ _-]*|非|无)wrapper[ _-]*(?:scan[ _-]*)?(?:chains?|链)|"
+    r"(?:内部|普通|非封装)(?:扫描)?链|wrapper[ _-]*(?:scan[ _-]*)?(?:chains?|链)|"
+    r"(?:封装|包装)(?:扫描)?链)"
+    r"[\s`*_]*(?:的\s*)?(?:(?:数(?:量|目)?|count|number)[\s`*_]*)?"
+    r"(?:(?:要求|应|必须|需要|需|must\s+be|shall\s+be)[\s`*_]*)?"
+    r"(?:(?:为|是|等于|设置为|is|are|of|[=:：])[\s`*_]*)?"
+    r"(?P<count>\d+)(?!\d|\.\d)\s*(?:条|chains?)?", re.I)
+_COUNT_NOT_EXACT = re.compile(
+    r"不要求|未要求|无需|不需要|不必|不得|不允许|禁止|不超过|不得超过|至少|最多|最少|"
+    r"如果|若|仅在|只有|分区|每个|各分区|\b(?:if|when|unless|partition|per|at\s+least|"
+    r"at\s+most|no\s+more|not\s+required|do\s+not\s+require)\b", re.I)
+
+
+def _role_counts(spec: str) -> tuple[dict[str, int], list[str]]:
+    values: dict[str, set[int]] = defaultdict(set)
+    for sentence in re.split(r"[\n;；。]", spec):
+        conditional = False
+        for clause in re.split(r"[，,]", sentence):
+            conditional |= bool(re.search(r"如果|若|仅在|只有|\b(?:if|when|unless)\b", clause, re.I))
+            if conditional or _COUNT_NOT_EXACT.search(clause):
+                continue
+            for match in _CHAIN_ROLE_COUNT.finditer(clause):
+                label = match["role"].lower()
+                role = "I" if label.startswith(("unwrapper", "non", "非", "无", "内部", "普通")) else "W"
+                values[role].add(int(match["count"]))
+    problems = [f"Task has conflicting explicit {'Wrapper' if role == 'W' else 'Internal/unwrapper'} chain counts; "
+                "a single total cannot prove this requirement" for role, counts in sorted(values.items()) if len(counts) > 1]
+    return {role: next(iter(counts)) for role, counts in values.items() if len(counts) == 1}, problems
+
+
+def chain_role_requirements(spec: str) -> dict[str, int]:
+    """Return only unambiguous exact global W/I counts from task text."""
+    return _role_counts(spec)[0]
+
+
+def wrapper_chain_configuration_problems(dofile: str, spec: str,
+                                         words_for: Callable[[str], list[str]]) -> list[str]:
+    """Check literal wrapper and total-chain configuration, never predict actual chains.
+
+    Unknown/dynamic Tcl, multiple designs and partition/IP scopes abstain from
+    this preflight. Actual typed report counts must still be checked afterwards.
+    """
+    required, problems = _role_counts(spec)
+    if problems or not required:
+        return problems
+    try:
+        chunks = tcl_chunks(dofile.replace("\\\n", " "))
+    except ValueError:
+        return []
+    counts: dict[str, list[int]] = defaultdict(list)
+    designs = set()
+    selected = ""
+
+    def literal(word: str) -> str | None:
+        if word.startswith(("{", '"')) and word.endswith(("}", '"')):
+            word = word[1:-1]
+        return None if re.search(r"[$\[\]\\;\s]", word) else word
+
+    for chunk in chunks:
+        text = chunk.strip()
+        if not text or text.startswith("#"):
+            continue
+        words = words_for(text)
+        if not words:
+            return []
+        name = words[0]
+        if name in {"source", "eval", "uplevel", "namespace", "proc"} or ";" in text:
+            return []
+        if name in {"if", "for", "foreach", "while", "catch"}:
+            if re.search(r"\b(?:set_scan_cfg|set_wrapper_cfg|present_design|load_netlist|partition|ip_group)\b", text):
+                return []
+            continue
+        if name == "set_current_scan_partition":
+            if len(words) != 2 or literal(words[1]) != "Default_Partition":
+                return []
+        elif name in {"add_scan_partition", "set_current_ip_group", "add_ip_group"}:
+            return []
+        if name == "load_netlist":
+            selected = ""
+            if "-top" in words:
+                index = words.index("-top")
+                selected = literal(words[index + 1]) if index + 1 < len(words) else None
+                if not selected:
+                    return []
+                designs.add(selected)
+        elif name == "present_design":
+            selected = literal(words[1]) if len(words) == 2 else None
+            if not selected:
+                return []
+            designs.add(selected)
+        elif name in {"set_scan_cfg", "set_wrapper_cfg"}:
+            if not selected or len(designs) != 1:
+                return []
+            if "-chain_count" not in words:
+                continue
+            if "-port" in words or words.count("-chain_count") != 1:
+                return []
+            index = words.index("-chain_count")
+            value = literal(words[index + 1]) if index + 1 < len(words) else None
+            if value is None or not value.isdecimal():
+                return []
+            counts["W" if name == "set_wrapper_cfg" else "I"].append(int(value))
+        elif name == "exit":
+            break
+        elif (name not in {"set", "file", "puts", "load_lib", "load_ctl", "set_scan_signal", "set_scan_cell_mapping",
+                           "set_scan_element", "set_scan_drc_cfg", "set_scan_drc_rule_handling", "set_dft_clock_gating_cfg",
+                           "add_dedicated_wrapper_cell_type", "set_scan_segment", "add_pseudo_pi", "examine_scan_drc",
+                           "examine_scan_chain", "insert_dft_logic"} and not name.startswith(("rpt_", "dump_", "get_"))):
+            return []
+    if len(designs) != 1:
+        return []
+    for role, wanted in required.items():
+        actual = counts.get(role, [])
+        command = "set_wrapper_cfg" if role == "W" else "set_scan_cfg"
+        # The installed tool counts I+W in global set_scan_cfg when wrappers
+        # are enabled. Actual typed output still proves each requested class.
+        configured_goal = wanted + required.get('W',0) if role == 'I' else wanted
+        if not actual:
+            problems.append(f"Task requires {'Wrapper' if role == 'W' else 'Internal/unwrapper'} chain count {wanted}; "
+                            f"missing literal {command} -chain_count {configured_goal}. "
+                            "With wrapper chains, global set_scan_cfg counts internal plus wrapper chains")
+        elif any(value != configured_goal for value in actual):
+            problems.append(f"Task requires {'Wrapper' if role == 'W' else 'Internal/unwrapper'} chain count {wanted}; "
+                            f"literal {command} counts {actual} do not match required configured count {configured_goal}")
+    return problems
+
+
 def chain_problems(rows: list[dict[str, Any]], spec: str) -> list[str]:
-    problems = []
+    required, problems = _role_counts(spec)
+    if required:
+        counted = {}
+        ambiguous = False
+        for row in rows:
+            match = re.fullmatch(r"([IW])\s+(\S+)", row.get("Chain", ""))
+            if not match or not str(row.get("Length", "")).isdigit():
+                problems.append("Explicit Wrapper/Internal chain counts require complete typed W/I report rows")
+                ambiguous = True
+                continue
+            key = row["Chain"], row.get("Partition", "")
+            if key in counted or row.get("_chain_conflict") or row.get("_chain_duplicate"):
+                problems.append(f"Duplicate or conflicting actual chain identity {row['Chain']} in partition {row.get('Partition', '')}")
+                ambiguous = True
+            counted[key] = match[1]
+        if not ambiguous:
+            for role, wanted in required.items():
+                actual = sum(value == role for value in counted.values())
+                if actual != wanted:
+                    problems.append(f"Task requires {'Wrapper' if role == 'W' else 'Internal/unwrapper'} chains ({role}) "
+                                    f"count {wanted}; complete actual typed report proves {actual}")
     internal = [row for row in rows if not row["Chain"].startswith("W")]
     if re.search(r"不得跨时钟域|不允许.{0,20}混合.{0,20}时钟域|不允许.{0,20}混合不同时钟", spec):
         mixed = next((row for row in internal if len(set(re.split(r",\s*", row.get("Clocks", "")))) > 1), None)

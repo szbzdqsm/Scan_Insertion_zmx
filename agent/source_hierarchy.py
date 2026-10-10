@@ -110,8 +110,14 @@ def _parts(line: str) -> list[tuple[str, bool]]:
     return parts
 
 
-def _records(path: Path, max_statement_chars: int, leaf_cells: set[str] | None = None):
-    """Yield bounded statements and scope markers with original line numbers."""
+def _records(path: Path, max_statement_chars: int, leaf_cells: set[str] | None = None, *,
+             headers_only: bool = False):
+    """Yield bounded statements and scope markers with original line numbers.
+
+    The definition pass needs only headers/scope/directive/lexical markers. A
+    complete single-line non-header statement can be skipped without recognizing
+    its cell type or parsing any connections. The full reference pass stays exact.
+    """
     state = {"block": False, "string": False}
     pending = ""
     first_line = 0
@@ -121,20 +127,30 @@ def _records(path: Path, max_statement_chars: int, leaf_cells: set[str] | None =
             stripped = line.strip()
             if not stripped:
                 continue
+            if (headers_only and not pending and stripped.endswith(';') and stripped.count(';') == 1 and
+                    not stripped.startswith(('module', 'endmodule', '`')) and
+                    ('\\' not in stripped or not re.search(r'\\\S*;', stripped))):
+                # Only a real final terminator ends this statement. Escaped
+                # identifiers containing semicolons must use the original lexer.
+                # _clean_line has already updated comment/string state.
+                continue
             if leaf_cells and not pending and stripped.endswith(';') and stripped.count(';') == 1:
                 instance = _INSTANCE.match(stripped)
                 if (instance and _name(instance[1]) in leaf_cells and len(stripped) - 1 <= max_statement_chars and
                         _SIMPLE_NAMED_CONNECTIONS.fullmatch(stripped[instance.end() - 1:-1].strip())):
-                    yield stripped[:-1], number, 'library_leaf'
+                    if not headers_only or _MODULE_START.match(stripped):
+                        yield stripped[:-1], number, 'library_leaf'
                     continue
             if stripped.startswith("`"):
                 if pending.strip():
-                    yield pending.strip(), first_line, "unterminated_statement"
+                    if not headers_only or _MODULE_START.match(pending):
+                        yield pending.strip(), first_line, "unterminated_statement"
                     pending = ""
                 yield stripped, number, "directive"
                 continue
             if stripped.startswith('endmodule') and _SCOPE_END.match(stripped) and pending.strip():
-                yield pending.strip(), first_line, "unterminated_statement"
+                if not headers_only or _MODULE_START.match(pending):
+                    yield pending.strip(), first_line, "unterminated_statement"
                 pending = ""
             for piece, terminated in _parts(line):
                 piece = piece.strip()
@@ -149,14 +165,24 @@ def _records(path: Path, max_statement_chars: int, leaf_cells: set[str] | None =
                     first_line = number
                 pending += (" " if pending else "") + piece
                 if len(pending) > max_statement_chars:
-                    yield pending[:max_statement_chars], first_line, "statement_limit"
+                    if not headers_only or _MODULE_START.match(pending[:max_statement_chars]):
+                        yield pending[:max_statement_chars], first_line, "statement_limit"
                     pending = ""
                 elif terminated:
-                    yield pending.strip(), first_line, "statement"
+                    if not headers_only or _MODULE_START.match(pending):
+                        yield pending.strip(), first_line, "statement"
                     pending = ""
     if pending.strip():
-        yield pending.strip(), first_line, "unterminated_statement"
+        if not headers_only or _MODULE_START.match(pending):
+            yield pending.strip(), first_line, "unterminated_statement"
     if state["block"] or state["string"]:
+        if headers_only:
+            # Legacy lexical diagnostics use the last non-leaf statement's
+            # first_line. Recover that exact line only on an incomplete lexical
+            # scope instead of classifying every ordinary instance in valid HDL.
+            for _, original_line, status in _records(path, max_statement_chars, leaf_cells):
+                if status == "unterminated_comment_or_string":
+                    first_line = original_line
         yield "", first_line, "unterminated_comment_or_string"
 
 
@@ -195,7 +221,7 @@ def source_hierarchy_hints(paths: list[Path], library_cells: set[str] | None = N
 
     for path in paths:
         current = ""
-        for text, number, status in _records(path, max_statement_chars, libraries):
+        for text, number, status in _records(path, max_statement_chars, libraries, headers_only=True):
             if status == "scope_end":
                 current = ""
             elif text.startswith('module') and _MODULE_START.match(text):

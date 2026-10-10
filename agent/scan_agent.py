@@ -23,6 +23,7 @@ from netlist_repair import RepairRejected, changed_paths, edits_allowed, fingerp
 from netlist_structure import shift_register_context, shift_register_groups
 from report_validation import chain_problems, chain_rows, coverage_problems, ctl_overlength_exceptions, pseudo_clock_problems, segment_problems
 from report_validation import report_rows as typed_report_rows, _full_insertion_designs
+from report_validation import chain_role_requirements, wrapper_chain_configuration_problems
 from dofile_recipe import configure_floating_inputs, configure_shift_segments, normalize_unrequested_counts, tcl_chunks
 from floating_inputs import floating_clock_outputs
 from clock_latch_context import clock_latch_context, clock_latch_hints
@@ -44,8 +45,12 @@ from audit_refresh import build_audit_refresh_request, current_evidence_catalog,
 from case_deadline import CaseDeadline, CaseDeadlineExceeded
 from original_dofile import copy_original_dofile, read_original_text
 from repair_deliverables import publish_repair_deliverables
+from dft_signal_requirements import explicit_signal_role_requirements, preflight_signal_role_problems, signal_role_report_problems
+from exclusion_requirements import debug_domain_source_context, debug_exclusion_requested, exclusion_configuration_problems, exclusion_report_problems, subtree_exclusion_requirements
 from source_hierarchy import source_hierarchy_context, source_hierarchy_hints
 from tool_process import run_tool_process
+from partial_insertion_validation import partial_flow_artifact_paths, partial_insertion_requirements, partial_insertion_validation
+from partial_issue_evidence import partial_issue_positive_evidence
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -652,7 +657,8 @@ def append_audit_reports(dofile: str, run_dir: Path, task_spec: str = "") -> str
                     r'(?:rpt_scan_drc_violation > "[^"\n]+"\n)+'
                     r"# End agent task-listed DRC reports\n", "", dofile)
     reports = [(name, "") for name in commands]
-    if "rpt_scan_element" in known and re.search(r"\bset_scan_element\b", dofile):
+    if "rpt_scan_element" in known and (re.search(r"\bset_scan_element\b", dofile) or
+            subtree_exclusion_requirements(task_spec) or debug_exclusion_requested(task_spec)):
         reports.append(("rpt_scan_element", " -type all"))
     if "rpt_wrapper_implementation" in known and re.search(r"\bset_wrapper_cfg\b", dofile):
         reports.append(("rpt_wrapper_implementation", ""))
@@ -958,6 +964,12 @@ Liberty files: {lib_names}
 # Shift-register structures requested by the task
 {shift_summary}
 
+# Exact chain classes and named DFT control roles required by the task
+{json.dumps({'chain_counts': chain_role_requirements(task_spec), 'signals': [{'port': item.port, 'roles': sorted(item.roles), 'off_state': item.off_state} for item in explicit_signal_role_requirements(task_spec)], 'subtree_exclusions': subtree_exclusion_requirements(task_spec)}, ensure_ascii=False)}
+
+# Literal debug-module clock binding excerpts; role names are candidates, not domain proof
+{debug_domain_source_context(netlists, task_spec, hierarchy)}
+
 # Literal clock-buffer and enable-latch connections (structural candidates, not proof)
 {clock_latch_context(netlists, libs, hints=clock_candidates) if re.search(r'ICG|门控|缓冲|latch|闩锁', task_spec, re.I) else 'Not requested'}
 
@@ -1044,7 +1056,7 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     "a fixed EQY proof against the original netlist returns PASS; failed or unproven candidates are not adopted. "
                     "Do not provide proof scripts or assumptions, and do not claim EQY ran before it actually runs.")
     system = f"""You are an expert operator of the ScanInsertion tool `dftexp_scan` for the contest.
-Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts, this tool's built-in help and evidence from existing Dofiles. Built-in help determines valid command options; do not use options from another EDA product. Correct every earlier ERROR before retrying. Use the actual Liberty pin names, never guess SE/SI/CLK. Choose the requested top module from root-module evidence, rather than an internal module whose name appears first. For reset signals, -off_state is the INACTIVE level: active-low reset means -off_state 1; active-high reset means -off_state 0. get_cells/get_pins return tool collections; use foreach_in_collection to iterate them. Declare wrapper control signals with set_scan_signal before referring to them in set_wrapper_cfg. Complete examine_scan_drc/examine_scan_chain before insert_dft_logic; do not call examine_scan_chain after insertion. For a clock passed through a latch, use the documented associated_internal_clocks option and exclude that latch from scan elements as required. Group repeated diagnostics by concrete root cause, rather than one issue per cell. Keep each diagnosis and summary short. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
+Follow the task specification exactly. Use only commands and options supported by the supplied manual excerpts, this tool's built-in help and evidence from existing Dofiles. Built-in help determines valid command options; do not use options from another EDA product. Correct every earlier ERROR before retrying. Use the actual Liberty pin names, never guess SE/SI/CLK. Choose the requested top module from root-module evidence, rather than an internal module whose name appears first. For reset signals, -off_state is the INACTIVE level: active-low reset means -off_state 1; active-high reset means -off_state 0. get_cells/get_pins return tool collections; use foreach_in_collection to iterate them. Declare wrapper control signals with set_scan_signal before referring to them in set_wrapper_cfg. For full scan-chain insertion, complete examine_scan_drc/examine_scan_chain before insert_dft_logic; partial connect/replace-only tasks follow their separate manual flow and do not require chain analysis. For a clock passed through a latch, use the documented associated_internal_clocks option and exclude that latch from scan elements as required. Group repeated diagnostics by concrete root cause, rather than one issue per cell. Keep each diagnosis and summary short. Never disable DRC to hide a violation. {netlist_rule} Never modify Liberty libraries, the tool, License configuration, or protected evaluation scripts.
 For a gated scan partition, its scan_enable usually needs usage all so it controls both scan FFs and that partition's clock gates; usage scan alone does not connect gating control. Use a separate clock_gating signal only when the task specifies one. Clock off_state can be 0 or 1; when a latch passes a clock through its D pin, diagnose the source off level with DRC and associated_internal_clocks before proposing a netlist edit. Declare each clock port once, including associated_internal_clocks on that same set_scan_signal command; a second declaration fails instead of updating it. Use the actual parent module and instance from source excerpts, not an assumed hierarchy. To select a hierarchical subtree, filter full_name using the actual path and optional leading hierarchy prefix. Check sizeof_collection before applying a command that requires a nonempty instance list; a missing required object must remain unresolved. Use the derived shift-register endpoint/index hints where supplied, and use brace quoting/format for array pin paths so Tcl does not interpret numeric brackets as commands.
 For scan_enable, -off_state is the INACTIVE/capture level; scan shifting uses the complementary level. Determine it from actual scan-cell and clock-gate functions/state tables and hookup polarity. A faulty original Dofile is not proof of the correct value. When DFTR9/DFTR17 remain with usage all, check whether the shift level opens the actual clock gate before changing lockups, chain lengths or latch clock associations. Never assume every library has active-high scan enable.
 Configure indexed scan data port names with set_scan_cfg -si_port_format and -so_port_format, not set_scan_signal -port containing %d. DRC rules DFTR1-6 and DFTR8-16 accept only Error/Warning. If the task allows a residual warning, leave it as Warning and retain actual evidence; do not request Ignore. When an instance path/pattern is specified, use full_name rather than ref_name (which is a cell type). Hierarchical positional query patterns may not match; use get_cells -hier -filter with full_name, e.g. {{full_name =~ */core/* && full_name !~ *keep_reg* && is_sequential == true}}, substituting actual source paths. If separate uninstantiated wrapper modules must remain available, load all netlist roots without -top, then use present_design to select the real scan top. Apply shift-register templates to ALL supplied index tuples, using concise Tcl loops rather than configuring only index zero. Global wrapper disable is set_wrapper_cfg disable, never -style none without an actual -port list. When the task does not request wrappers, remove spurious wrapper settings inherited from a faulty original script.
@@ -1066,6 +1078,30 @@ The actual read-only input directory is {input_dir}. The current run directory a
                "literal Tcl in the returned script. Do not map an implicit default to a command that was "
                "never written. Task 2 may explicitly return requirement_mapping: [] to clear optional "
                "mappings; omit the field only when an inherited mapping remains unchanged and valid.")
+    system += ("\nWrapper chain counts and internal/unwrapper chain counts are separate report requirements. "
+               "Set set_wrapper_cfg -chain_count to the requested Wrapper count. With Wrapper enabled, the installed "
+               "tool's global set_scan_cfg -chain_count is the TOTAL of internal plus Wrapper chains, so use their sum. "
+               "Then verify actual typed I and W report counts independently; a configuration table is insufficient. "
+               "A literal mapping alone does not prove its natural-language requirement. Configure the exact "
+               "task-named ICG control port with clock_gating/all usage; another port with usage all is not evidence "
+               "for that named control. Preserve any explicitly named scan FF shift/capture control independently. "
+               "If a subtree exclusion has exceptions, select sequential descendant leaves, never the parent "
+               "Hinstance that recursively disables its exceptions. Restrict exceptions to the given subtree. "
+               "For a debug/TAP-only exclusion, trace actual source clocks and keep functional-clock synchronizer FFs; "
+               "do not exclude the entire mixed-clock interface parent. Resolve remaining debug-clock FFs using "
+               "the actual source and DRC, rather than hiding clock-controlled functional FFs.")
+    system += ("\nThe earlier DRC/chain-analysis ordering applies to FULL chain insertion. For a task that only "
+               "connects ICG or replaces FFs without scan chains, follow the manual's partial-flow API instead. "
+               "insert_dft_logic -replace_unscan can revert both user-selected non-scan SFFs and SFFs that fail DRC. "
+               "Running unrequested DRC with unconfigured clocks/resets before it can revert every SFF, including "
+               "required scan FFs outside the target scope. Do not add that DRC pass to a partial task that does not "
+               "require it; if DRC is explicitly required, configure the controls correctly and preserve the target "
+               "scope. Keep actual post_replace_sff and final post_replace_unscan outputs so retained replacements "
+               "outside the non-scan scope can be checked. Never replace all SFFs just to satisfy one domain's unscan. "
+               "Honor explicit ICG exclusion scopes BEFORE connect_icg_only: use the installed "
+               "set_dft_clock_gating_cfg -exclude_elements with actual is_icg leaf collections from those scopes. "
+               "A scan_enable usage setting alone does not preserve an excluded ICG subtree's original test pins. "
+               "Keep ICG exclusions separate from the FF back-replacement scope.")
     if mode_hints:
         system += ("\nUse the supplied real top-level mode-port declarations and task-conditioned constants. "
                    "Do not invent test_mode when only scan_mode exists. A scan_enable declaration is distinct "
@@ -1202,6 +1238,9 @@ The actual read-only input directory is {input_dir}. The current run directory a
                                            bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
             problems.extend(mode_control_problems(dofile, spec, mode_hints or [], literal_tcl_words))
             problems.extend(mapping_cell_problems(dofile, library_cells or set()))
+            problems.extend(wrapper_chain_configuration_problems(dofile, spec, literal_tcl_words))
+            problems.extend(preflight_signal_role_problems(dofile, spec, literal_tcl_words))
+            problems.extend(exclusion_configuration_problems(dofile, spec, literal_tcl_words))
             if previous_actual_dofile is not None:
                 problems.extend(unchanged_control_retry_problems(
                     previous_actual_dofile, dofile, previous_unallowed_codes or set(),
@@ -1252,6 +1291,22 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
         if _is_inside(source, delivery) or _is_inside(source, reports):
             if source.suffix.lower() != ".dofile":
                 copied.append(source)
+            if _is_inside(source, reports) and source.suffix.lower() in {'.v','.vg','.ctl','.def','.scandef'}:
+                target = delivery / source.relative_to(reports)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    if target.is_symlink():
+                        raise RuntimeError('Conflicting real deliverable paths: ' + str(target))
+                    with target.open('rb') as left, source.open('rb') as right:
+                        while True:
+                            a,b = left.read(1048576),right.read(1048576)
+                            if a != b:
+                                raise RuntimeError('Conflicting real deliverable paths: ' + str(target))
+                            if not a:
+                                break
+                if not target.exists():
+                    independent_copy(source, target)
+                copied.append(target)
             continue
         rel = source.relative_to(run_dir)
         if rel.parts and rel.parts[0] in {"input", "rejected_proposals"}:
@@ -1267,7 +1322,11 @@ def collect_tool_outputs(run_dir: Path, run_id: str) -> list[Path]:
         lower_parts = [part.lower() for part in parts]
         report_at = next((i for i in range(len(lower_parts) - 1, -1, -1) if lower_parts[i] in {"report", "reports"}), None)
         output_at = next((i for i in range(len(lower_parts) - 1, -1, -1) if lower_parts[i] in {"output", "deliverable", "deliverables"}), None)
-        if report_at is not None:
+        if source.suffix.lower() in {'.v','.vg','.ctl','.def','.scandef'}:
+            boundary = max(position for position in (report_at, output_at) if position is not None) if any(
+                position is not None for position in (report_at, output_at)) else -1
+            destination_root, subparts = delivery, parts[boundary + 1:]
+        elif report_at is not None:
             destination_root, subparts = reports, parts[report_at + 1:]
         elif output_at is not None:
             destination_root, subparts = delivery, parts[output_at + 1:]
@@ -1365,6 +1424,8 @@ def check_output(run_dir: Path, task_spec: str, task: str, dofile: str, status: 
     report_files = [p for p in actual_files if p.suffix.lower() in {".rpt", ".report", ".txt"}]
     problems.extend(coverage_problems(report_files, dofile))
     problems.extend(wrapper_problems(report_files, task_spec))
+    problems.extend(signal_role_report_problems(report_files, task_spec))
+    problems.extend(exclusion_report_problems(report_files, task_spec, dofile, literal_tcl_words))
     problems.extend(clock_association_problems(report_files, dofile, clock_candidates or [], task_spec, literal_tcl_words))
     problems.extend(mode_control_report_problems(report_files, dofile, task_spec, mode_hints or [], literal_tcl_words))
     problems.extend(natural_shift_report_problems([log_path, *report_files], task_spec))
@@ -1699,7 +1760,8 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
                        verification_plans: dict[str, dict[str, Any]], output_dir: Path,
                        previous_run: str, current_run: str, change_id: str,
                        additional_change_ids: list[str] | None = None,
-                       accepted_residual: set[str] | None = None) -> None:
+                       accepted_residual: set[str] | None = None,
+                       task_spec: str | None = None) -> None:
     """Bind a proposed fix to the previous run that actually exposed the issue."""
     if not previous_run or not change_id:
         return
@@ -1763,6 +1825,16 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         located = str(item.get("located_object", ""))
         diagnostic = str(item.get("diagnosis", "")) + " " + str(item.get("root_cause", ""))
         fix_text = str(item.get("fix", ""))
+        if (task_spec is not None and re.search(r"off[-_ ]state", diagnostic, re.I) and
+                re.search(r"\bscan_enable\(spec\)", cited, re.I) and
+                not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited)):
+            # A reported value alone is not a polarity failure. A port suffix
+            # does not supply a task-required capture/inactive level.
+            declared = explicit_signal_role_requirements(task_spec)
+            if not any(requirement.off_state is not None and re.search(
+                    r"(?<![\w$])" + re.escape(requirement.port) + r"(?![\w$])", cited)
+                       for requirement in declared):
+                continue
         diagnosed_rules = rule_codes(located + " " + diagnostic + " " + fix_text + " " + str(item.get("phenomenon", "")))
         chain_evidence = bool(re.search(r"(?m)^\s*(?:[IW]\s+\S+|\d+)\s+\d+\s+", cited) or
                               re.search(r"Chain\s+Length\s+Input", cited))
@@ -2389,6 +2461,8 @@ def serialize_tool_runs(records: list[dict]) -> list[dict]:
              'returncode': r.get('returncode'), 'elapsed_seconds': r.get('elapsed_seconds'),
              'collection_seconds': r.get('collection_seconds', 0), 'artifacts': r.get('artifacts', []),
              **({'termination_reason': r['termination_reason']} if r.get('termination_reason') else {}),
+             **({'command_timing': r['command_timing']} if r.get('command_timing') else {}),
+             **({'structural_check_ref': r['structural_check_ref']} if r.get('structural_check_ref') else {}),
              **({'repair_integrity_passed': r['repair_integrity_passed']} if 'repair_integrity_passed' in r else {})}
             for r in records]
 
@@ -2426,6 +2500,7 @@ def main(started_at: float | None = None) -> int:
     final_active_netlists: dict[Path, Path] = {}
     final_source_signature: tuple | None = None
     final_artifact_fingerprints: dict = {}
+    final_structural_check: dict | None = None
     requirement_mapping: list[dict[str, Any]] = []
     final_dofile = ""
     task = "task1"
@@ -2443,6 +2518,7 @@ def main(started_at: float | None = None) -> int:
         case_deadline = CaseDeadline(start + timeout_total, clock=time.monotonic)
         case_deadline.arm()
         task, task_spec, netlists, libs, original_path = timed_call(performance_stages, "input_discovery", get_task_artifacts, input_dir)
+        partial_requirements = partial_insertion_requirements(task_spec)
         active_netlists = {path: path for path in netlists}
         active_netlist_root = input_dir / "netlist"
         # Small-case artifacts finalize in seconds; do not discard 20% of a
@@ -2468,6 +2544,8 @@ def main(started_at: float | None = None) -> int:
                                          clock_candidates=clock_candidates, mode_hints=mode_hints,
                                          structural_groups=structural_groups, include_command_help=False,
                                          library_cells=library_cells, hierarchy_hints_out=hierarchy_hints)
+        if partial_requirements["applicable"]:
+            static_context += "\n# Explicit replacement-only task requirements\n" + json.dumps(partial_requirements, ensure_ascii=False)
         known_reset_ports = set(control_hints)
         reset_inference_evidenced = False
         floating = (timed_call(performance_stages, "source_floating", floating_clock_outputs, netlists) if re.search(r"悬空|浮空|unconnected|floating", task_spec, re.I) and
@@ -2705,6 +2783,25 @@ def main(started_at: float | None = None) -> int:
             mapping_errors = requirement_mapping_problems(task, meta.get("requirement_mapping", requirement_mapping), dofile)
             problems.extend(mapping_errors)
             ok = ok and not mapping_errors
+            if partial_requirements["applicable"]:
+                final_paths, replacement_paths = partial_flow_artifact_paths(run_dir, task_spec)
+                final_structural_check = timed_call(
+                    performance_stages, "partial_structure_validation", partial_insertion_validation,
+                    netlists, final_paths, libs, task_spec,
+                    report_paths=list((run_dir / "reports").rglob("*.rpt")),
+                    replacement_paths=replacement_paths)
+                structural_dir = output_dir / "structural_checks"
+                structural_dir.mkdir(exist_ok=True)
+                (structural_dir / f"{rid}.json").write_text(
+                    json.dumps(final_structural_check, ensure_ascii=False, indent=2), encoding="utf-8")
+                record["structural_check_ref"] = f"structural_checks/{rid}.json"
+                structural_problems = list(final_structural_check["problems"])
+                structural_problems.extend("Partial-flow structural proof incomplete: " + item
+                                           for item in final_structural_check["unknown"])
+                if final_structural_check["status"] != "pass" and not structural_problems:
+                    structural_problems.append("Partial-flow structural proof did not pass")
+                problems.extend(structural_problems)
+                ok = ok and not structural_problems
             modified = changed_paths(snapshot) + changed_paths(execution_snapshot)
             if modified:
                 integrity_problems = ["EQY-proven candidate or proof artifact changed during the tool run: " + name for name in modified]
@@ -2727,9 +2824,15 @@ def main(started_at: float | None = None) -> int:
                                                     "dft_config": str(item.get("dft_config", "")),
                                                     "config_ref": {"source": "final_results/deliverables/final.dofile", "locator": ""}})
             record_issue_fixes(meta, issue_records, verification_plans, output_dir, previous_run, rid, change_id,
-                               netlist_change_ids, audit_visible_residual_codes(task, task_spec))
+                               netlist_change_ids, audit_visible_residual_codes(task, task_spec), task_spec=task_spec)
             verify_issue_fixes(issue_records, verification_plans, output_dir, rid, ok,
                                permitted_residual_drc_codes(task, task_spec))
+            if ok and partial_requirements["applicable"]:
+                for issue in issue_records:
+                    evidence = partial_issue_positive_evidence(
+                        issue, output_dir, rid, task_spec, final_structural_check, changes)
+                    if evidence:
+                        issue["attempts"][-1]["verify"].update(run_ref=rid, resolved=True, **evidence)
             validation_problems = problems + issue_audit_problems(task, issue_records, changes)
             if integrity_problems:
                 break
@@ -2772,6 +2875,11 @@ def main(started_at: float | None = None) -> int:
                                 run_records[-1]["exit_status"], expected_segments, floating, clock_candidates, mode_hints),
             dofile=final_dofile, task_spec=task_spec, status=run_records[-1]["exit_status"],
             expected=expected_checks, tool_finished=True)
+        if partial_requirements["applicable"] and (
+                final_structural_check is None or final_structural_check["status"] != "pass"):
+            tool_checks_passed = False
+            final_problems.extend(validation_problems)
+            final_problems.append("Final partial-flow structural proof did not pass")
         if integrity_problems:
             tool_checks_passed = False
             final_problems.extend(integrity_problems)
@@ -2824,6 +2932,7 @@ def main(started_at: float | None = None) -> int:
             "generation_rejections": generation_rejections,
             "audit_reviews": audit_reviews,
             "repair_delivery": repair_delivery,
+            "partial_structure_validation": final_structural_check,
             "source_analysis": {"hierarchy_complete": hierarchy_hints.get('complete', False),
                                 "hierarchy_issues": hierarchy_hints.get('issue_counts', {}),
                                 "mode_levels": "task_grounded_or_unknown",

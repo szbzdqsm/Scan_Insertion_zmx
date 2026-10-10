@@ -1,5 +1,11 @@
 # 赛题要求核对
 
+本轮最新结果：v60 Task1 case3/case5 分别31.41/377.03秒；v61 Task2 case5 647.56秒；v63 Task1 case4 33.90秒；v64 Task1 case1 36.41秒，各按对应检查通过。584项回归与Ruff通过。结果分属不同固定镜像，不能合并为新版全量成绩；当前默认开发镜像更新为v64，旧完整基线保留。
+
+## 新增要求复核（2026-10-10）
+
+平台评分说明将11/11限定为格式和运行。复核发现 I/W 实际数量、指定 ICG 控制口、排除例外、PLL 外已成功替换 SFF 保留和主时钟同步 FF 的排除边界等漏项，已增加任务文本与真实报告/结构验证。旧全批记录按原范围保存，当前开发版没有完成新版全量 Public 或 Hidden。详见 [平台结果复核](../PLATFORM_RESULT_REVIEW.md)。
+
 核对日期：2026-10-08。规范依据是用户提供的[正式 Word](赛题指南_广立微.docx)和[主办方已审核 Q&A](https://docs.qq.com/doc/DQkp3SGFOaGphZmZa)；[宣讲 PPT](EDA精英挑战赛_Scan_Insertion_赛题线上宣讲.pptx)为参考。Q&A 摘要及规则适用范围见 [CONTEST_QA.md](CONTEST_QA.md)。
 
 2026-10-09 小范围修复：新源码对 Task 2 可选映射也检查候选/实际/最终脚本位置，并正确清空显式空数组。22 项小检查、Ruff、Task 2 case3 单例及独立复核通过，新结果 6 条映射均有行号；旧 v56 未确定行不改判。官方参考 README 已规定根 `.env`/Dockerfile 与 `submission/` 的 ZIP 结构，本地空 Key 包构建与入口检查通过，见 [SUBMISSION_PACKAGING.md](../SUBMISSION_PACKAGING.md)。本次没有完整重跑修改版。
