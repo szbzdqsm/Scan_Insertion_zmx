@@ -45,6 +45,27 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("set_wrapper_cfg -max_length 100", result)
         self.assertEqual(normalize_unrequested_counts(script, "扫描链数不得超过 5"), script)
 
+    def test_maximum_only_count_removal_leaves_no_bare_configuration(self):
+        spec = "链最大长度（含内部链与 wrapper 链）不超过 100"
+        script = ("set_scan_cfg -chain_count 80\n"
+                  "set_wrapper_cfg -chain_count 2\n"
+                  "set_scan_cfg -chain_count 80 -max_length 100\n"
+                  "set_wrapper_cfg enable -chain_count 2 -max_length 100 -style shared\n"
+                  "examine_scan_drc\n")
+        result = normalize_unrequested_counts(script, spec)
+        self.assertNotIn("-chain_count", result)
+        self.assertFalse(any(line.strip() in {"set_scan_cfg", "set_wrapper_cfg"} for line in result.splitlines()))
+        self.assertIn("set_scan_cfg -max_length 100", result)
+        self.assertIn("set_wrapper_cfg enable -max_length 100 -style shared", result)
+        self.assertEqual(normalize_unrequested_counts(result, spec), result)
+
+    def test_explicit_chain_count_requirements_preserve_scan_and_wrapper_counts(self):
+        script = "set_scan_cfg -chain_count 70\nset_wrapper_cfg enable -chain_count 15\n"
+        for spec in ["wrapper chain 数目要求为 15 条，unwrapper chain 数目要求为 55 条。",
+                     "扫描链数量必须为 70", "number of chains must be 70", "chain_count 70"]:
+            with self.subTest(spec=spec):
+                self.assertEqual(normalize_unrequested_counts(script, spec), script)
+
 
 if __name__ == "__main__":
     unittest.main()

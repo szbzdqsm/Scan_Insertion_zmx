@@ -59,16 +59,19 @@ class RequirementMappingTests(unittest.TestCase):
             with self.subTest(mappings=mappings):
                 self.assertTrue(agent.requirement_mapping_problems('task2', mappings, self.script))
 
-    def test_generation_corrects_missing_command_before_tool_call(self):
+    def test_invalid_optional_mapping_is_not_adopted_without_an_extra_model_call(self):
         valid = self.script.replace('-max_length 23', '-max_length 23 -replace true')
         before = copy.deepcopy(self.mapping)
         candidate, metadata, ask = self.generate([
             {'dofile': self.script, 'requirement_mapping': self.mapping},
             {'dofile': valid, 'requirement_mapping': self.mapping}])
-        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(ask.call_count, 1)
         self.assertEqual(self.mapping, before)
-        self.assertEqual(agent.config_reference(candidate, metadata['requirement_mapping'][0]['dft_config']), 'L2')
-        self.assertIn('has no actual Tcl match', json.loads((self.run / 'llm_validation.json').read_text())['problems'][0])
+        self.assertEqual(metadata['requirement_mapping'], [])
+        self.assertEqual(candidate, self.script)
+        rejection = json.loads((self.run / 'llm_mapping_rejections.json').read_text())['rejected'][0]
+        self.assertFalse(rejection['adopted'])
+        self.assertIn('has no actual Tcl match', rejection['problems'][0])
         self.assertFalse((self.run / 'R2.log').exists())
 
     def test_task2_explicit_empty_mapping_clears_inherited_optional_mapping(self):
@@ -89,7 +92,7 @@ class RequirementMappingTests(unittest.TestCase):
         edit = {'dofile_edits': [{'old': '-max_length 23', 'new': '-max_length 29'}]}
         candidate, metadata, ask = self.generate([edit, edit | {'requirement_mapping': []}],
                                                base_dofile=self.script, previous_mapping=valid)
-        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(ask.call_count, 1)
         self.assertIn('-max_length 29', candidate)
         self.assertEqual(metadata['requirement_mapping'], [])
 

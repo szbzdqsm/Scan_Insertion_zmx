@@ -33,4 +33,6 @@
 !tool_process.py
 !partial_insertion_validation.py
 !partial_issue_evidence.py
+!command_error_evidence.py
+!library_cell_catalog.py
 !agent_runner.py

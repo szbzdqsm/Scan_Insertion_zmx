@@ -88,6 +88,26 @@ class AuditRegression(unittest.TestCase):
         self.assertEqual(verify["excerpt"], "Total violations: 0")
         self.assertEqual(agent.issue_audit_problems("task2", issues, [{"change_id": "F1"}]), [])
 
+    def test_no_further_edit_claim_cannot_register_a_new_issue(self):
+        item = dict(self.item, fix="No further edit needed; current configuration is valid.")
+        issues, _ = self.record(item)
+        self.assertEqual(issues, [])
+
+    def test_rule_targets_can_be_named_in_fix_and_need_all_actual_rows(self):
+        p = self.out / "runs/R2/reports/rpt_scan_drc_rule_handling.audit.rpt"
+        p.write_text("RuleType DefaultLevel SpecifiedLevel InstRange\n"
+                     "DFTR-TIE0 Warning Warning all\nDFTR-TIE1 Warning Warning all\n")
+        issue = {"phenomenon": "Invalid DRC ID", "found": {"excerpt": "[ERROR] Invalid DRC ID"},
+                 "diagnosis": {"located_object": "set_scan_drc_rule_handling {TIE1 TIE0} Warning",
+                               "summary": "Use proper rule identifiers", "root_cause": "Invalid list"},
+                 "attempts": [{"fix": {"action": "Split calls with DFTR-TIE0 and DFTR-TIE1 IDs"}}]}
+        script = "set_scan_drc_rule_handling DFTR-TIE0 Warning\nset_scan_drc_rule_handling DFTR-TIE1 Warning\n"
+        evidence = agent.configuration_evidence(issue, [p], self.out, script)
+        self.assertIsNotNone(evidence)
+        self.assertIn("DFTR-TIE1", evidence['excerpt'])
+        p.write_text("RuleType DefaultLevel SpecifiedLevel InstRange\nDFTR-TIE0 Warning Warning all\n")
+        self.assertIsNone(agent.configuration_evidence(issue, [p], self.out, script))
+
     def test_new_round_cannot_supply_discovery_evidence(self):
         item = dict(self.item, evidence_excerpt="an invented old diagnostic")
         (self.out / "runs/R2/R2.log").write_text(item["evidence_excerpt"] + "\n")

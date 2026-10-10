@@ -40,6 +40,8 @@ COPY exclusion_requirements.py /submission/exclusion_requirements.py
 COPY tool_process.py /submission/tool_process.py
 COPY partial_insertion_validation.py /submission/partial_insertion_validation.py
 COPY partial_issue_evidence.py /submission/partial_issue_evidence.py
+COPY command_error_evidence.py /submission/command_error_evidence.py
+COPY library_cell_catalog.py /submission/library_cell_catalog.py
 COPY agent_runner.py /submission/agent_runner.py
 COPY extract_tool_help.py /submission/extract_tool_help.py
 RUN python3 /submission/extract_tool_help.py --output /submission/tool_help.json

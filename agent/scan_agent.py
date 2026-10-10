@@ -34,7 +34,7 @@ from insertion_evidence import insertion_replacement_evidence
 from shift_report_recipe import configure as configure_natural_shift_reports, natural_shift_report_problems
 from model_script_view import model_owned_script
 from drc_retry_preflight import unchanged_control_retry_problems
-from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets
+from wrapper_validation import port_wrapper_rows, wrapper_problems, wrapper_style_evidence, wrapper_targets, wrapper_style_configuration_problems, global_wrapper_style
 from contest_rules import QA_READ_DATE, QA_URL, qa_context, qa_residual_codes
 from drc_validation import authorized_ignored_rule_codes, authorized_rule_codes, drc_summaries, excluded_scan_cells, redirected_drc_codes, residual_positive_evidence, rule_codes, summary_permitted
 from scan_exclusion_evidence import exclusion_command_evidence
@@ -51,6 +51,8 @@ from source_hierarchy import source_hierarchy_context, source_hierarchy_hints
 from tool_process import run_tool_process
 from partial_insertion_validation import partial_flow_artifact_paths, partial_insertion_requirements, partial_insertion_validation
 from partial_issue_evidence import partial_issue_positive_evidence
+from command_error_evidence import bare_configuration_evidence, grouped_signal_evidence, mismatched_signal_target
+from library_cell_catalog import LibraryCellCatalog, mapping_kind_problems
 
 
 TOOL = os.environ.get("DFTEXP_SCAN", "/opt/dftexp_scan/bin/dftexp_scan")
@@ -315,6 +317,8 @@ def unsupported_options(dofile: str, task_spec: str | None = None, *,
     syntax = json.loads(path.read_text())
     problems = []
     dynamic_commands = re.search(r"(?m)^\s*(?:proc|source|eval|interp|namespace)\b", dofile)
+    if not dynamic_commands and re.search(r"(?m)^\s*set_scan_cfg\s*$", dofile):
+        problems.append("Bare set_scan_cfg has no arguments and is invalid; remove it or provide supported options")
     if not dynamic_commands and 'mkdir' not in syntax and re.search(r"(?m)^\s*mkdir(?:\s|$)", dofile):
         problems.append("mkdir is a shell command, not a Tcl command; use file mkdir. "
                         "The runtime already creates the reports and deliverables directories.")
@@ -557,6 +561,8 @@ def liberty_summary(path: Path, *, cell_names: set[str] | None = None) -> str:
                     cell_names.add(current)
                 if re.search(r"df|sdf|latch|clk|dl", current, re.I) and len(pin_map) < 128:
                     pin_map[current] = []
+            if cell_names is not None and hasattr(cell_names, 'observe_line'):
+                cell_names.observe_line(current, line)
             pin = pin_pattern.match(line)
             if pin:
                 current_pin = pin.group(1)
@@ -598,6 +604,7 @@ def mapping_cell_problems(script: str, cell_names: set[str]) -> list[str]:
         words = literal_tcl_words(chunk.strip())
         if len(words) != 3:
             continue
+        problems.extend(mapping_kind_problems(words, cell_names))
         for word in words[1:]:
             literal = word[1:-1] if word[:1] in {'"', '{'} and word[-1:] in {'"', '}'} else word
             if re.search(r"[$\[\]\\;\s]", literal):
@@ -965,7 +972,7 @@ Liberty files: {lib_names}
 {shift_summary}
 
 # Exact chain classes and named DFT control roles required by the task
-{json.dumps({'chain_counts': chain_role_requirements(task_spec), 'signals': [{'port': item.port, 'roles': sorted(item.roles), 'off_state': item.off_state} for item in explicit_signal_role_requirements(task_spec)], 'subtree_exclusions': subtree_exclusion_requirements(task_spec)}, ensure_ascii=False)}
+{json.dumps({'chain_counts': chain_role_requirements(task_spec), 'global_wrapper_style': global_wrapper_style(task_spec), 'signals': [{'port': item.port, 'roles': sorted(item.roles), 'off_state': item.off_state} for item in explicit_signal_role_requirements(task_spec)], 'subtree_exclusions': subtree_exclusion_requirements(task_spec), 'debug_domain_exclusion': debug_exclusion_requested(task_spec)}, ensure_ascii=False)}
 
 # Literal debug-module clock binding excerpts; role names are candidates, not domain proof
 {debug_domain_source_context(netlists, task_spec, hierarchy)}
@@ -1089,7 +1096,19 @@ The actual read-only input directory is {input_dir}. The current run directory a
                "Hinstance that recursively disables its exceptions. Restrict exceptions to the given subtree. "
                "For a debug/TAP-only exclusion, trace actual source clocks and keep functional-clock synchronizer FFs; "
                "do not exclude the entire mixed-clock interface parent. Resolve remaining debug-clock FFs using "
-               "the actual source and DRC, rather than hiding clock-controlled functional FFs.")
+               "the actual source and DRC, rather than hiding clock-controlled functional FFs. "
+               "Select the smallest actual TAP state-machine subtree; inspect its sibling synchronizer module's "
+               "clock connection before using a parent wildcard. If a global Wrapper style is explicitly "
+               "required, declare that style: enable alone defaults to shared. A successful DFF replacement "
+               "count followed by missing scan pins while tracing Wrapper chains is not proof replacement "
+               "was disabled; check ordinary cells reused by shared Wrappers and the requested dedicated style. "
+               "For a task with only max_length and no chain_count requirement, let the tool choose counts; "
+               "fixed global or Wrapper counts can override the length bound.")
+    system += ("\nWrapper enable/disable is GLOBAL. Never combine enable or disable with -port: "
+               "the installed tool warns SCAN-4306 and can leave Wrapper disabled. Use a separate "
+               "set_wrapper_cfg enable with global custom-cell/threshold options, followed by "
+               "set_wrapper_cfg -style dedicated/shared/none -port {actual_port_list}. "
+               "Adding a dedicated cell type to a disabled per-port enable command cannot enable Wrappers.")
     system += ("\nThe earlier DRC/chain-analysis ordering applies to FULL chain insertion. For a task that only "
                "connects ICG or replaces FFs without scan chains, follow the manual's partial-flow API instead. "
                "insert_dft_logic -replace_unscan can revert both user-selected non-scan SFFs and SFFs that fail DRC. "
@@ -1239,12 +1258,26 @@ The actual read-only input directory is {input_dir}. The current run directory a
             problems.extend(mode_control_problems(dofile, spec, mode_hints or [], literal_tcl_words))
             problems.extend(mapping_cell_problems(dofile, library_cells or set()))
             problems.extend(wrapper_chain_configuration_problems(dofile, spec, literal_tcl_words))
+            problems.extend(wrapper_style_configuration_problems(dofile, spec, literal_tcl_words))
             problems.extend(preflight_signal_role_problems(dofile, spec, literal_tcl_words))
             problems.extend(exclusion_configuration_problems(dofile, spec, literal_tcl_words))
             if previous_actual_dofile is not None:
                 problems.extend(unchanged_control_retry_problems(
                     previous_actual_dofile, dofile, previous_unallowed_codes or set(),
                     netlist_edits=result.get("netlist_edits"), words_for=literal_tcl_words))
+            if task == "task2":
+                admitted, rejected = [], []
+                for item in result.get("requirement_mapping", []):
+                    errors = requirement_mapping_problems(task, [item], dofile)
+                    if errors:
+                        rejected.append({"mapping": item, "problems": errors, "adopted": False})
+                    else:
+                        admitted.append(item)
+                result["requirement_mapping"] = admitted
+                if rejected:
+                    (run_dir / "llm_mapping_rejections.json").write_text(json.dumps(
+                        {"reason": "Invalid optional Task 2 annotations were not adopted; executable configuration remains unchanged",
+                         "rejected": rejected}, ensure_ascii=False, indent=2))
             problems.extend(requirement_mapping_problems(task, result.get("requirement_mapping", []), dofile))
             if not problems:
                 return append_audit_reports(strip_fence(dofile), run_dir, spec), result
@@ -1886,11 +1919,15 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
             if requested_values and all(current_values[name].lower() == value.lower() for name, value in requested_values):
                 # Already effective values do not prove an absent explicit declaration is a defect.
                 continue
-        if (not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited) and
-                re.search(r"already corrected|already correct|^no (?:further )?changes? (?:needed|required)|no further change|already.*fixed|无需进一步|已经修复", fix_text, re.I)):
+        if re.search(r"already corrected|already correct|\bno fix needed\b|^no (?:further )?(?:changes?|edits?) (?:needed|required)|no further change|already.*fixed|already resolved|无需进一步|已经修复", fix_text, re.I):
             continue
         if re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited) and re.search(r"redundan|duplicate configuration|冗余", diagnostic, re.I):
             continue
+        if re.search(r"ScanConfigurationParameter|WrapperConfigurationParameter", cited):
+            if parameter_claim and not re.search(r"OffState|Usage", cited):
+                continue
+            if re.search(r"chain.{0,30}length|链.{0,15}长度", diagnostic, re.I) and not re.search(r"Chain\s+Length", cited):
+                continue
         if (re.search(r"Chain\s+Length\s+Input", cited) and
                 re.search(r"empty.{0,25}chain|no scan chains|chains were (?:not|never)|no.*stitched", diagnostic, re.I) and
                 re.search(r"(?m)^\s*[IW]\s+\S+\s+\d+\s+", cited)):
@@ -1911,6 +1948,8 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         evidence = (command_failure_evidence(cited, generic_failure.group(1), located) if generic_failure
                     else locate_evidence(files, output_dir, cited))
         if not evidence:
+            continue
+        if mismatched_signal_target(item, {"run_ref": previous_run, **evidence}, output_dir, literal_tcl_words):
             continue
         if chain_evidence and not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited):
             source = output_dir / evidence["source"]
@@ -1947,6 +1986,10 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
 def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir: Path,
                            dofile: str) -> dict[str, str] | None:
     """Bind the executed literal configuration to typed rows from the real tool."""
+    specific = (bare_configuration_evidence(issue, files, output_dir, dofile, literal_tcl_words) or
+                grouped_signal_evidence(issue, files, output_dir, dofile, literal_tcl_words))
+    if specific:
+        return specific
     if re.search(r"\[INFO\]\s+\[\s*SCAN-7600\]\s+There were 0 'D' flip-flops", issue.get("found", {}).get("excerpt", "")):
         # A declaration alone cannot prove that zero replacement was repaired.
         return None
@@ -2142,15 +2185,16 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
     if "set_scan_drc_rule_handling" in subject:
         requested = rule_codes(" ".join(str(diagnosis.get(key, "")) for key in
                                        ("located_object", "summary", "root_cause")) +
-                               " " + str(issue.get("phenomenon", ""))) or rule_codes(excerpt)
+                               " " + str(issue.get("phenomenon", ""))) or rule_codes(excerpt) or rule_codes(fix)
+        effective = {}
         for command in logical_lines:
             match = re.match(r"\s*set_scan_drc_rule_handling\s+(\{[^}]+\}|DFTR[\w-]+)\s+(Error|Warning|Info|Ignore)\b", command)
             if not match or "-inst" in command:
                 continue
-            rules = set(re.findall(r"DFTR[-\w]+", match.group(1)))
-            targeted = {rule for rule in rules if rule_codes(rule) & requested}
-            if not targeted or not requested <= rule_codes(match.group(1)):
-                continue
+            for rule in re.findall(r"DFTR[-\w]+", match.group(1)):
+                if rule_codes(rule) & requested:
+                    effective[rule] = match.group(2)
+        if requested and requested <= rule_codes(" ".join(effective)):
             for path in files:
                 if "rule_handling" not in path.name.lower() or path.suffix.lower() not in {".rpt", ".report", ".txt"}:
                     continue
@@ -2158,9 +2202,9 @@ def configuration_evidence(issue: dict[str, Any], files: list[Path], output_dir:
                 matches = []
                 for number, line in enumerate(lines, 1):
                     row = re.fullmatch(r"\s*(DFTR[-\w]+)\s+(?:Error|Warning|Info|Ignore)\s+(Error|Warning|Info|Ignore)\s+all\s*", line)
-                    if row and row.group(1) in targeted and row.group(2) == match.group(2):
+                    if row and row.group(1) in effective and row.group(2) == effective[row.group(1)]:
                         matches.append((number, row.group(1)))
-                if {rule for _, rule in matches} == targeted:
+                if {rule for _, rule in matches} == set(effective):
                     first, last = min(n for n, _ in matches), max(n for n, _ in matches)
                     return {"source": path.relative_to(output_dir).as_posix(),
                             "locator": f"L{first}" if first == last else f"L{first}-L{last}",
@@ -2538,7 +2582,7 @@ def main(started_at: float | None = None) -> int:
         structural_groups = timed_call(performance_stages, "source_structure", shift_register_groups, netlists, libraries=libs, reset_hints=reset_hints,
             instance_map=instances if re.search(r"闩锁|latch|关联关系", task_spec, re.I) else None)
         control_hints = {root: values for root, values in reset_hints.items() if values}
-        library_cells: set[str] = set()
+        library_cells: set[str] = LibraryCellCatalog()
         hierarchy_hints: dict = {}
         static_context = timed_call(performance_stages, "static_context", context_for_run, input_dir, task_spec, limits, netlists, libs, "",
                                          clock_candidates=clock_candidates, mode_hints=mode_hints,
@@ -2930,6 +2974,8 @@ def main(started_at: float | None = None) -> int:
             "file_changes": changes,
             "netlist_repair_attempts": repair_attempts,
             "generation_rejections": generation_rejections,
+            "optional_mapping_rejection_files": [str(path.relative_to(output_dir)) for path in
+                                                  sorted(runs_root.glob("R*/llm_mapping_rejections.json"))],
             "audit_reviews": audit_reviews,
             "repair_delivery": repair_delivery,
             "partial_structure_validation": final_structural_check,

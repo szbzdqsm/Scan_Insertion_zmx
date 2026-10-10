@@ -57,8 +57,10 @@ def normalize_unrequested_counts(script: str, spec: str) -> str:
         return script
     if not spec or re.search(r"chain_count|链(?:数|数量)|\d+\s*条(?:扫描)?链|number.{0,20}chains", spec, re.I):
         return script
-    return re.sub(r"(?m)^(\s*set_scan_cfg\b[^\n]*)", lambda match:
-                  re.sub(r"\s+-chain_count\s+\S+", "", match.group()), script)
+    def remove_count(match):
+        changed = re.sub(r"\s+-chain_count\s+\S+", "", match.group())
+        return "" if changed.strip() in {"set_scan_cfg", "set_wrapper_cfg"} else changed
+    return re.sub(r"(?m)^([ \t]*(?:set_scan_cfg|set_wrapper_cfg)\b[^\n]*)", remove_count, script)
 
 
 def shift_segment_recipe(groups: list[dict[str, Any]], spec: str = "") -> tuple[str, list[str]]:
