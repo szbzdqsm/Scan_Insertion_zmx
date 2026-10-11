@@ -418,6 +418,22 @@ class AuditRegression(unittest.TestCase):
                         fix='add_scan_partition arbitrary_partition -clocks {clk}\nset_scan_drc_rule_handling DFTR7 Warning')
         self.assertEqual(len(self.record(topology)[0]), 1)
 
+    def test_healthy_chain_table_cannot_discover_missing_gate_initialization(self):
+        table = ('Design: unfamiliar\nChain Length Input Output ScanEnable Clocks Partition\n'
+                 'I 1 1 ingress_1 egress_1 shift clk arbitrary_partition\n')
+        (self.out / 'runs/R1/reports/scan_chain.rpt').write_text(table)
+        item = dict(self.item, evidence_excerpt=table.rstrip(),
+                    located_object='Clock gating network with cascaded gates',
+                    phenomenon='Downstream clock gates may not initialize',
+                    root_cause='Missing clock_gating_init_cycles configuration',
+                    fix='set_scan_drc_cfg -clock_gating_init_cycles 3')
+        self.assertEqual(self.record(item)[0], [])
+
+    def test_real_drc_clock_failure_can_support_gate_initialization_diagnosis(self):
+        item = dict(self.item, root_cause='Insufficient clock_gating_init_cycles configuration',
+                    fix='set_scan_drc_cfg -clock_gating_init_cycles 3')
+        self.assertEqual(len(self.record(item)[0]), 1)
+
     def test_explicit_visible_residuals_are_not_registered_as_defects_but_ignore_is_separate(self):
         specification = '允许保留 DFTR11 和 DFTR12 违例，忽略 DFTR-TIE0。其余违例必须清零。'
         permitted = agent.audit_visible_residual_codes('task2', specification)

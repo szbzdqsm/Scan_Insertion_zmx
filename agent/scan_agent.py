@@ -1952,7 +1952,7 @@ def record_issue_fixes(meta: dict[str, Any], issues: list[dict[str, Any]],
         if chain_evidence and claim_rules and not cited_rules and not re.search(r"\[(?:ERROR|FATAL|WARNING)\]", cited):
             # A chain table supplies topology, not an observed DRC rule result.
             continue
-        parameter_claim = bool(re.search(r"off[-_ ]state|\busage\b|incomplete.{0,30}(?:declaration|command)|"
+        parameter_claim = bool(re.search(r"off[-_ ]state|\busage\b|\bclock_gating_init_cycles\b|incomplete.{0,30}(?:declaration|command)|"
                                          r"missing.{0,20}(?:parameters?|options?)|缺少.{0,20}参数", diagnostic, re.I))
         if (chain_evidence and parameter_claim and not re.search(r"\[(?:ERROR|FATAL)\]", cited) and
                 not re.search(r"OffState|Usage", cited)):
