@@ -1135,10 +1135,11 @@ The actual read-only input directory is {input_dir}. The current run directory a
                "task-listed natural report command, but the tool must actually produce and validate it.")
     if segments:
         system += ("\nThe runtime compiles ALL supplied actual shift-register candidates into set_scan_segment "
-                   "commands and preserves their actual scan-enable pin connections. You may omit your own segment "
-                   "commands and focus on clock, scan, wrapper and output settings. Keep ordinary top-level "
+                   "commands and preserves their actual scan-enable pin connections. Omit your own segment "
+                   "commands: do not expand the supplied index tuples into individual set_scan_segment statements. "
+                   "Return a compact Dofile for clock, scan, wrapper and output settings. Keep ordinary top-level "
                    "examine_scan_drc/examine_scan_chain before insertion, as the recipe is inserted before them. "
-                   "Any segment commands you do provide must be separate statements or pure segment loops.")
+                   "The runtime restores every supplied segment and its actual mapping after generation.")
     if floating:
         system += ("\nThe runtime declares the listed clock output pins of gates with disconnected inputs as pseudo primary inputs "
                    "and independent scan clocks before DRC. Omit your own pseudo-input discovery queries and clock "
