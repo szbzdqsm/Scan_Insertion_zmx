@@ -40,6 +40,10 @@ class ShiftLevelFeedbackTests(unittest.TestCase):
         original = 'set_scan_signal -type scan_enable -port enable_a -usage all -off_state 1\n'
         self.assertNotIn('shift = 1 - off_state', self.context(original, {'DFTR10'}))
 
+    def test_nested_unexecuted_declarations_are_not_reported(self):
+        original = 'if {0} {\nset_scan_signal -type scan_enable -port unused -usage all -off_state 1\n}\n'
+        self.assertNotIn('shift = 1 - off_state', self.context(original, {'DFTR9'}))
+
 
 if __name__ == '__main__':
     unittest.main()

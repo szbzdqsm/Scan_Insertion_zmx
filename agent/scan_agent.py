@@ -1104,8 +1104,12 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     "and audit reports are restored automatically; removing their former text cannot repair these rules.")
     if previous_actual_dofile and (previous_unallowed_codes or set()) & {'DFTR9', 'DFTR17'}:
         shift_declarations = []
-        for line in previous_actual_dofile.replace('\\\n', ' ').splitlines():
-            words = literal_tcl_words(line.strip())
+        try:
+            declarations = tcl_chunks(previous_actual_dofile.replace('\\\n', ' '))
+        except ValueError:
+            declarations = []
+        for declaration in declarations:
+            words = literal_tcl_words(declaration.strip())
             if not words or words[0] != 'set_scan_signal' or len(words) % 2 != 1:
                 continue
             options = dict(zip(words[1::2], words[2::2]))
