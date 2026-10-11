@@ -201,6 +201,13 @@ class ReportValidation(unittest.TestCase):
                                        ["I 1", "99", "scan_si_1", "scan_so_1", "se", "clk", "P"]])])
         self.assertEqual(chain_problems(rows, "扫描端口命名为 `scan_si_%d` / `scan_so_%d`"), [])
 
+    def test_explicit_wrapper_prohibition_does_not_exempt_wrapper_ports(self):
+        rows = chain_rows([self.report([["W wrp_1", "20", "wrp_si1", "wrp_so1", "wrp_se", "clk", "P"],
+                                       ["I 1", "99", "scan_si_1", "scan_so_1", "se", "clk", "P"]])])
+        spec = "禁止启用 Wrapper；扫描端口命名为 `scan_si_%d` / `scan_so_%d`"
+        self.assertTrue(any('explicitly forbids' in problem for problem in chain_problems(rows, spec)))
+        self.assertTrue(any('wrp_si1' in problem for problem in chain_problems(rows, spec)))
+
     def test_actual_ports_must_match_requested_format(self):
         rows = chain_rows([self.report([["I 1", "10", "test_si1", "scan_so_1", "se", "clk", "P"]])])
         spec = "扫描输入/输出端口命名格式：`scan_si_%d` / `scan_so_%d`"

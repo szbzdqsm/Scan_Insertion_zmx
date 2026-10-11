@@ -388,7 +388,12 @@ def chain_problems(rows: list[dict[str, Any]], spec: str) -> list[str]:
     formats = scan_formats(spec)
     if formats:
         # Unrequested Wrapper rows must not bypass the task's scan-data port contract.
-        wrapper_requested = 'W' in required or bool(re.search(r'wrapper', spec, re.I))
+        wrapper_prohibited = bool(re.search(
+            r'(?:^|[；;。])\s*(?:[-*]\s*)?(?:禁止(?:使用|启用)?|不允许(?:使用|启用)?|'
+            r'do not (?:use|enable))\s*wrappers?\s*(?:[；;。.]|$)', spec, re.I | re.M))
+        wrapper_requested = not wrapper_prohibited and ('W' in required or bool(re.search(r'wrapper', spec, re.I)))
+        if wrapper_prohibited and any(row['Chain'].startswith('W') for row in rows):
+            problems.append('Task explicitly forbids Wrapper chains, but actual typed W rows are present')
         format_rows = internal if wrapper_requested else rows
         if not format_rows:
             problems.append("No typed scan-chain rows prove the requested data port naming")
