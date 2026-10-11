@@ -341,7 +341,7 @@ def collection_handle_list_problems(dofile: str) -> list[str]:
                   words[2][1:] in collections and words[3].startswith('{') and words[3].endswith('}')):
                 inspect(words[3][1:-1], handles | {words[1]})
             elif words[0] == 'if':
-                if len(words) == 3 and words[1].strip('{}').strip() in {'0', 'false'}:
+                if len(words) >= 3 and words[1].strip('{}').strip() in {'0', 'false'}:
                     continue
                 for body in words[2:]:
                     if body.startswith('{') and body.endswith('}'):

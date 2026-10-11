@@ -62,6 +62,10 @@ if {[llength $excluded] > 0} {
     def test_unexecuted_constant_false_body_is_not_rejected(self):
         self.assertEqual(agent.collection_handle_list_problems('if {0} {\n' + self.bad + '}\n'), [])
 
+    def test_constant_false_with_else_is_not_assumed_to_execute_bad_branch(self):
+        script = self.query + 'if {0} {\n' + self.bad + '} else {\nset_scan_element false $selected\n}\n'
+        self.assertEqual(agent.collection_handle_list_problems(script), [])
+
     def test_unknown_collection_source_is_not_guessed(self):
         script = self.bad.replace(self.query, 'set selected [custom_collection_source]\n')
         self.assertEqual(agent.collection_handle_list_problems(script), [])
