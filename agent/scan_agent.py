@@ -988,6 +988,18 @@ def requirement_mapping_problems(task: str, mappings: Any, dofile: str) -> list[
     return problems
 
 
+def retain_unchanged_task1_mappings(previous: list[dict], updates: list, dofile: str) -> list:
+    """Merge repair updates with prior literal mappings still present in the actual candidate."""
+    if not updates:
+        return updates  # An empty Task 1 mapping remains subject to the existing mandatory check.
+    updated_requirements = {item.get('requirement') for item in updates
+                            if isinstance(item, dict) and isinstance(item.get('requirement'), str)}
+    retained = [dict(item) for item in previous if isinstance(item, dict) and
+                item.get('requirement') not in updated_requirements and
+                not requirement_mapping_problems('task1', [item], dofile)]
+    return retained + updates
+
+
 def context_for_run(input_dir: Path, task_spec: str, limits: str, netlists: list[Path], libs: list[Path], dofile: str, log: str = "", reports: str = "",
                     clock_candidates: list[dict] | None = None, mode_hints: list[dict] | None = None,
                     structural_groups: list[dict] | None = None, include_command_help: bool = True,
@@ -1329,6 +1341,16 @@ The actual read-only input directory is {input_dir}. The current run directory a
                 result["requirement_mapping"] = mappings
                 (run_dir / "llm_clock_association_recipe.json").write_text(json.dumps({"input_candidates": clock_candidates,
                     "actual_commands": clock_references}, ensure_ascii=False, indent=2))
+            if task == 'task1' and previous_mapping:
+                updates = result.get('requirement_mapping', [])
+                merged = retain_unchanged_task1_mappings(previous_mapping, updates, dofile)
+                if len(merged) > len(updates):
+                    (run_dir / 'llm_mapping_inheritance.json').write_text(json.dumps({
+                        'reason': 'Preserve prior Task 1 mappings with unchanged literal Tcl; updated labels override prior entries',
+                        'retained': merged[:len(merged) - len(updates)],
+                        'updated_requirements': [item.get('requirement') for item in updates if isinstance(item, dict)]
+                    }, ensure_ascii=False, indent=2))
+                result['requirement_mapping'] = merged
             problems = unsupported_options(dofile, spec, known_reset_ports=set(control_hints or {}) | (known_reset_ports or set()),
                                            permit_reset_inference=reset_inference_evidenced or
                                            bool((previous_unallowed_codes or set()) & {"DFTR2", "DFTR3"}))
