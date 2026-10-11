@@ -1102,6 +1102,27 @@ def call_for_dofile(client: OpenAI, task: str, context: str, original: str | Non
                     ", ".join(sorted(previous_unallowed_codes)) +
                     "\nThe displayed current Dofile contains the editable model code. Runtime-owned recipes "
                     "and audit reports are restored automatically; removing their former text cannot repair these rules.")
+    if previous_actual_dofile and (previous_unallowed_codes or set()) & {'DFTR9', 'DFTR17'}:
+        shift_declarations = []
+        for line in previous_actual_dofile.replace('\\\n', ' ').splitlines():
+            words = literal_tcl_words(line.strip())
+            if not words or words[0] != 'set_scan_signal' or len(words) % 2 != 1:
+                continue
+            options = dict(zip(words[1::2], words[2::2]))
+            port, off = options.get('-port', ''), options.get('-off_state')
+            if (options.get('-type') == 'scan_enable' and options.get('-usage') == 'all' and
+                    off in {'0', '1'} and re.fullmatch(r'[A-Za-z_]\w*', port)):
+                shift_declarations.append({'port': port, 'capture_off_state': int(off),
+                                           'shift_level': 1 - int(off)})
+        if shift_declarations:
+            context += ("\n# Literal declarations in the preceding executed Dofile: shift = 1 - off_state\n" +
+                        json.dumps(shift_declarations[:24]) +
+                        "\nThe actual preceding DRC still has gated-clock failures. Check these computed shift "
+                        "levels against the supplied actual Liberty clock_gate_test_pin/statetable and source "
+                        "hookup, then choose the inactive/capture level as the complement of the required shift "
+                        "level. The old Dofile value is not proof of polarity. A clock -internal_clock setting "
+                        "does not change the declared scan-enable shift level. Neither high nor low polarity "
+                        "is assumed here; validate the actual effective signals and gate connections.")
     spec = read_text(input_dir / "task_spec.md", 60000)
     netlist_rule = (("Task 1 strictly forbids modifying Pre-scan input netlists. Return no netlist_edits."
                      if task == "task1" else "This case strictly forbids modifying Pre-scan input netlists. Return no netlist_edits.")
