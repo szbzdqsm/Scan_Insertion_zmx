@@ -387,14 +387,20 @@ def chain_problems(rows: list[dict[str, Any]], spec: str) -> list[str]:
             problems.append(f"Chain {mixed['Chain']} mixes clock domains {mixed['Clocks']} contrary to the task")
     formats = scan_formats(spec)
     if formats:
-        if not internal:
+        # Unrequested Wrapper rows must not bypass the task's scan-data port contract.
+        wrapper_requested = 'W' in required or bool(re.search(r'wrapper', spec, re.I))
+        format_rows = internal if wrapper_requested else rows
+        if not format_rows:
             problems.append("No typed scan-chain rows prove the requested data port naming")
         else:
             for column, pattern in zip(("Input", "Output"), formats):
                 regex = re.escape(pattern).replace("%d", r"\d+")
-                mismatch = next((row for row in internal if not re.fullmatch(regex, row[column])), None)
+                mismatch = next((row for row in format_rows if not re.fullmatch(regex, row[column])), None)
                 if mismatch:
                     problems.append(f"Actual scan {column.lower()} port {mismatch[column]} does not match requested format {pattern}")
+                    if not wrapper_requested and mismatch['Chain'].startswith('W'):
+                        problems.append("The task does not request Wrapper chains. Remove inherited unrequested "
+                                        "Wrapper settings; every actual scan-data port must meet the task format.")
     by_partition = defaultdict(list)
     for row in internal:
         by_partition[row["Partition"]].append(row)

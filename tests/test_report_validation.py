@@ -187,6 +187,18 @@ class ReportValidation(unittest.TestCase):
         rows = chain_rows([self.report([["W wrp_1", "301", "wrp_si1", "wrp_so1", "wrp_se", "clk", "P"],
                                        ["I 1", "99", "scan_si_1", "scan_so_1", "se", "clk", "P"]])])
         self.assertEqual(len(rows), 2)
+        self.assertEqual(chain_problems(rows, "启用 Wrapper；扫描端口命名为 `scan_si_%d` / `scan_so_%d`"), [])
+
+    def test_unrequested_wrapper_ports_cannot_bypass_data_format_check(self):
+        rows = chain_rows([self.report([["W wrp_1", "20", "wrp_si1", "wrp_so1", "wrp_se", "clk", "P"],
+                                       ["I 1", "99", "scan_si_1", "scan_so_1", "se", "clk", "P"]])])
+        problems = chain_problems(rows, "扫描端口命名为 `scan_si_%d` / `scan_so_%d`")
+        self.assertTrue(any('wrp_si1' in problem for problem in problems))
+        self.assertTrue(any('does not request Wrapper' in problem for problem in problems))
+
+    def test_all_actual_ports_are_accepted_when_they_match(self):
+        rows = chain_rows([self.report([["W wrp_1", "20", "scan_si_2", "scan_so_2", "wrp_se", "clk", "P"],
+                                       ["I 1", "99", "scan_si_1", "scan_so_1", "se", "clk", "P"]])])
         self.assertEqual(chain_problems(rows, "扫描端口命名为 `scan_si_%d` / `scan_so_%d`"), [])
 
     def test_actual_ports_must_match_requested_format(self):
