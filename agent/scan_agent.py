@@ -307,6 +307,57 @@ def audit_visible_residual_codes(task: str, spec: str) -> set[str]:
     return qa_residual_codes(task, spec) | (allowed_drc_codes(spec) - authorized_ignored_rule_codes(spec))
 
 
+def collection_handle_list_problems(dofile: str) -> list[str]:
+    """Reject the observed Tcl-list-of-tool-handles argument, without rewriting Tcl."""
+    problems: list[str] = []
+    lists: set[str] = set()
+    collections: set[str] = set()
+
+    def inspect(script: str, handles: set[str]) -> set[str]:
+        handles = set(handles)
+        for chunk in tcl_chunks(script):
+            words = literal_tcl_words(chunk.strip())
+            if not words or words[0].startswith('#'):
+                continue
+            if words[0] == 'set' and len(words) == 3:
+                lists.discard(words[1])
+                handles.discard(words[1])
+                collections.discard(words[1])
+                if re.match(r'^\[(?:get_cells|get_obj_insts)\s', words[2]):
+                    collections.add(words[1])
+            elif (words[0] == 'lappend' and len(words) == 3 and
+                  words[2].startswith('$') and words[2][1:] in handles):
+                lists.add(words[1])
+            elif (words[0] == 'set_scan_element' and len(words) == 3 and
+                  words[2].startswith('$') and words[2][1:] in lists):
+                problems.append(
+                    f"set_scan_element argument {words[2]} is a Tcl list of tool collection handles, "
+                    "not an instance collection; this produces COM-2003 Nothing matched for _dbColl. "
+                    "Use one get_cells/get_obj_insts -filter query with inclusion and exception "
+                    "predicates and pass its returned collection directly. Update the corresponding "
+                    "requirement_mapping to match the corrected actual Tcl.")
+            elif (words[0] in {'cluster_foreach', 'foreach_in_collection'} and len(words) == 4 and
+                  re.fullmatch(r'\w+', words[1]) and words[2].startswith('$') and
+                  words[2][1:] in collections and words[3].startswith('{') and words[3].endswith('}')):
+                inspect(words[3][1:-1], handles | {words[1]})
+            elif words[0] == 'if':
+                if len(words) == 3 and words[1].strip('{}').strip() in {'0', 'false'}:
+                    continue
+                for body in words[2:]:
+                    if body.startswith('{') and body.endswith('}'):
+                        # A conditional rebind makes the later value unknown; do not assume a handle.
+                        handles.intersection_update(inspect(body[1:-1], handles))
+        return handles
+
+    if not re.search(r'(?m)^\s*(?:proc|source|eval|interp|namespace)\b', dofile):
+        try:
+            inspect(dofile, set())
+        except ValueError:
+            # Existing Tcl syntax validation remains responsible for incomplete scripts.
+            pass
+    return list(dict.fromkeys(problems))
+
+
 def unsupported_options(dofile: str, task_spec: str | None = None, *,
                         known_reset_ports: set[str] | None = None,
                         permit_reset_inference: bool = False) -> list[str]:
@@ -315,7 +366,7 @@ def unsupported_options(dofile: str, task_spec: str | None = None, *,
     if not path.is_file():
         return []
     syntax = json.loads(path.read_text())
-    problems = []
+    problems = collection_handle_list_problems(dofile)
     dynamic_commands = re.search(r"(?m)^\s*(?:proc|source|eval|interp|namespace)\b", dofile)
     if not dynamic_commands and re.search(r"(?m)^\s*set_scan_cfg\s*$", dofile):
         problems.append("Bare set_scan_cfg has no arguments and is invalid; remove it or provide supported options")
