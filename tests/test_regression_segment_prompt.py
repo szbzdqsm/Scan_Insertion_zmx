@@ -27,6 +27,8 @@ class SegmentPromptRegression(unittest.TestCase):
             prompt = ask.call_args.args[1]
             self.assertIn('Omit your own segment', prompt)
             self.assertIn('do not expand the supplied index tuples', prompt)
+            self.assertIn('For a gated scan partition, configure its scan_enable with usage all', prompt)
+            self.assertNotIn('its scan_enable usually needs usage all', prompt)
             self.assertIn('{{0} {1} {2}}', actual)
             self.assertIn('-respect_sff_se_connection true', actual)
             self.assertIn('set_scan_segment agent_shift', actual)
