@@ -1,0 +1,11 @@
+{
+  "UTC": "2026-11-04T15:35:40.807509+00:00",
+  "exit": 0,
+  "result": {
+    "source": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+    "verified_files": 86,
+    "permissions_match": true,
+    "root": "/tmp/b9-marker-source-restore-final-3",
+    "restored": true
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "status": "built",
+  "pid": 447083,
+  "tag": "eda2602a4:b9-marker-20261104-ed2a25ff",
+  "base_id": "sha256:9db0736a60bba851a848e20792202fe21ece0ba87a56944abf0003dafc5301d9",
+  "previous_runtime_id": "sha256:82abc4fd20a8a266e0b920d0371ea22f9603cba26cd8e6a629b4d9eea0b65927",
+  "source": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+  "started_utc": "2026-11-04T15:22:42.337482+00:00",
+  "started_monotonic": 129721.043387576,
+  "context_sha256": {
+    ".dockerignore": "4f657f7139a38e62c380a197614a7986c3ac8a99ffba2705792be8640aae37c9",
+    "Dockerfile": "8e5982f8a7484939630e00eb0980e7e487ef44f41dc68eba373e19d54cbdd6ab",
+    "apply_delta.py": "7e49c25b87f08086970b67c9a8e894d882f1694074523f79cad4125b85f87c5b",
+    "delta.tar": "3d253b1f359fe7e92de9d783a77a65a5f66324ec996af4aaee615d19a11ebadb",
+    "metadata.json": "6727d4a8ff6d4562b4cedcb03dc590ec3e6c8162ec7feb16fde52665b60d4bb8"
+  },
+  "build_network": "none",
+  "platform": "linux/amd64",
+  "returncode": 0,
+  "ended_utc": "2026-11-04T15:22:51.683675+00:00",
+  "elapsed_monotonic_seconds": 9.037914171989542
+}

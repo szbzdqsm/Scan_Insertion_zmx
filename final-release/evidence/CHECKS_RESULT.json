@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "steps": [
+    {
+      "phase": "filesystem",
+      "exit": 0,
+      "host_seconds": 32.59048726099718
+    },
+    {
+      "phase": "runtime",
+      "exit": 0,
+      "host_seconds": 2.0699210220045643
+    },
+    {
+      "phase": "entry",
+      "exit": 0,
+      "host_seconds": 22.7259377429873
+    }
+  ],
+  "image": "sha256:589d4dd9928b47e54d2980fc92344a3b9071c9e784077d54c753cad6a8b4f6ef",
+  "running": false
+}

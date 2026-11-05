@@ -1,0 +1,12 @@
+{
+  "returncode": 0,
+  "started_utc": "2026-11-04T15:23:43.715922+00:00",
+  "elapsed_seconds": 2.0007595589995617,
+  "image_id": "sha256:589d4dd9928b47e54d2980fc92344a3b9071c9e784077d54c753cad6a8b4f6ef",
+  "passed": true,
+  "dependency_and_environment_differences": {},
+  "source_runtime_files": 82,
+  "actual_imports": 11,
+  "help_sha256": "3645cac1c61eae6524949836e02041693f78087f08c0cb82110e97cc3f1194cd",
+  "help_entries": 66
+}
