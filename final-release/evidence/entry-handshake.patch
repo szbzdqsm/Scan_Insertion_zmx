@@ -1,0 +1,177 @@
+--- a/agent_runner.py
++++ b/agent_runner.py
+@@ -1,9 +1,9 @@
+-"""Independent preloaded-input compatibility entry (not platform t1)."""
++"""Formal input-marker entry; local readiness observation is not platform t1."""
+ import time
+ 
+ ENTRY_MONOTONIC = time.monotonic()
+ ENTRY_UTC = time.time()
+-print('[startup] version=1026-preloaded-v1 mode=preloaded input_assumption=complete-before-entry clock=local-entry-monotonic', flush=True)
++print('[startup] version=1104-marker-v1 mode=marker input_marker=case_upload_marker clock=local-marker-observation', flush=True)
+ 
+ if __name__ == '__main__':
+     from preloaded_startup import run
+--- a/platform_protocol.py
++++ b/platform_protocol.py
+@@ -12,7 +12,7 @@
+ 
+ INPUT_MARKER = 'case_upload_marker'
+ OUTPUT_MARKER = '.case_complete_marker'
+-_preloaded_ready = None
++_validated_marker_ready = None
+ 
+ 
+ class OutputDirectoryError(ValueError):
+@@ -59,14 +59,18 @@
+         raise OutputDirectoryError('Cannot initialize output directory ' + str(output) + ': ' + exc.strerror) from None
+ 
+ 
+-def activate_preloaded(ready):
+-    """Only the image's compatibility entry calls this, after input validation."""
+-    global _preloaded_ready
+-    if _preloaded_ready is not None:
+-        raise RuntimeError('Preloaded entry may only be activated once')
+-    if ready.get('event') != 'preloaded_input_validated' or not ready.get('input_check_passed'):
+-        raise ValueError('Preloaded input requires a completed entry check')
+-    _preloaded_ready = dict(ready)
++def activate_marker_ready(ready):
++    """Carry the real marker observation across entry validation and business."""
++    global _validated_marker_ready
++    if _validated_marker_ready is not None:
++        raise RuntimeError('Marker entry may only be activated once')
++    if (ready.get('event') != 'marker_input_validated'
++            or not ready.get('input_check_passed')
++            or not ready.get('input_ready_observed')
++            or ready.get('startup_mode') != 'marker'
++            or ready.get('marker') != str(Path(ready['input_root']) / INPUT_MARKER)):
++        raise ValueError('Marker readiness requires observation and a completed entry check')
++    _validated_marker_ready = dict(ready)
+ 
+ 
+ def publish_completion(output: Path, rc: int, ready):
+@@ -91,10 +95,10 @@
+ 
+ 
+ def wait_input(root: Path):
+-    if _preloaded_ready is not None:
+-        if str(root.resolve()) != _preloaded_ready['input_root']:
+-            raise ValueError('Preloaded input root differs from the validated root')
+-        return dict(_preloaded_ready)
++    if _validated_marker_ready is not None:
++        if str(root.resolve()) != _validated_marker_ready['input_root']:
++            raise ValueError('Input root differs from the marker-validated root')
++        return dict(_validated_marker_ready)
+     # Stat only the marker, never list/read partial uploads. No pre-upload case
+     # deadline: t1 belongs to the evaluator that atomically publishes the marker.
+     marker = root / INPUT_MARKER
+@@ -116,13 +120,13 @@
+         root, output = Path(args.input).absolute(), Path(args.output).absolute()
+         ready = wait_input(root)
+         start = ready['monotonic_seconds'] if started_at is None else started_at
+-        if ready.get('startup_mode') == 'preloaded':
++        if ready.get('startup_mode') == 'marker':
+             prepare_case_output(output)
+         else:
+             if output.exists() and any(output.iterdir()):
+                 raise ValueError('A new case requires an empty output directory')
+             output.mkdir(parents=True, exist_ok=True)
+-        if ready.get('startup_mode') == 'preloaded':
++        if ready.get('startup_mode') == 'marker':
+             with (output / 'startup_protocol.json').open('x') as stream:
+                 json.dump(ready, stream, indent=2)
+         # Native tool and library temporary files must also stay on output.
+--- a/preloaded_startup.py
++++ b/preloaded_startup.py
+@@ -1,6 +1,7 @@
+-"""User-authorized direct-start experiment; input readiness is an assumption.
++"""Formal marker-gated startup, retaining the historical module path.
+ 
+-No marker is created, inferred or waited for. Business logic is unchanged.
++Input contents are checked only after case_upload_marker is observed. Waiting
++does not consume the case budget; the business receives that observation time.
+ """
+ from __future__ import annotations
+ 
+@@ -15,11 +16,11 @@
+ 
+ import model_config
+ from case_deadline import CaseDeadline, CaseDeadlineExceeded
+-from platform_protocol import (arguments, activate_preloaded, publish_completion,
++from platform_protocol import (arguments, wait_input, activate_marker_ready, publish_completion,
+                                prepare_case_output, OutputDirectoryError)
+ from runtime_limits import effective_case_seconds
+ 
+-VERSION = '1026-preloaded-v1'
++VERSION = '1104-marker-v1'
+ 
+ 
+ class StartupError(ValueError):
+@@ -27,7 +28,7 @@
+ 
+ 
+ def log(stage, **facts):
+-    print('[startup] ' + json.dumps({'version': VERSION, 'mode': 'preloaded',
++    print('[startup] ' + json.dumps({'version': VERSION, 'mode': 'marker',
+                                    'stage': stage, **facts}, ensure_ascii=False), flush=True)
+ 
+ 
+@@ -88,7 +89,7 @@
+     try:
+         prepare_case_output(output)
+         with (output / 'startup_failure.json').open('x') as stream:
+-            json.dump({'version': VERSION, 'mode': 'preloaded', 'error': error,
++            json.dump({'version': VERSION, 'mode': 'marker', 'error': error,
+                        'entry_clock': clock, 'business_entered': False}, stream, indent=2)
+             stream.flush()
+             os.fsync(stream.fileno())
+@@ -98,10 +99,10 @@
+ 
+ 
+ def run(started, utc_started):
+-    clock = {'monotonic_seconds': started, 'utc_seconds': utc_started,
+-             'event': 'local_entry_started', 'startup_mode': 'preloaded',
+-             'clock_basis': 'first Python entry statement; not platform t1',
+-             'input_ready_assumption': 'complete before container entry; not platform-confirmed'}
++    clock = {'entry_monotonic_seconds': started, 'entry_utc_seconds': utc_started,
++             'event': 'local_entry_started', 'startup_mode': 'marker',
++             'clock_basis': 'local observation of case_upload_marker; not platform t1',
++             'input_ready_observed': False}
+     output = None
+     guard = None
+     business_entered = False
+@@ -120,6 +121,13 @@
+             raise
+         clock['output_initialization'] = output_facts
+         log('output_validated', **output_facts)
++        log('waiting_for_input_marker', marker=str(root / 'case_upload_marker'),
++            business_budget_started=False)
++        ready = wait_input(root)
++        clock.update(ready, input_ready_observed=True,
++                     input_wait_seconds=ready['monotonic_seconds'] - started)
++        started = ready['monotonic_seconds']
++        log('input_marker_observed', **clock)
+         log('checking_input', input_root=str(root), output_root=str(output))
+         case = input_check(root)
+         with (case / 'limitations.md').open() as stream:
+@@ -131,7 +139,7 @@
+             if not math.isfinite(remaining) or remaining <= 0:
+                 raise StartupError('Invalid controller remaining duration')
+             limit = min(limit, remaining)
+-        # Absolute start is never replaced by validation/import/round start.
++        # One observed-ready start covers validation, imports, work and closing.
+         guard = CaseDeadline(started + limit)
+         guard.arm()
+         clock.update(deadline_monotonic=started + limit, limit_seconds=limit)
+@@ -145,9 +153,9 @@
+         if not os.environ.get('SCANINSERTION_LICENSE_SERVER', '').strip():
+             raise StartupError('SCANINSERTION_LICENSE_SERVER must be injected at runtime')
+         log('configuration_validated', model=selected_model)
+-        clock.update(event='preloaded_input_validated', input_check_passed=True,
++        clock.update(event='marker_input_validated', input_check_passed=True,
+                      input_root=str(root), input_check=facts)
+-        activate_preloaded(clock)
++        activate_marker_ready(clock)
+         log('importing_business')
+         from scan_agent import main
+         log('entering_business', remaining_seconds=max(0, started + limit - time.monotonic()))

@@ -1,0 +1,38 @@
+{
+  "source": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+  "image_id": "sha256:589d4dd9928b47e54d2980fc92344a3b9071c9e784077d54c753cad6a8b4f6ef",
+  "tag": "eda2602a4:b9-marker-20261104-ed2a25ff",
+  "official_base_id": "sha256:9db0736a60bba851a848e20792202fe21ece0ba87a56944abf0003dafc5301d9",
+  "base_layers": 9,
+  "layers": 10,
+  "rootfs_diff_ids": [
+    "sha256:42724e448bf499ec7d4b3c21d6cc68fe665ef677ed393c3dbb5357394e89ff91",
+    "sha256:4c83be9f22dabdcd350ee19315215dae76f9d580bab6dc722e7e7c01f4231974",
+    "sha256:bfbeb044ecf6ddec604888796d5180e9d68ece58d790798baa3bc9bd368baeb7",
+    "sha256:516c5dec8ec975387d5d4efa183c1b59af40d15f4a8a171334d6e8f7668951db",
+    "sha256:ccec044c4cd8ace39ea477355956e5b80d75a6a27f851969ac3cc275ce784b93",
+    "sha256:f0f688b7e4f54dcebf8523f643417ba7e436735c72f1ab241d290df7025d8012",
+    "sha256:11118b95056b698a268eed03c677d7ff3ec5903fb92f377844061047df4a4b86",
+    "sha256:fa53142129d15a0164bd53c01a0426c84a52ced0eb057bebdc95627734e0c9bd",
+    "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+    "sha256:da678c30cd94984df362a4b152d0637206da4d7090eb32e6017d7f8ed6a21761"
+  ],
+  "base_layer_prefix_exact": true,
+  "platform": "linux/amd64",
+  "config_equal_to_previous_runtime": true,
+  "user": "root",
+  "entrypoint": [
+    "/submission/agent_system"
+  ],
+  "cmd": null,
+  "working_directory": "/work",
+  "env_keys": [
+    "PATH",
+    "DEBIAN_FRONTEND",
+    "SCANINSERTION_HOME",
+    "SCANINSERTION_MANUAL"
+  ],
+  "size_bytes": 1750571576,
+  "build_elapsed_seconds": 9.037914171989542,
+  "submission_allowed": false
+}

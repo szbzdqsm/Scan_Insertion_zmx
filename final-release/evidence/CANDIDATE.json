@@ -1,0 +1,460 @@
+{
+  "source_sha256": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+  "sha256": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+  "parent_source_sha256": "b9b476a9d6efca44cec9258f1b115160e00ac6f0b77421ab042d4202ff5c89ae",
+  "created_UTC": "2026-11-04T15:14:55.272673+00:00",
+  "files": [
+    [
+      ".dockerignore",
+      "35707d609351dd5eb314b781e74fb4227dc44586852342dba0393a9155602978"
+    ],
+    [
+      "Dockerfile",
+      "3d4f17c499ac75ec3cf9987345fde4e1a6473ae476786ca2e4bb2bab3816df37"
+    ],
+    [
+      "agent_runner.py",
+      "c9c450d90c9688e61aa9803bb0c29deb10340888c632f1e88bc331c8c626cec7"
+    ],
+    [
+      "agent_system",
+      "7037dd1f6dd4215764cc814f39612beee251a5498cd3374103f88f4a367520ea"
+    ],
+    [
+      "artifact_operations.py",
+      "a771a08c82452e0af68feae43d760cd3f279bbb4e6b2b2e54b2afc83dab66919"
+    ],
+    [
+      "audit_no_progress.py",
+      "5f4d6a0011b8fb7ee2db07edceb973fb555ab8d5ab026f8cea80b57ffca5ac0c"
+    ],
+    [
+      "audit_refresh.py",
+      "ddfea031d55fe2957e30632dd74814d9c5287de53da26924f8c3dd2443865676"
+    ],
+    [
+      "canonical_delivery.py",
+      "052fd5def413ab13dfdcba2366df8ad8c57586323f7f9bea3652103de8ed0075"
+    ],
+    [
+      "case_deadline.py",
+      "5642c811294990d40e3092444dcf73335c9390b0c96fe143d631ed4070b24109"
+    ],
+    [
+      "clock_association_recipe.py",
+      "3db25862e3fc3b39fe850c4c8ddb3539401fd86ffeda652d817f6826a935cfb8"
+    ],
+    [
+      "clock_latch_context.py",
+      "c9adf5362186f15eb27a5ee3b4906bd10cf0db8df19cbbbd910325bab1eba45d"
+    ],
+    [
+      "command_delivery.py",
+      "dfbe8942391047d7e957030f6dabee63411f8fe799ad71a66af122839be7cd4a"
+    ],
+    [
+      "command_error_evidence.py",
+      "89a070c38765b5b3e64d46839c358c0b2b3d324e0d87fba2ad3c01584affd621"
+    ],
+    [
+      "completion_policy.py",
+      "f408d2edf5ebbe530b790d7c267d09752e99a7c6f95ab9fbb8d316d26310f304"
+    ],
+    [
+      "configuration_evidence.py",
+      "9cc4952495ed9558cb0241b29c88a68127d756c6e8b611c6644d41d4912da5c8"
+    ],
+    [
+      "contest_rules.py",
+      "3cd4dcf96e0d76060de785655b4a5452e0c1af8d79a82cc52dc19462384c73d8"
+    ],
+    [
+      "debug_exclusion_preflight.py",
+      "4aef16b7b2520752b30b39dafcb387fbd9c98fbd7e1de23dee756a9ba15b0066"
+    ],
+    [
+      "dft_signal_requirements.py",
+      "7e2c517d09edafb4eaa984f42cd9a04c012e212a59110638f4cec25fb27dd6a5"
+    ],
+    [
+      "dofile_recipe.py",
+      "8ef60e4c37ac79d3e3e2bb2610926483c942dfb5539c1d418b94fe097af50dc2"
+    ],
+    [
+      "drc_retry_preflight.py",
+      "b6b761e3cbdd9c431e2fae91e860689f87c0db56009bf6e751203662ab24a862"
+    ],
+    [
+      "drc_validation.py",
+      "f18e0354ce33462e0fa102ac1c982daace67d117efc96d4c5e1dab4d4021b933"
+    ],
+    [
+      "eco_connection_plan.py",
+      "de5cb4fa620b4b08a2c2b5a04cc4883dcdd5a67e7557e1885685657ec9e25bfb"
+    ],
+    [
+      "eco_constant_source.py",
+      "ae75a49d3443b50d300cab5e52a342271ed67dd99a78ffc8f6a24edfdd6b4b55"
+    ],
+    [
+      "eco_equivalence.py",
+      "d9c06d8c160ab0e70c0b7323eb723a179cadca4984d9414a3b56516dab4b9a3d"
+    ],
+    [
+      "eco_evidence.py",
+      "c00a39c0d845634581a964f77dc39c152608b5d17f85ea7fcce745fad3ce2d88"
+    ],
+    [
+      "eco_feedback.py",
+      "0e7e7c27cb855f5d326343a9b078065efd6b55bb9cdb3ba31e35e72c8a8563e6"
+    ],
+    [
+      "eco_object_contract.py",
+      "ef5a33f7173b087fc10471d6534fd6bee040c4e7d0fb43f7adec76556cae27f6"
+    ],
+    [
+      "eco_object_selection.py",
+      "8563f1dabe150db7e2840967252430dacc271021abc31734a0e0a3551d21881a"
+    ],
+    [
+      "eco_object_workflow.md",
+      "e9bf4b899b9ffbbd3a5a09252da11375150f9c4ee65176c84d95f1f31d071c5e"
+    ],
+    [
+      "eco_plan_context.py",
+      "bd6f1d38680b1bfb2d3be273f28d404ea14fb802e039e56a351b169fe47bef74"
+    ],
+    [
+      "eco_plan_ownership.py",
+      "6ce2b284900e0453b9208e55f3d4b5025e34e21ee55a7e95a359bf9aa9f356f6"
+    ],
+    [
+      "eco_plan_semantics.py",
+      "4a1c3b3e763008816aeb01f626ccbb521cb1c405aafea286cfe5a2f73130f957"
+    ],
+    [
+      "eco_structure.py",
+      "9a54cf05dfbed564a5406cb83cf04ec36871ad0de851e4f2bd176be54808f3c1"
+    ],
+    [
+      "exclusion_requirements.py",
+      "84cf1baed3f2050f63cc72c35f1e591dcb9a35b1fa03950e2b5bce229131cf24"
+    ],
+    [
+      "extract_tool_help.py",
+      "f738b8dd2145be36789bffc1f1de28564d3a0cf60445ed7d42657dabcde2e35d"
+    ],
+    [
+      "floating_inputs.py",
+      "cf724e44331f6f8105f6dbe426f4e9fd947db3cc8fdc61caf230c7abe7242d85"
+    ],
+    [
+      "help_selection.py",
+      "74c5c680776e66cab14ca684bc780569854e6c01321500cc42583d6012914070"
+    ],
+    [
+      "icg_protection.py",
+      "32ab63f849fff2bc024769e8a069fd8b1bf757d8e90eee23551713269a4a62e2"
+    ],
+    [
+      "insertion_evidence.py",
+      "3c6cda6855187e5e43dd32387307162eaeba9bea08002084472ef57a4ad80389"
+    ],
+    [
+      "library_cell_catalog.py",
+      "8842afd2e20ff402dad702bbe4d9525179cebbf897c63a0e8981ae898b16062f"
+    ],
+    [
+      "mode_control_context.py",
+      "bae502729c56a2de0d357f9ba3ae7283ff71d5215e4bdacb7f6071007125fa91"
+    ],
+    [
+      "model_config.py",
+      "28ed36f385935b41655561438e1bd42aa4790069ba93f96571921a07c0abe96f"
+    ],
+    [
+      "model_script_view.py",
+      "75e740691a88c7fe3ecd8e32dd7a120f4ebad425026fdc4f6d86396591d1ef6b"
+    ],
+    [
+      "netlist_repair.py",
+      "de4fd709c96f99e347bc10defe9da0523fd772c846cbdd4284d8735e3b282506"
+    ],
+    [
+      "netlist_structure.py",
+      "c917e7737f520e5588659e84cc568f2c5e68d15a28e4cf7dae4b85cb62eb4b3c"
+    ],
+    [
+      "official_eco_docs/add_inst.md",
+      "e96cb2fbffacf7e162e3e4bb57cb0e249f756ef013a2edf63cbbd325d2bd1ad0"
+    ],
+    [
+      "official_eco_docs/add_net.md",
+      "77f4e2d86d193f2231b4e10b8ad8139cd6b4ba860435b50bd8978ede91059e34"
+    ],
+    [
+      "official_eco_docs/add_port.md",
+      "0f1e2947b917d4c8bfdc77b6ff1418cdca9cce9890faef695069dfddac4b60b2"
+    ],
+    [
+      "official_eco_docs/connect_net.md",
+      "edcef793073df4f9e2386736c7761f526d906b9017c492465fc1a8a94891501c"
+    ],
+    [
+      "official_eco_docs/connect_pg_net.md",
+      "85f62d07fa0d3c441f52897b016a3cd9eadcc0a6a2f53b8e1d90ea47abc3c670"
+    ],
+    [
+      "official_eco_docs/connect_pin.md",
+      "66f0f68930e112f0f6d533f8ba4f43179d66c4b87c9db9264876025cd352e961"
+    ],
+    [
+      "official_eco_docs/delete_inst.md",
+      "7b3dbae83a706ade3d484883457a2fa787a5268598345bef079f9847d3fa96d6"
+    ],
+    [
+      "official_eco_docs/delete_net.md",
+      "537a3e2579925faa719786ef489eb461b863f5fd7fc5476a3e881383b1b0899e"
+    ],
+    [
+      "official_eco_docs/delete_port.md",
+      "fa29a3eb7916eed923accfe05fc609afb9ae357c490191df7fe85b0cff182de0"
+    ],
+    [
+      "official_eco_docs/disconnect_net.md",
+      "a04704c16eaedc86e6f8c35854260bb8e6c6c2816f2171643651622896bb14a1"
+    ],
+    [
+      "official_eco_docs/dump_ctl.md",
+      "95e1c980db2a0cdfd25c30ce588eb5cdfbbd8eca38dfd108536d6c8de4311e7d"
+    ],
+    [
+      "official_eco_docs/dump_netlist.md",
+      "788b82f5c11146b330585a18de3e004b9fde6cf59f864f24bec93a78936dbe21"
+    ],
+    [
+      "official_eco_docs/dump_scan_def.md",
+      "08c60f8b23312e431eda5b5d9e2fc9a16b93ff5c66fa765e2e9a909b69f15fa3"
+    ],
+    [
+      "official_eco_docs/get_obj_nets.md",
+      "87aae21a83b94b74b2a40bedd053fe2590477fb5c3414a84a4cfe039ba1ccc63"
+    ],
+    [
+      "official_eco_docs/get_obj_pins.md",
+      "bbf2a46f96ccc6d0989b8f043ea44aedeec11024212206ad9632684479e241c7"
+    ],
+    [
+      "official_eco_docs/load_ctl.md",
+      "904c6b12708313f05247f73df9d7179e62cf997380fb16403004c39e818b18e7"
+    ],
+    [
+      "official_eco_docs/load_db.md",
+      "d5c5df5cbf743fe2aaceee4933a1c452dfba3cf204c9a47f22f2d2af8a4ef5d2"
+    ],
+    [
+      "official_eco_docs/load_netlist.md",
+      "0f3e96e14fae23d65625b0591a8c826b6c58c44999b5571e5bdf1ded27923c4e"
+    ],
+    [
+      "official_eco_docs/manifest.json",
+      "b98f729c35a637e4ecf07878ea51ad7f71e2e837ed6aaa292de163ca9648e32b"
+    ],
+    [
+      "official_eco_docs/present_design.md",
+      "4912af26a5df0f7ae893954a4ab1bf30ad857e82be812716798965ac98febd20"
+    ],
+    [
+      "official_eco_docs/rewire.md",
+      "4df1754c1576f2c0c782d74b6c3566c42d28096bcd63e17295aee43963abd63e"
+    ],
+    [
+      "operation_audit.py",
+      "895cecc35fe1a9327477b41c4e4548e1a754cc0eaa9611650251ae9b630f3bfc"
+    ],
+    [
+      "original_dofile.py",
+      "0110e16fa360930d523857131a650a4a06af3206cb47ed7be64b780ba9f8e18a"
+    ],
+    [
+      "partial_insertion_validation.py",
+      "404c31be8eb7fc90025246a2b8cb920b3959fbdb8786ca34c6e33455c3360936"
+    ],
+    [
+      "partial_issue_evidence.py",
+      "c1bd5f7c82d428e0df105090fa7bbc7bc3c4c9a6ed2e67710faff8ebf40c9e3d"
+    ],
+    [
+      "plan_provenance.py",
+      "339df57cfc91c8af63257bbeefb86ccb6460ba2a25fa95bb9a599d11fca06719"
+    ],
+    [
+      "platform_protocol.py",
+      "1a41a7fca50b131d0b49f7899a5e45f2ffdfe6c420eca5beda0631eeb315144a"
+    ],
+    [
+      "preloaded_startup.py",
+      "b44bc3a1fa433bb94afd1d4ada7330f24815cec642f600306e9aeb50ce0953b7"
+    ],
+    [
+      "repair_deliverables.py",
+      "b5be7c39d7c1f40d3d37424cef635e5202cff081a024f7275a3729ea3e188593"
+    ],
+    [
+      "report_validation.py",
+      "4958ebb05f40139bbfc75c1a0634ec89b83d1c5214b56c050eca638bcea34753"
+    ],
+    [
+      "requirements.txt",
+      "7f6d949c9a55868d361f144d919a2adbab5657b2e2d0a893da8b93be87b757d6"
+    ],
+    [
+      "runtime.env.example",
+      "f870142fd39a7f7bb17a8de53c98405ba1a9997d868a985624b66c57816a7814"
+    ],
+    [
+      "runtime_events.py",
+      "8e14fd51128aec97f03f466d6da7459f1ab6dc9a525db36f3ad5429ef761dfd6"
+    ],
+    [
+      "runtime_limits.py",
+      "7f028cefa173c5ea9d836664693dd2d6d4f2194b517628387125f9880f2a03f2"
+    ],
+    [
+      "scan_agent.py",
+      "e27918123dadee128a40d68b2c25f4f459b91e7b90959cccba98db1e6c4ba4db"
+    ],
+    [
+      "scan_exclusion_evidence.py",
+      "0654fe3ad3f235cffbb7ed2b6483c036667faab65196dda4fdbe387603ba628a"
+    ],
+    [
+      "shift_report_recipe.py",
+      "6c15facd039a0fd2d99ce3175c246cfdf222333c14e4c4061b96bb6fabfb962b"
+    ],
+    [
+      "source_hierarchy.py",
+      "a0d657fb64e66203003d01225666f65ad1bef3db174aebe1eeb716f3954dcf11"
+    ],
+    [
+      "tool_help.json",
+      "b47bc3d5e26046fffcc6a4e8c5251b76f8cec7559eb22a3b2449db23e61b76f1"
+    ],
+    [
+      "tool_process.py",
+      "8f1ace78fd786a24d9416bfc13fcbf27b496244fddbee74d862b0aa79cd5d47d"
+    ],
+    [
+      "wrapper_validation.py",
+      "245fb774ad39144f6afb8fd56eccac2a54c53dcf3e9944895819ffa8cc9a8727"
+    ]
+  ],
+  "permissions": {
+    ".dockerignore": "0o644",
+    "Dockerfile": "0o644",
+    "agent_runner.py": "0o644",
+    "agent_system": "0o644",
+    "artifact_operations.py": "0o644",
+    "audit_no_progress.py": "0o644",
+    "audit_refresh.py": "0o644",
+    "canonical_delivery.py": "0o644",
+    "case_deadline.py": "0o644",
+    "clock_association_recipe.py": "0o644",
+    "clock_latch_context.py": "0o644",
+    "command_delivery.py": "0o644",
+    "command_error_evidence.py": "0o644",
+    "completion_policy.py": "0o644",
+    "configuration_evidence.py": "0o644",
+    "contest_rules.py": "0o644",
+    "debug_exclusion_preflight.py": "0o644",
+    "dft_signal_requirements.py": "0o644",
+    "dofile_recipe.py": "0o644",
+    "drc_retry_preflight.py": "0o644",
+    "drc_validation.py": "0o644",
+    "eco_connection_plan.py": "0o644",
+    "eco_constant_source.py": "0o644",
+    "eco_equivalence.py": "0o644",
+    "eco_evidence.py": "0o644",
+    "eco_feedback.py": "0o644",
+    "eco_object_contract.py": "0o644",
+    "eco_object_selection.py": "0o644",
+    "eco_object_workflow.md": "0o644",
+    "eco_plan_context.py": "0o644",
+    "eco_plan_ownership.py": "0o644",
+    "eco_plan_semantics.py": "0o644",
+    "eco_structure.py": "0o644",
+    "exclusion_requirements.py": "0o644",
+    "extract_tool_help.py": "0o644",
+    "floating_inputs.py": "0o644",
+    "help_selection.py": "0o644",
+    "icg_protection.py": "0o644",
+    "insertion_evidence.py": "0o644",
+    "library_cell_catalog.py": "0o644",
+    "mode_control_context.py": "0o644",
+    "model_config.py": "0o644",
+    "model_script_view.py": "0o644",
+    "netlist_repair.py": "0o644",
+    "netlist_structure.py": "0o644",
+    "official_eco_docs/add_inst.md": "0o644",
+    "official_eco_docs/add_net.md": "0o644",
+    "official_eco_docs/add_port.md": "0o644",
+    "official_eco_docs/connect_net.md": "0o644",
+    "official_eco_docs/connect_pg_net.md": "0o644",
+    "official_eco_docs/connect_pin.md": "0o644",
+    "official_eco_docs/delete_inst.md": "0o644",
+    "official_eco_docs/delete_net.md": "0o644",
+    "official_eco_docs/delete_port.md": "0o644",
+    "official_eco_docs/disconnect_net.md": "0o644",
+    "official_eco_docs/dump_ctl.md": "0o644",
+    "official_eco_docs/dump_netlist.md": "0o644",
+    "official_eco_docs/dump_scan_def.md": "0o644",
+    "official_eco_docs/get_obj_nets.md": "0o644",
+    "official_eco_docs/get_obj_pins.md": "0o644",
+    "official_eco_docs/load_ctl.md": "0o644",
+    "official_eco_docs/load_db.md": "0o644",
+    "official_eco_docs/load_netlist.md": "0o644",
+    "official_eco_docs/manifest.json": "0o644",
+    "official_eco_docs/present_design.md": "0o644",
+    "official_eco_docs/rewire.md": "0o644",
+    "operation_audit.py": "0o644",
+    "original_dofile.py": "0o644",
+    "partial_insertion_validation.py": "0o644",
+    "partial_issue_evidence.py": "0o644",
+    "plan_provenance.py": "0o644",
+    "platform_protocol.py": "0o644",
+    "preloaded_startup.py": "0o644",
+    "repair_deliverables.py": "0o644",
+    "report_validation.py": "0o644",
+    "requirements.txt": "0o644",
+    "runtime.env.example": "0o644",
+    "runtime_events.py": "0o644",
+    "runtime_limits.py": "0o644",
+    "scan_agent.py": "0o644",
+    "scan_exclusion_evidence.py": "0o644",
+    "shift_report_recipe.py": "0o644",
+    "source_hierarchy.py": "0o644",
+    "tool_help.json": "0o644",
+    "tool_process.py": "0o644",
+    "wrapper_validation.py": "0o644"
+  },
+  "changes": [
+    {
+      "file": "agent_runner.py",
+      "parent_sha256": "c2fc79ba1b1b61141d647483047f952cef0ecfa506ef99f529b57b72998c1d7e",
+      "sha256": "c9c450d90c9688e61aa9803bb0c29deb10340888c632f1e88bc331c8c626cec7"
+    },
+    {
+      "file": "platform_protocol.py",
+      "parent_sha256": "caea49c31d92fd701ef197a102347759eb65b9fa9e57cf3f88004f967d150659",
+      "sha256": "1a41a7fca50b131d0b49f7899a5e45f2ffdfe6c420eca5beda0631eeb315144a"
+    },
+    {
+      "file": "preloaded_startup.py",
+      "parent_sha256": "7846abc172c060aec002cae2003351d08e4118d687846527dcd3eb7303fbdabf",
+      "sha256": "b44bc3a1fa433bb94afd1d4ada7330f24815cec642f600306e9aeb50ce0953b7"
+    }
+  ],
+  "unchanged_files": 83,
+  "scope": "formal input handshake and observed-ready budget handoff only",
+  "normal_case_runs": 0
+}

@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "source_archive_sha256": "c9896b57abb39375c571563b001c1befce1d5a54eecc63138743a893a135b212",
+  "authority": "official supplemental documentation; binary support unverified",
+  "documents": [
+    {
+      "command": "add_inst",
+      "file": "add_inst.md",
+      "sha256": "e96cb2fbffacf7e162e3e4bb57cb0e249f756ef013a2edf63cbbd325d2bd1ad0",
+      "size": 3566
+    },
+    {
+      "command": "add_net",
+      "file": "add_net.md",
+      "sha256": "77f4e2d86d193f2231b4e10b8ad8139cd6b4ba860435b50bd8978ede91059e34",
+      "size": 1868
+    },
+    {
+      "command": "add_port",
+      "file": "add_port.md",
+      "sha256": "0f1e2947b917d4c8bfdc77b6ff1418cdca9cce9890faef695069dfddac4b60b2",
+      "size": 1971
+    },
+    {
+      "command": "connect_net",
+      "file": "connect_net.md",
+      "sha256": "edcef793073df4f9e2386736c7761f526d906b9017c492465fc1a8a94891501c",
+      "size": 2147
+    },
+    {
+      "command": "connect_pg_net",
+      "file": "connect_pg_net.md",
+      "sha256": "85f62d07fa0d3c441f52897b016a3cd9eadcc0a6a2f53b8e1d90ea47abc3c670",
+      "size": 1355
+    },
+    {
+      "command": "connect_pin",
+      "file": "connect_pin.md",
+      "sha256": "66f0f68930e112f0f6d533f8ba4f43179d66c4b87c9db9264876025cd352e961",
+      "size": 3477
+    },
+    {
+      "command": "delete_inst",
+      "file": "delete_inst.md",
+      "sha256": "7b3dbae83a706ade3d484883457a2fa787a5268598345bef079f9847d3fa96d6",
+      "size": 2080
+    },
+    {
+      "command": "delete_net",
+      "file": "delete_net.md",
+      "sha256": "537a3e2579925faa719786ef489eb461b863f5fd7fc5476a3e881383b1b0899e",
+      "size": 2067
+    },
+    {
+      "command": "delete_port",
+      "file": "delete_port.md",
+      "sha256": "fa29a3eb7916eed923accfe05fc609afb9ae357c490191df7fe85b0cff182de0",
+      "size": 1061
+    },
+    {
+      "command": "disconnect_net",
+      "file": "disconnect_net.md",
+      "sha256": "a04704c16eaedc86e6f8c35854260bb8e6c6c2816f2171643651622896bb14a1",
+      "size": 2421
+    },
+    {
+      "command": "dump_ctl",
+      "file": "dump_ctl.md",
+      "sha256": "95e1c980db2a0cdfd25c30ce588eb5cdfbbd8eca38dfd108536d6c8de4311e7d",
+      "size": 842
+    },
+    {
+      "command": "dump_netlist",
+      "file": "dump_netlist.md",
+      "sha256": "788b82f5c11146b330585a18de3e004b9fde6cf59f864f24bec93a78936dbe21",
+      "size": 6823
+    },
+    {
+      "command": "dump_scan_def",
+      "file": "dump_scan_def.md",
+      "sha256": "08c60f8b23312e431eda5b5d9e2fc9a16b93ff5c66fa765e2e9a909b69f15fa3",
+      "size": 1411
+    },
+    {
+      "command": "get_obj_nets",
+      "file": "get_obj_nets.md",
+      "sha256": "87aae21a83b94b74b2a40bedd053fe2590477fb5c3414a84a4cfe039ba1ccc63",
+      "size": 7436
+    },
+    {
+      "command": "get_obj_pins",
+      "file": "get_obj_pins.md",
+      "sha256": "bbf2a46f96ccc6d0989b8f043ea44aedeec11024212206ad9632684479e241c7",
+      "size": 6087
+    },
+    {
+      "command": "load_ctl",
+      "file": "load_ctl.md",
+      "sha256": "904c6b12708313f05247f73df9d7179e62cf997380fb16403004c39e818b18e7",
+      "size": 1266
+    },
+    {
+      "command": "load_db",
+      "file": "load_db.md",
+      "sha256": "d5c5df5cbf743fe2aaceee4933a1c452dfba3cf204c9a47f22f2d2af8a4ef5d2",
+      "size": 3505
+    },
+    {
+      "command": "load_netlist",
+      "file": "load_netlist.md",
+      "sha256": "0f3e96e14fae23d65625b0591a8c826b6c58c44999b5571e5bdf1ded27923c4e",
+      "size": 3658
+    },
+    {
+      "command": "present_design",
+      "file": "present_design.md",
+      "sha256": "4912af26a5df0f7ae893954a4ab1bf30ad857e82be812716798965ac98febd20",
+      "size": 1115
+    },
+    {
+      "command": "rewire",
+      "file": "rewire.md",
+      "sha256": "4df1754c1576f2c0c782d74b6c3566c42d28096bcd63e17295aee43963abd63e",
+      "size": 473
+    }
+  ]
+}

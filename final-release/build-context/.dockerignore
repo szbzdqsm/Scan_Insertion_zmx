@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!.dockerignore
+!apply_delta.py
+!metadata.json
+!delta.tar

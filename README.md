@@ -1,3 +1,9 @@
+# 已选终测版本源码备份
+
+最终冻结源码及恢复说明在[final-release/README.md](final-release/README.md)，对应ed2a25ff源码与589d4dd9镜像。此分支仅保存无凭据源码和构建/校验材料，不包含API Key或提交ZIP，不宣称新版本12例已通过。
+
+---
+
 # Scan Insertion Agent
 
 2026-10-10 平台6/11回归已修复：**v69同一官方包镜像完整Public 11/11、624项回归及Ruff通过**，逐例累计1344.92秒，全部在预算内。修复Wrapper全局启用/样式、固定链数及裸命令、实际命令/规则审计、无效可选映射和Liberty latch/FF类别预检查。详见 [平台回归修复](PLATFORM_FAILURE_FIX.md) 与 [验证记录](LIVE_VALIDATION.md)。本地通过范围与Hidden/正式评分分开记录。

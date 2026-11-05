@@ -1,0 +1,16 @@
+{
+  "source": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+  "image_id": "sha256:589d4dd9928b47e54d2980fc92344a3b9071c9e784077d54c753cad6a8b4f6ef",
+  "config_digest": "sha256:ef7237ce7d6f549f570a1f1d18fb92e24ee3c8c78fecb6d0463920908379d433",
+  "runtime_manifest_digest": "sha256:5c0bb0a06bd69d0392e16523425ccba48f2ac825b5b80a0d9de0d5f78a7a419f",
+  "tar": "/home/zmx2007226/scan-agent-dev/outputs/b9-final-handshake-20261104/delivery/eda2602a4.tar",
+  "sha256": "4db2c6ea83b631be20f3c2ae3575fd6118d7917b6bad79e5fa403672a8c8c2d3",
+  "bytes": 1750593024,
+  "verified_blobs": 16,
+  "platform": "linux/amd64",
+  "layers": 10,
+  "actual_load_identity_matches": true,
+  "save_seconds": 41.60551432200009,
+  "load_seconds": 10.685893938993104,
+  "tar_validation_and_load_seconds": 14.088025646997266
+}

@@ -1,0 +1,7 @@
+{
+  "source": "ed2a25ff26313c34b6c0262c5da1120b21b3127eb18a536cf9ddb15daefd316e",
+  "image": "sha256:589d4dd9928b47e54d2980fc92344a3b9071c9e784077d54c753cad6a8b4f6ef",
+  "zip_sha256": "e4b773dc7b02dfc9821a760609e3fdf959889b27aa0f94d142998791270e9b48",
+  "local_private_artifacts_excluded": true,
+  "note": "Public wrapper contains private env locally; only source/image/hash metadata uploaded"
+}
